@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Static Web Site Example</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(to right, #6dd5ed, #2193b0);
+            height: 100vh;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 48px;
+            font-weight: bold;
+            margin-bottom: 20px;
+            color: #fff;
+            text-shadow: 2px 2px 4px #000000;
+        }
+
+        p {
+            font-size: 24px;
+            margin-top: 20px;
+        }
+
+        .cookies {
+            margin-top: 20px;
+            font-size: 18px;
+            color: #ffffff;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Static Web Site</h1>
+        <p>Welcome to our example page</p>
+        <div class="cookies" id="cookies"></div>
+    </div>
+
+    <script>
+        console.log("Entrou")
+        // Função para obter e exibir os nomes dos cookies
+        function showCookies() {
+            // Obtém todos os cookies e divide em pares chave=valor
+            console.log("Show Cookies")
+            const cookies = document.cookie.split(';');
+            let cookieNames = cookies
+                .map(cookie => cookie.split('=')[0].trim())
+                .filter(name => name !== ""); // Remove cookies com nomes vazios
+            if (cookieNames.length > 0) {
+                const cookiesContainer = document.getElementById('cookies');
+                cookiesContainer.textContent = 'Cookies encontrados: ' + cookieNames.join(', ');
+                console.log("Cookies encontrados", cookieNames.join(', '))
+            } else {
+                console.log("Não achou cookies")
+            }
+        }
+        showCookies();
+    </script>
+</body>
+
+</html>

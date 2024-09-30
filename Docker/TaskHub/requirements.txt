@@ -1,0 +1,11 @@
+fastapi==0.68.0
+uvicorn==0.15.0
+boto3==1.17.84
+aws-xray-sdk==2.7.0
+watchtower==1.0.6
+python-dotenv
+requests
+dnspython 
+pymysql
+mysql
+mysql-connector-python

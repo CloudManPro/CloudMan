@@ -1,0 +1,44 @@
+# Use Amazon Linux como imagem base
+FROM amazonlinux:2
+
+# Set the working directory in the container
+WORKDIR /usr/src/app
+
+# Instale Python, pip e pacotes necessários
+RUN yum update -y && \
+    yum install -y python3 python3-pip gcc mysql-devel python3-devel libffi-devel && \
+    pip3 install --upgrade pip
+
+# Instale o agente SSM
+RUN yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+
+# Instala pacotes necessários para administração de usuários
+RUN yum install -y shadow-utils
+
+# Instale todas as dependências Python do arquivo requirements
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Instala MySQL para acesso via terminal
+RUN yum install -y mysql
+
+# Instalar o Daemon do X-Ray
+RUN curl https://s3.dualstack.us-east-2.amazonaws.com/aws-xray-assets.us-east-2/xray-daemon/aws-xray-daemon-3.x.rpm -o /tmp/xray.rpm && \
+    yum install -y /tmp/xray.rpm && \
+    rm /tmp/xray.rpm
+
+# Exponha a porta 2000 para o daemon do X-Ray
+EXPOSE 2000
+
+# Copie o script Python para o container
+COPY EC2Hub.py .
+
+# Definição do Healthcheck
+HEALTHCHECK --interval=5m --timeout=3s \
+    CMD curl -f http://localhost:${Port:-80}/health || exit 1
+
+# Instale Uvicorn para rodar FastAPI
+RUN pip3 install uvicorn
+
+# Comando para iniciar o daemon do X-Ray e o aplicativo FastAPI
+CMD xray -b 0.0.0.0:2000 & uvicorn EC2Hub:app --host 0.0.0.0 --port ${Port:-80}

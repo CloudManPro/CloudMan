@@ -1,0 +1,19 @@
+# Use the official WordPress image with PHP 7.4 and Apache
+FROM wordpress:latest
+
+# Install necessary dependencies for the following commands
+RUN apt-get update && apt-get install -y unzip
+
+# Set the version of WP Offload Media Lite. You can find the latest version on WordPress.org
+ENV WP_OFFLOAD_MEDIA_VERSION=2.5.2
+
+# Download and install the WP Offload Media Lite plugin for Amazon S3
+RUN curl -O https://downloads.wordpress.org/plugin/amazon-s3-and-cloudfront.${WP_OFFLOAD_MEDIA_VERSION}.zip \
+    && unzip amazon-s3-and-cloudfront.${WP_OFFLOAD_MEDIA_VERSION}.zip -d /usr/src/wordpress/wp-content/plugins/ \
+    && rm amazon-s3-and-cloudfront.${WP_OFFLOAD_MEDIA_VERSION}.zip
+
+# Create a simple health check file
+RUN echo "<?php http_response_code(200); echo 'OK'; ?>" > /usr/src/wordpress/wp-content/plugins/healthcheck.php
+
+# Clear the apt cache
+RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*

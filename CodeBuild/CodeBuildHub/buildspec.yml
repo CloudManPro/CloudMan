@@ -1,0 +1,40 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.8  # Especifique a versão do Python que você precisa
+    commands:
+      - echo Installing dependencies...
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+  pre_build:
+    commands:
+      - echo Pre-build phase...
+  build:
+    commands:
+      - echo Build phase...
+      - python CodeBuildHub.py  # Executa o script Python
+  post_build:
+    commands:
+      - echo Post-build phase...
+      - mkdir -p ./logs  # Cria o diretório logs se ele não existir
+      - cp /tmp/codebuild_log.txt ./logs/codebuild_log.txt  # Copia o arquivo de log para o diretório específico
+      - tr '[:lower:]' '[:upper:]' < /tmp/codebuild_log.txt > ./logs/codebuild_log_upper.txt  # Converte para maiúsculas e salva no diretório logs
+
+cache:
+  paths:
+    - /root/.cache/pip  # Cache dos pacotes pip instalados
+
+artifacts:
+  files:
+    - 'logs/codebuild_log.txt'  # Inclui o arquivo de log original
+  base-directory: '.'
+  discard-paths: no
+
+  secondary-artifacts:
+    ArtifactSec:
+      files:
+        - 'logs/codebuild_log_upper.txt'  # Inclui o arquivo de log em maiúsculas
+      base-directory: '.'
+      discard-paths: no

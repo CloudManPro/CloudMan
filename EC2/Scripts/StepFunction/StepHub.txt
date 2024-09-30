@@ -1,0 +1,209 @@
+{
+  "Comment": "Step Function that initializes environment variables, captures current date and time, and conditionally performs DynamoDB operations",
+  "StartAt": "CloudManEnvironmentVariables",
+  "States": {
+    "CloudManEnvironmentVariables": {
+      "Type": "Pass",
+      "Result": {
+        "aws_s3_bucket": {
+          "Name": {
+            "0": "s3cloudman"
+          }
+        },
+        "aws_lambda_function": {
+          "Name": {
+            "0": "Function"
+          }
+        },
+        "aws_sqs_queue": {
+          "Name": {
+            "0": "Queue"
+          },
+          "URL": {
+            "0": "https://sqs.us-east-1.amazonaws.com/952133486861/Queue"
+          }
+        },
+        "aws_dynamodb_table": {
+          "Name": {
+            "0": "Table"
+          }
+        },
+        "aws_sns_topic": {
+          "Name": {
+            "0": "Topic"
+          }
+        }
+      },
+      "ResultPath": "$.EnvVariables",
+      "Next": "GetCurrentDate"
+    },
+    "GetCurrentDate": {
+      "Type": "Pass",
+      "Result": {
+        "Time": "$$.State.EnteredTime"
+      },
+      "ResultPath": "$.Time",
+      "Next": "Parallel"
+    },
+    "Parallel": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Choice Dynamo 0",
+          "States": {
+            "Choice Dynamo 0": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.EnvVariables.aws_dynamodb_table.Name['0']",
+                  "IsPresent": true,
+                  "Next": "DynamoDB PutItem 0"
+                }
+              ],
+              "Default": "Pass Dynamo 0"
+            },
+            "Pass Dynamo 0": {
+              "Type": "Pass",
+              "End": true
+            },
+            "DynamoDB PutItem 0": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName.$": "$.EnvVariables.aws_dynamodb_table.Name['0']",
+                "Item": {
+                  "ID": {
+                    "S.$": "$$.State.EnteredTime"
+                  },
+                  "Date": {
+                    "S.$": "$$.State.EnteredTime"
+                  }
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Choice S3 0",
+          "States": {
+            "Choice S3 0": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.EnvVariables.aws_s3_bucket.Name['0']",
+                  "IsPresent": true,
+                  "Next": "PutObject 0"
+                }
+              ],
+              "Default": "Pass S3 0"
+            },
+            "Pass S3 0": {
+              "Type": "Pass",
+              "End": true
+            },
+            "PutObject 0": {
+              "Type": "Task",
+              "End": true,
+              "Parameters": {
+                "Body.$": "$$.State.EnteredTime",
+                "Bucket.$": "$.EnvVariables.aws_s3_bucket.Name['0']",
+                "Key.$": "$$.State.EnteredTime"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:s3:putObject"
+            }
+          }
+        },
+        {
+          "StartAt": "Choice SQS 0",
+          "States": {
+            "Choice SQS 0": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.EnvVariables.aws_sqs_queue.URL['0']",
+                  "IsPresent": true,
+                  "Next": "SQS SendMessage"
+                }
+              ],
+              "Default": "Pass SQS 0"
+            },
+            "Pass SQS 0": {
+              "Type": "Pass",
+              "End": true
+            },
+            "SQS SendMessage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "MessageBody.$": "$$.State.EnteredTime",
+                "QueueUrl.$": "$.EnvVariables.aws_sqs_queue.URL['0']"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Choice Lambda 0",
+          "States": {
+            "Choice Lambda 0": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.EnvVariables.aws_lambda_function.Name['0']",
+                  "IsPresent": true,
+                  "Next": "Lambda Invoke 0"
+                }
+              ],
+              "Default": "Pass Lambda 0"
+            },
+            "Pass Lambda 0": {
+              "Type": "Pass",
+              "End": true
+            },
+            "Lambda Invoke 0": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "OutputPath": "$.Payload",
+              "Parameters": {
+                "FunctionName.$": "$.EnvVariables.aws_lambda_function.Name['0']",
+                "Payload.$": "$"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Choice SNS 0",
+          "States": {
+            "Choice SNS 0": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.EnvVariables.aws_sns_topic.Name['0']",
+                  "IsPresent": true,
+                  "Next": "SNS Publish 0"
+                }
+              ],
+              "Default": "Pass SNS 0"
+            },
+            "Pass SNS 0": {
+              "Type": "Pass",
+              "End": true
+            },
+            "SNS Publish 0": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.EnvVariables.aws_sns_topic.Name['0']",
+                "Message":  "teste"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "End": true
+    }
+  }
+}

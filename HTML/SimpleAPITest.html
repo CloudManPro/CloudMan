@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Teste de API</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(to bottom, #8a2be2, #0000ff);
+            height: 100vh;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .welcome {
+            text-align: center;
+        }
+
+        input[type="text"] {
+            margin: 8px 0;
+            padding: 10px;
+            border-radius: 5px;
+            border: none;
+            width: 800px;
+            background-color: #ddd;
+            box-shadow: 3px 3px 5px rgba(0, 0, 0, 0.3);
+        }
+
+        button {
+            margin: 8px 0;
+            padding: 10px;
+            border-radius: 5px;
+            border: none;
+            width: 200px;
+            cursor: pointer;
+            background-color: #ddd;
+            color: #000;
+            box-shadow: 3px 3px 5px rgba(0, 0, 0, 0.3);
+        }
+
+        #output {
+            margin-top: 8px;
+            color: #000;
+            padding: 10px;
+            background-color: #ccc;
+            border-radius: 5px;
+            box-shadow: 3px 3px 5px rgba(0, 0, 0, 0.3);
+            width: 800px;
+            height: 15px;
+        }
+
+        .logout-button {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            background-color: #cccccc;
+            color: #000;
+            font-weight: bold;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="welcome">
+        <h1>CloudMan API Test v2</h1>
+    </div>
+    <input type="text" id="Stage" placeholder="Enter Stage" onchange="UpdateURL()">
+    <input type="text" id="Resource" placeholder="Enter Resource" onchange="UpdateURL()">
+    <input type="text" id="Key" placeholder="Enter Key">
+    <input type="text" id="Value" placeholder="Enter Value">
+    <div id="URL"></div>
+    <h2>HTTP Methods</h2>
+    <button onclick="postRequest()" id="Post">POST</button>
+    <button onclick="putRequest()" id="Put">PUT</button>
+    <button onclick="getRequest()" id="Get">GET</button>
+    <h2>Response</h2>
+    <div id="output"></div>
+    <script>
+        const currentUrl = window.location.href;
+        let APIBase;
+
+        // Função para obter o valor de um cookie pelo nome
+        function getCookie(name) {
+            const value = `; ${document.cookie}`;
+            const parts = value.split(`; ${name}=`);
+            if (parts.length === 2) return parts.pop().split(';').shift();
+            return null;
+        }
+
+        // Função para apagar o cookie
+        function deleteCookie(name) {
+            document.cookie = `${name}=; path=/; domain=.cloudman.pro; expires=Thu, 01 Jan 1970 00:00:00 UTC; secure; SameSite=None`;
+            console.log(`Cookie ${name} apagado`);
+        }
+
+        console.log("URL da página atual:", currentUrl);
+
+        // Obter o valor do cookie 'stageJS'
+        const stageValue = getCookie('stageJS');
+        console.log("stageValue", stageValue);
+
+        if (stageValue && stageValue !== 'null') {
+            // Extrai o domínio da URL atual sem o protocolo (https://)
+            const url = new URL(currentUrl);
+            const domain = url.hostname;
+
+            // Constrói a nova URL com o stage como subdomínio
+            APIBase = `${url.protocol}//${stageValue}.${domain}${url.pathname}${url.search}`;
+
+            // Apaga o cookie 'stageJS' após o uso
+            deleteCookie('stageJS');
+        } else {
+            APIBase = new URL(currentUrl);
+        }
+
+        let APIURL = APIBase;
+        console.log("API URL atualizado:", APIURL);
+
+        function Fetch(APIURL, Value, Method) {
+            console.log("Value", Value, Method);
+            const options = {
+                method: Method,
+                headers: { 'Content-Type': 'application/json' }
+            };
+
+            if (Method === 'POST' || Method === 'PUT') {
+                options.body = JSON.stringify({ Value });
+            }
+            console.log("APIURL", APIURL, options);
+            fetch(APIURL, options)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Erro na resposta da APIURL: ' + response.statusText);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    console.log("Resposta: ", data);
+                    if (Method == 'GET') {
+                        document.getElementById('output').innerText = data.data;
+                    } else {
+                        document.getElementById('output').innerText = data;
+                    }
+                })
+                .catch((error) => {
+                    console.error('Erro:', error);
+                    document.getElementById('output').innerText = `Erro: ${error.message}`;
+                });
+        }
+
+        function getRequest() {
+            const keyValue = document.getElementById("Key").value;
+            const urlWithQuery = `${APIURL}?ID=${encodeURIComponent(keyValue)}`;
+            console.log("Chamando getRequest", APIURL, keyValue, urlWithQuery);
+            Fetch(urlWithQuery, null, 'GET');
+        }
+
+        function postRequest() {
+            const Key = document.getElementById('Key').value;
+            const Value = document.getElementById('Value').value;
+            const PostValue = [Key, Value];
+            console.log("Key", Key, Value, PostValue, APIURL);
+            if (Key !== null && Value !== null) {
+                Fetch(APIURL, PostValue, 'POST');
+            }
+        }
+
+        function putRequest() {
+            const Key = document.getElementById('Key').value;
+            const Value = document.getElementById('Value').value;
+            const PutValue = [Key, Value];
+            console.log("Key", Key, Value, PutValue);
+            if (Key !== null && Value !== null) {
+                Fetch(APIURL, PutValue, 'PUT');
+            }
+        }
+
+        function UpdateURL() {
+            const Stage = document.getElementById('Stage').value;
+            const Resource = document.getElementById('Resource').value;
+            APIURL = APIBase + Stage + "/" + Resource;
+            document.getElementById('URL').innerText = "URL: " + APIURL;
+        }
+    </script>
+
+</body>
+
+</html>
