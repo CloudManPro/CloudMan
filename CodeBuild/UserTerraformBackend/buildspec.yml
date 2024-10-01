@@ -1,0 +1,71 @@
+version: 0.2
+
+env:
+  variables:
+    USER_ID: "seu_usuario_id"  # Defina conforme necessário
+    STATE_NAME: "seu_state_name"  # Defina conforme necessário
+    COMMAND: "apply"  # ou "plan", "destroy", etc.
+    aws_s3_bucket_Source_Name_0: "your-bucket-name"  # Nome do bucket S3 onde estão os arquivos
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "Instalando dependências do Terraform..."
+      - curl -O https://releases.hashicorp.com/terraform/1.4.0/terraform_1.4.0_linux_arm64.zip --silent
+      - unzip -q terraform_1.4.0_linux_arm64.zip
+      - mkdir -p ~/.local/bin
+      - mv terraform ~/.local/bin/
+      - export PATH=$PATH:~/.local/bin
+      - echo "Instalando dependências do Python..."
+      - pip install boto3 requests --quiet
+
+
+  pre_build:
+    commands:
+      - echo "Preparando o ambiente..."
+      - echo "Criando diretório .terraform se não existir..."
+      - mkdir -p /tmp/states/${STATE_NAME}/.terraform
+      - echo "Sincronizando plugins do Terraform do diretório compartilhado no S3..."
+      - aws s3 sync s3://${aws_s3_bucket_Source_Name_0}/terraform-plugin-dir/.terraform/ /tmp/states/${STATE_NAME}/.terraform/ --quiet
+      
+      - echo "Definindo permissões de execução para os plugins do Terraform..."
+      - find /tmp/states/${STATE_NAME}/.terraform/ -type f -name "terraform-provider-*" -exec chmod +x {} \;
+      
+      - echo "Baixando arquivos Terraform e lockfile do S3..."
+      - aws s3 cp s3://${aws_s3_bucket_Source_Name_0}/states/${STATE_NAME}/ /tmp/states/${STATE_NAME}/ --recursive --quiet
+
+      - echo "Renomeando terraform.lock.hcl para .terraform.lock.hcl, se necessário..."
+      - if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
+          mv /tmp/states/${STATE_NAME}/terraform.lock.hcl /tmp/states/${STATE_NAME}/.terraform.lock.hcl;
+        fi
+      
+      - echo "Arquivos baixados do S3:"
+      - ls -al /tmp/states/${STATE_NAME}  # Lista arquivos no diretório de trabalho para verificação
+      - echo "Modificando o arquivo main.tf e baixando arquivos adicionais do S3..."
+      - python modify_main_tf.py
+
+  build:
+    commands:
+      - echo "Executando o build..."
+      - python InitTerraform.py
+      - echo "Verificando se o terraform.lock.hcl foi criado..."
+      - ls -al /tmp/states/${STATE_NAME}/
+
+  post_build:
+    commands:
+      - echo "Sincronizando plugins do Terraform para o diretório compartilhado no S3..."
+      - aws s3 sync /tmp/states/${STATE_NAME}/.terraform/ s3://${aws_s3_bucket_Source_Name_0}/terraform-plugin-dir/.terraform/ --quiet
+      - if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
+          aws s3 cp /tmp/states/${STATE_NAME}/terraform.lock.hcl s3://${aws_s3_bucket_Source_Name_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
+        elif [ -f /tmp/states/${STATE_NAME}/.terraform.lock.hcl ]; then
+          aws s3 cp /tmp/states/${STATE_NAME}/.terraform.lock.hcl s3://${aws_s3_bucket_Source_Name_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
+        else
+          echo "Lockfile não encontrado, não há necessidade de sincronizar.";
+        fi
+      - echo "Build completado."
+
+artifacts:
+  files:
+    - '**/*'
