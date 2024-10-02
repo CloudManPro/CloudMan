@@ -1,10 +1,10 @@
 import json
 from my_math_functions import multiply
 
+
 def lambda_handler(event, context):
     # Importing the function from the Lambda Layer
-    
-    print("Event:",event)
+    print("Event:", event)
 
     # Parsing query parameters
     params = event.get('queryStringParameters', {})
@@ -21,7 +21,7 @@ def lambda_handler(event, context):
 
         # Calling the multiply function from the Lambda Layer
         result = multiply(num1, num2)
-        print("Result:",result)
+        print("Result:", result)
 
         # Returning the result
         return {
@@ -30,8 +30,15 @@ def lambda_handler(event, context):
         }
 
     except ValueError:
-        print("Error")
+        print("Error: Parameters must be integers")
         return {
             'statusCode': 400,
             'body': json.dumps('Parameters must be integers')
+        }
+
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Internal server error')
         }

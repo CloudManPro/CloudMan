@@ -3,22 +3,24 @@ import json
 import os
 
 # Retrieve DynamoDB table information from environment variables
-dynamodb_table_name = os.environ['aws_dynamodb_table_Target_Name_0']
-dynamodb_region = os.environ['aws_dynamodb_table_Target_Region_0']
+DYNAMODB_TABLE_NAME = os.environ['AWS_DYNAMODB_TABLE_TARGET_NAME_0']
+DYNAMODB_REGION = os.environ['AWS_DYNAMODB_TABLE_TARGET_REGION_0']
+
 # Create a DynamoDB resource with the specified region
-dynamodb = boto3.resource('dynamodb', region_name=dynamodb_region)
-table = dynamodb.Table(dynamodb_table_name)
+dynamodb = boto3.resource('dynamodb', region_name=DYNAMODB_REGION)
+table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
 # Headers to enable CORS
-cors_headers = {
+CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
 }
+
 # Used with CloudMan CI/CD
-Version = os.environ.get('CloudManCICDVersion', "")
-Stage = os.environ.get('CloudManCICDStage', "")
-AppName = os.environ.get('CloudManCICDAppName', "")
+VERSION = os.environ.get('CLOUDMAN_CICD_VERSION', "")
+STAGE = os.environ.get('CLOUDMAN_CICD_STAGE', "")
+APP_NAME = os.environ.get('CLOUDMAN_CICD_APPNAME', "")
 
 
 def lambda_handler(event, context):
@@ -38,7 +40,7 @@ def lambda_handler(event, context):
         if key == "" or data == "":
             return {
                 'statusCode': 200,
-                'headers': cors_headers,
+                'headers': CORS_HEADERS,
                 'body': json.dumps('Key and Data must be a valid value.')
             }
         # Save or update the item in DynamoDB
@@ -46,7 +48,7 @@ def lambda_handler(event, context):
         print(f"Data saved or updated for key : {key} using {http_method}")
         return {
             'statusCode': 200,
-            'headers': cors_headers,
+            'headers': CORS_HEADERS,
             'body': json.dumps(f"Data saved or updated for key : {key}, using {http_method}")
         }
 
@@ -65,11 +67,11 @@ def lambda_handler(event, context):
 
         if 'Item' in response:
             print(f"Item retrieved for key: {key}")
-            # Considerando que AppName, Stage e Version já foram lidas anteriormente
+            # Considerando que APP_NAME, STAGE e VERSION já foram lidas anteriormente
             # Modifica o valor do atributo 'data' para adicionar a string desejada
             item = response['Item']
-            if 'data' in item and AppName != "":
-                item['data'] += f", from App Name:{AppName} Stage:{Stage} Version:{Version}"
+            if 'data' in item and APP_NAME != "":
+                item['data'] += f", from App Name:{APP_NAME} Stage:{STAGE} Version:{VERSION}"
 
             return {
                 'statusCode': 200,
@@ -86,6 +88,6 @@ def lambda_handler(event, context):
         print(f"Unsupported HTTP method: {http_method}")
         return {
             'statusCode': 400,
-            'headers': cors_headers,
+            'headers': CORS_HEADERS,
             'body': json.dumps('Unsupported HTTP method.')
         }

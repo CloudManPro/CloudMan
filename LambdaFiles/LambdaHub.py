@@ -14,7 +14,7 @@ try:
 except:
     xray_enabled = False
     print("XRay SDK not found!")
-XRay = os.getenv('XRay_Enabled', "False")
+XRay = os.getenv('XRAY_ENABLED', "False")
 if XRay == "False":
     xray_enabled = False
 
@@ -29,14 +29,14 @@ except:
 
 # Cria um clientes para acessar os serviço AWS
 
-Region = os.getenv("Region")
-AccountID = os.getenv("Account")
+Region = os.getenv("REGION")
+AccountID = os.getenv("ACCOUNT")
 sqs = boto3.client('sqs', region_name=Region)
 dynamodb = boto3.resource('dynamodb', region_name=Region)
 lambda_client = boto3.client('lambda', region_name=Region)
 sns = boto3.client('sns', region_name=Region)
 s3 = boto3.client('s3')
-LambdaName = os.getenv("LambdaName")
+LambdaName = os.getenv("LAMBDA_NAME")
 
 
 def execute_with_xray(segment_name, function, *args, **kwargs):
@@ -64,12 +64,11 @@ QueueTargetUrl = []
 Name = ""
 i = 0
 while True:
-    Name = os.getenv(f"aws_sqs_queue_Target_Name_{str(i)}")
-    Region = os.getenv(f"aws_sqs_queue_Target_Region_{str(i)}")
-    Account = os.getenv(f"aws_sqs_queue_Target_Account_{str(i)}")
+    Name = os.getenv(f"AWS_SQS_QUEUE_TARGET_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_SQS_QUEUE_TARGET_REGION_{str(i)}")
+    URL = os.getenv(f"AWS_SQS_QUEUE_TARGET_URL_{str(i)}")
     if Name != None:
         SQSTargetName.append(Name)
-        URL = f"https://sqs.{Region}.amazonaws.com/{Account}/{Name}"
         QueueTargetUrl.append(URL)
     else:
         SQSTargetMaxNumber = i
@@ -85,12 +84,11 @@ TopicTargetARN = []
 
 i = 0
 while True:
-    Name = os.getenv(f"aws_sns_topic_Target_Name_{str(i)}")
-    Region = os.getenv(f"aws_sns_topic_Target_Region_{str(i)}")
-    Account = os.getenv(f"aws_sns_topic_Target_Account_{str(i)}")
+    Name = os.getenv(f"AWS_SNS_TOPIC_TARGET_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_SNS_TOPIC_TARGET_REGION_{str(i)}")
+    ARN = os.getenv(f"AWS_SNS_TOPIC_TARGET_ARN_{str(i)}")
     if Name != None:
         SNSTargetName.append(Name)
-        ARN = f"arn:aws:sns:{Region}:{Account}:{Name}"
         TopicTargetARN.append(ARN)
     else:
         SNSTargetMaxNumber = i
@@ -104,9 +102,9 @@ TableNameTargetList = []
 ListDynamo = []
 i = 0
 while True:
-    TableName = os.getenv(f"aws_dynamodb_table_Target_Name_{str(i)}")
-    Region = os.getenv(f"aws_dynamodb_table_Target_Region_{str(i)}")
-    Account = os.getenv(f"aws_dynamodb_table_Target_Account_{str(i)}")
+    TableName = os.getenv(f"AWS_DYNAMODB_TABLE_TARGET_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_DYNAMODB_TABLE_TARGET_REGION_{str(i)}")
+    Account = os.getenv(f"AWS_DYNAMODB_TABLE_TARGET_ACCOUNT_{str(i)}")
     if TableName != None:
         TableNameTargetList.append([dynamodb.Table(TableName), TableName])
         ListDynamo.append(TableName)
@@ -126,9 +124,9 @@ LambdaMaxNumber = 0
 LambdaNameList = []
 i = 0
 while True:
-    Name = os.getenv(f"aws_lambda_function_Target_Name_{str(i)}")
-    Region = os.getenv(f"aws_lambda_function_Target_Region_{str(i)}")
-    Account = os.getenv(f"aws_lambda_function_Target_Account_{str(i)}")
+    Name = os.getenv(f"AWS_LAMBDA_FUNCTION_TARGET_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_LAMBDA_FUNCTION_TARGET_REGION_{str(i)}")
+    Account = os.getenv(f"AWS_LAMBDA_FUNCTION_TARGET_ACCOUNT_{str(i)}")
     if Name != None:
         LambdaNameList.append(Name)
         LambdaMaxNumber = i
@@ -142,62 +140,44 @@ CodeBuildMaxNumber = 0
 CodeBuildNameList = []
 i = 0
 while True:
-    Name = os.getenv(f"aws_codebuild_project_Target_Name_{str(i)}")
-    Region = os.getenv(f"aws_codebuild_project_Target_Region_{str(i)}")
-    Account = os.getenv(f"aws_codebuild_project_Target_Name_Account_{str(i)}")
-    if Name != None:
+    Name = os.getenv(f"AWS_CODEBUILD_PROJECT_TARGET_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_CODEBUILD_PROJECT_TARGET_REGION_{str(i)}")
+    Account = os.getenv(f"AWS_CODEBUILD_PROJECT_TARGET_ACCOUNT_{str(i)}")
+    if Name is not None:
         CodeBuildNameList.append(Name)
         CodeBuildMaxNumber = i
     else:
         break
     i += 1
 print(f"CodeBuild Target Total: {i} {CodeBuildNameList}")
+
 # **********Identifica cada S3 target **************************
 S3TargetMaxNumber = 0
-S3BucketTargetName = []
+S3BucketTarget = []
 i = 0
 while True:
-    Name = os.getenv(f"aws_s3_bucket_Target_Name_{str(i)}")
-    Region = os.getenv(f"aws_s3_bucket_Target_Region_{str(i)}")
-    Account = os.getenv(f"aws_s3_bucket_Target_Account_{str(i)}")
-    if Name != None:
-        S3BucketTargetName.append(Name)
+    Name = os.getenv(f"AWS_S3_BUCKET_TARGET_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_S3_BUCKET_TARGET_REGION_{str(i)}")
+    Account = os.getenv(f"AWS_S3_BUCKET_TARGET_ACCOUNT_{str(i)}")
+    if Name is not None:
+        S3BucketTarget.append([Name, Region])
     else:
         S3TargetMaxNumber = i
         break
     i += 1
-print(f"S3 Target Total: {i} {S3BucketTargetName}")
+print(f"S3 Target Total: {i} ")
 
 # **********Identifica EC2 target **************************
-
-
-def find_ec2_dns_by_tag(tag_key, tag_value, region_name):
-    ec2 = boto3.client('ec2', region_name=region_name)
-    # client.meta.config.connect_timeout = 5
-    # client.meta.config.read_timeout = 5
-    response = ec2.describe_instances(
-        Filters=[{'Name': f'tag:{tag_key}', 'Values': [tag_value]}])
-    public_dns = None
-    private_dns = None
-    for reservation in response['Reservations']:
-        for instance in reservation['Instances']:
-            if instance.get('PublicDnsName'):
-                public_dns = instance['PublicDnsName']
-            if instance.get('PrivateDnsName'):
-                private_dns = instance['PrivateDnsName']
-    return public_dns, private_dns
-
-
 EC2TargetDNS = []
 EC2TargetName = []
 i = 0
 while True:
-    Name = os.getenv(f"aws_instance_Target_Name_{str(i)}")
-    Region = os.getenv(f"aws_instance_Target_Region_{str(i)}")
-    if Name != None:
+    Name = os.getenv(f"AWS_INSTANCE_TARGET_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_INSTANCE_TARGET_REGION_{str(i)}")
+    if Name is not None:
         public_dns, private_dns = find_ec2_dns_by_tag('Name', Name, Region)
         EC2TargetName.append(Name)
-        if public_dns != None:
+        if public_dns is not None:
             EC2TargetDNS.append(public_dns)
             print("achou dns publico")
         else:
@@ -209,14 +189,13 @@ while True:
 print(f"EC2 Target Total: {i} {EC2TargetName}")
 
 # **************Inicializa EFS*********************************
-
 EFSList = []
 EFSNameList = []
 i = 0
 while True:
-    Name = os.getenv(f"aws_efs_file_system_Target_Name_{str(i)}")
-    if Name != None:
-        Path = os.getenv(f"aws_efs_access_point_Target_Path_{str(i)}")
+    Name = os.getenv(f"AWS_EFS_FILE_SYSTEM_TARGET_NAME_{str(i)}")
+    if Name is not None:
+        Path = os.getenv(f"AWS_EFS_ACCESS_POINT_TARGET_PATH_{str(i)}")
         EFSList.append(Path)
         EFSNameList.append(Name)
     else:
@@ -229,18 +208,14 @@ print(f"EFS Target Total: {i} {EFSNameList}")
 SSMParameterTargetName = []
 SSMParameterTargetRegion = []
 i = 0
-
 while True:
-    # Obtém o nome e a região do parâmetro a partir das variáveis de ambiente
-    Name = os.getenv(f"aws_ssm_parameter_Target_Name_{str(i)}")
-    Region = os.getenv(f"aws_ssm_parameter_Target_Region_{str(i)}")
+    Name = os.getenv(f"AWS_SSM_PARAMETER_TARGET_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_SSM_PARAMETER_TARGET_REGION_{str(i)}")
 
-    # Verifica se o nome do parâmetro foi encontrado
     if Name is not None and Region is not None:
         SSMParameterTargetName.append(Name)
         SSMParameterTargetRegion.append(Region)
     else:
-        # Encerra o loop se não encontrar mais parâmetros
         SSMParameterMaxNumber = i
         break
     i += 1
@@ -253,8 +228,8 @@ SQSSourceMaxNumber = 4
 SQSSourceName = []
 i = 0
 while True:
-    Name = os.getenv(f"aws_sqs_queue_Source_Name_{str(i)}")
-    if Name != None:
+    Name = os.getenv(f"AWS_SQS_QUEUE_SOURCE_NAME_{str(i)}")
+    if Name is not None:
         SQSSourceName.append(Name)
     else:
         SQSSourceMaxNumber = i
@@ -267,10 +242,10 @@ SNSSourceMaxNumber = 4
 SNSSourceName = []
 i = 0
 while True:
-    Name = os.getenv(f"aws_sns_topic_Source_Name_{str(i)}")
-    Region = os.getenv(f"aws_sns_topic_Source_Region_{str(i)}")
-    Account = os.getenv(f"aws_sns_topic_Source_Account_{str(i)}")
-    if Name != None:
+    Name = os.getenv(f"AWS_SNS_TOPIC_SOURCE_NAME_{str(i)}")
+    Region = os.getenv(f"AWS_SNS_TOPIC_SOURCE_REGION_{str(i)}")
+    Account = os.getenv(f"AWS_SNS_TOPIC_SOURCE_ACCOUNT_{str(i)}")
+    if Name is not None:
         SNSTargetName.append(Name)
     else:
         SNSSourceMaxNumber = i
@@ -283,8 +258,8 @@ S3SourceMaxNumber = 4
 S3BucketSourceName = []
 i = 0
 while True:
-    Name = os.getenv(f"aws_s3_bucket_Source_Name_{str(i)}")
-    if Name != None:
+    Name = os.getenv(f"AWS_S3_BUCKET_SOURCE_NAME_{str(i)}")
+    if Name is not None:
         S3BucketSourceName.append(Name)
     else:
         S3SourceMaxNumber = i
@@ -298,8 +273,8 @@ SecretNameList = []
 i = 0
 while True:
     SecretName = os.getenv(
-        f"aws_secretsmanager_secret_version_Source_Name_{i}")
-    SecretARN = os.getenv(f"aws_secretsmanager_secret_version_Source_ARN_{i}")
+        f"AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_{i}")
+    SecretARN = os.getenv(f"AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_{i}")
     if SecretName is not None:
         client = boto3.client('secretsmanager', region_name=Region)
         response = client.get_secret_value(SecretId=SecretARN)
@@ -312,8 +287,6 @@ while True:
         break
     i += 1
 print(f"Secret Source Total: {i} {SecretNameList}")
-
-# Funções para conectar e executar queries no MySQL
 
 
 def create_connection(host_name, user_name, user_password, db_name):
@@ -351,9 +324,9 @@ RDSConnections = []
 i = 0
 if MySQLEnabled:
     while True:
-        database = os.getenv(f"aws_db_instance_Target_Name_{i}")
+        database = os.getenv(f"AWS_DB_INSTANCE_TARGET_NAME_{i}")
         if database is not None:
-            EndPoint = os.getenv(f"aws_db_instance_Target_Endpoint_{i}")
+            EndPoint = os.getenv(f"AWS_DB_INSTANCE_TARGET_ENDPOINT_{i}")
             Host = EndPoint.split(":")[0]
             FoundSecret = False
             if len(SecretsCredentials) > 0:
@@ -415,6 +388,7 @@ def lambda_handler(event, context):
         Message = event['Records'][0]['body']
         Information = "Message from SQS " + SQSName
     elif EventSource == "aws:s3":
+        s3 = boto3.client('s3')
         EventSource += event['Records'][0]['s3']["bucket"]['arn'].split(
             ":")[-1]
         FileSize = str(event['Records'][0]['s3']['object']["size"])
@@ -471,6 +445,8 @@ def lambda_handler(event, context):
     # Define o nome da fila para envio da mensagem
     for i in range(SQSTargetMaxNumber):
         message_body = NewMessage
+        print("SQSTargetName[i], sqs.send_message, QueueUrl=QueueTargetUrl[i]",
+              SQSTargetName[i], QueueTargetUrl[i])
         response = execute_with_xray(
             SQSTargetName[i], sqs.send_message, QueueUrl=QueueTargetUrl[i], MessageBody=message_body)
         print('Mensagem SQS' + str(i) +
@@ -511,7 +487,9 @@ def lambda_handler(event, context):
 
     # *************************Bloco S3**********************************
     for i in range(S3TargetMaxNumber):
-        bucket_name = S3BucketTargetName[i]
+        bucket_name = S3BucketTarget[i][0]
+        S3Region = S3BucketTarget[i][1]
+        s3 = boto3.client('s3', region_name=S3Region)
         folder_name = LambdaName+"/"
         file_name = LambdaName + ":" + str(Agora) + ".txt"
         file_content = NewMessage
