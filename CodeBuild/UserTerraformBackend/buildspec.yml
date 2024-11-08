@@ -2,10 +2,12 @@ version: 0.2
 
 env:
   variables:
-    USER_ID: "seu_usuario_id"  # Defina conforme necessário
-    STATE_NAME: "seu_state_name"  # Defina conforme necessário
+    USER_ID: "seu_usuario_id"
+    STATE_NAME: "seu_state_name"
     COMMAND: "apply"  # ou "plan", "destroy", etc.
-    AWS_S3_BUCKET_SOURCE_NAME_0: "your-bucket-name"  # Nome do bucket S3 onde estão os arquivos
+    AWS_S3_BUCKET_SOURCE_NAME_0: "your-bucket-name"
+  export:
+    TF_PLUGIN_CACHE_DIR: "/tmp/.terraform.d/plugin-cache"
 
 phases:
   install:
@@ -21,28 +23,20 @@ phases:
       - echo "Instalando dependências do Python..."
       - pip install boto3 requests --quiet
 
-
   pre_build:
     commands:
       - echo "Preparando o ambiente..."
-      - echo "Criando diretório .terraform se não existir..."
-      - mkdir -p /tmp/states/${STATE_NAME}/.terraform
-      - echo "Sincronizando plugins do Terraform do diretório compartilhado no S3..."
-      - aws s3 sync s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/terraform-plugin-dir/.terraform/ /tmp/states/${STATE_NAME}/.terraform/ --quiet
-      
-      - echo "Definindo permissões de execução para os plugins do Terraform..."
-      - find /tmp/states/${STATE_NAME}/.terraform/ -type f -name "terraform-provider-*" -exec chmod +x {} \;
-      
+      - mkdir -p /tmp/states/${STATE_NAME}/
+      - echo "Sincronizando cache de plugins do Terraform do S3..."
+      - aws s3 sync s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/terraform-plugin-cache/ $TF_PLUGIN_CACHE_DIR/ --quiet
       - echo "Baixando arquivos Terraform e lockfile do S3..."
       - aws s3 cp s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/ /tmp/states/${STATE_NAME}/ --recursive --quiet
-
       - echo "Renomeando terraform.lock.hcl para .terraform.lock.hcl, se necessário..."
       - if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
           mv /tmp/states/${STATE_NAME}/terraform.lock.hcl /tmp/states/${STATE_NAME}/.terraform.lock.hcl;
         fi
-      
       - echo "Arquivos baixados do S3:"
-      - ls -al /tmp/states/${STATE_NAME}  # Lista arquivos no diretório de trabalho para verificação
+      - ls -al /tmp/states/${STATE_NAME}
       - echo "Modificando o arquivo main.tf e baixando arquivos adicionais do S3..."
       - python modify_main_tf.py
 
@@ -55,8 +49,8 @@ phases:
 
   post_build:
     commands:
-      - echo "Sincronizando plugins do Terraform para o diretório compartilhado no S3..."
-      - aws s3 sync /tmp/states/${STATE_NAME}/.terraform/ s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/terraform-plugin-dir/.terraform/ --quiet
+      - echo "Sincronizando cache de plugins do Terraform para o S3..."
+      - aws s3 sync $TF_PLUGIN_CACHE_DIR/ s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/terraform-plugin-cache/ --quiet
       - if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
           aws s3 cp /tmp/states/${STATE_NAME}/terraform.lock.hcl s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
         elif [ -f /tmp/states/${STATE_NAME}/.terraform.lock.hcl ]; then
@@ -69,3 +63,7 @@ phases:
 artifacts:
   files:
     - '**/*'
+
+cache:
+  paths:
+    - '/tmp/.terraform.d/plugin-cache/**/*'

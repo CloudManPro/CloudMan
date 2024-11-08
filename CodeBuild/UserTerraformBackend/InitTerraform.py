@@ -8,6 +8,9 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
+# Definir a variável de ambiente para o cache de plugins
+os.environ['TF_PLUGIN_CACHE_DIR'] = '/tmp/.terraform.d/plugin-cache'
+
 
 def run_terraform_init(working_dir, reconfigure=False):
     """Executa 'terraform init' para inicializar o Terraform, com a opção de reconfigurar."""
@@ -25,11 +28,6 @@ def run_terraform_init(working_dir, reconfigure=False):
             return run_terraform_init(working_dir, reconfigure=True)
         raise Exception("Falha na inicialização do Terraform")
     logger.info("Terraform inicializado com sucesso")
-
-
-# Configuração do logger
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 def run_terraform_command(command, working_dir):
@@ -66,8 +64,8 @@ def main():
         f"Parâmetros recebidos: user_id={user_id}, state_name={state_name}, command={command}")
 
     # Diretório de trabalho do CodeBuild
-    work_dir = '/tmp'
-    terraform_dir = os.path.join(work_dir, 'states', state_name)
+    work_dir = '/tmp/states/' + state_name
+    terraform_dir = work_dir
 
     if not os.path.exists(terraform_dir):
         logger.error(f"Diretório Terraform não encontrado: {terraform_dir}")
