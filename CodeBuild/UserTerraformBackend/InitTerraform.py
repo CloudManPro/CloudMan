@@ -8,24 +8,17 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
-# Definir a variável de ambiente para o cache de plugins
-os.environ['TF_PLUGIN_CACHE_DIR'] = '/tmp/.terraform.d/plugin-cache'
 
-
-def run_terraform_init(working_dir, reconfigure=False):
+def run_terraform_init(working_dir, reconfigure=True):
     """Executa 'terraform init' para inicializar o Terraform, com a opção de reconfigurar."""
     command = ["terraform", "init"]
     if reconfigure:
-        command.append("-reconfigure")
+        command.append("-reconfigure")  # Força reconfiguração do backend
 
     result = subprocess.run(command, cwd=working_dir,
                             capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"Erro ao inicializar o Terraform: {result.stderr}")
-        if "reconfigure" in result.stderr and not reconfigure:
-            logger.info(
-                "Detectada necessidade de reconfiguração. Tentando novamente com '-reconfigure'.")
-            return run_terraform_init(working_dir, reconfigure=True)
         raise Exception("Falha na inicialização do Terraform")
     logger.info("Terraform inicializado com sucesso")
 

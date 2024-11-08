@@ -2,12 +2,10 @@ version: 0.2
 
 env:
   variables:
-    USER_ID: "seu_usuario_id"
-    STATE_NAME: "seu_state_name"
+    USER_ID: "seu_usuario_id"  # Defina conforme necessário
+    STATE_NAME: "seu_state_name"  # Defina conforme necessário
     COMMAND: "apply"  # ou "plan", "destroy", etc.
-    AWS_S3_BUCKET_SOURCE_NAME_0: "your-bucket-name"
-  export:
-    TF_PLUGIN_CACHE_DIR: "/tmp/.terraform.d/plugin-cache"
+    AWS_S3_BUCKET_SOURCE_NAME_0: "your-bucket-name"  # Nome do bucket S3 onde estão os arquivos
 
 phases:
   install:
@@ -27,8 +25,6 @@ phases:
     commands:
       - echo "Preparando o ambiente..."
       - mkdir -p /tmp/states/${STATE_NAME}/
-      - echo "Sincronizando cache de plugins do Terraform do S3..."
-      - aws s3 sync s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/terraform-plugin-cache/ $TF_PLUGIN_CACHE_DIR/ --quiet
       - echo "Baixando arquivos Terraform e lockfile do S3..."
       - aws s3 cp s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/ /tmp/states/${STATE_NAME}/ --recursive --quiet
       - echo "Renomeando terraform.lock.hcl para .terraform.lock.hcl, se necessário..."
@@ -49,21 +45,10 @@ phases:
 
   post_build:
     commands:
-      - echo "Sincronizando cache de plugins do Terraform para o S3..."
-      - aws s3 sync $TF_PLUGIN_CACHE_DIR/ s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/terraform-plugin-cache/ --quiet
-      - if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
-          aws s3 cp /tmp/states/${STATE_NAME}/terraform.lock.hcl s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
-        elif [ -f /tmp/states/${STATE_NAME}/.terraform.lock.hcl ]; then
-          aws s3 cp /tmp/states/${STATE_NAME}/.terraform.lock.hcl s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
-        else
-          echo "Lockfile não encontrado, não há necessidade de sincronizar.";
-        fi
+      - echo "Sincronizando arquivos Terraform de volta para o S3..."
+      - aws s3 sync /tmp/states/${STATE_NAME}/ s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/ --recursive --quiet
       - echo "Build completado."
 
 artifacts:
   files:
     - '**/*'
-
-cache:
-  paths:
-    - '/tmp/.terraform.d/plugin-cache/**/*'
