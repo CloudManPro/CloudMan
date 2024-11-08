@@ -5,7 +5,7 @@ env:
     USER_ID: "seu_usuario_id"  # Defina conforme necessário
     STATE_NAME: "seu_state_name"  # Defina conforme necessário
     COMMAND: "apply"  # ou "plan", "destroy", etc.
-    aws_s3_bucket_Source_Name_0: "your-bucket-name"  # Nome do bucket S3 onde estão os arquivos
+    AWS_S3_BUCKET_SOURCE_NAME_0: "your-bucket-name"  # Nome do bucket S3 onde estão os arquivos
 
 phases:
   install:
@@ -28,13 +28,13 @@ phases:
       - echo "Criando diretório .terraform se não existir..."
       - mkdir -p /tmp/states/${STATE_NAME}/.terraform
       - echo "Sincronizando plugins do Terraform do diretório compartilhado no S3..."
-      - aws s3 sync s3://${aws_s3_bucket_Source_Name_0}/terraform-plugin-dir/.terraform/ /tmp/states/${STATE_NAME}/.terraform/ --quiet
+      - aws s3 sync s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/terraform-plugin-dir/.terraform/ /tmp/states/${STATE_NAME}/.terraform/ --quiet
       
       - echo "Definindo permissões de execução para os plugins do Terraform..."
       - find /tmp/states/${STATE_NAME}/.terraform/ -type f -name "terraform-provider-*" -exec chmod +x {} \;
       
       - echo "Baixando arquivos Terraform e lockfile do S3..."
-      - aws s3 cp s3://${aws_s3_bucket_Source_Name_0}/states/${STATE_NAME}/ /tmp/states/${STATE_NAME}/ --recursive --quiet
+      - aws s3 cp s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/ /tmp/states/${STATE_NAME}/ --recursive --quiet
 
       - echo "Renomeando terraform.lock.hcl para .terraform.lock.hcl, se necessário..."
       - if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
@@ -56,11 +56,11 @@ phases:
   post_build:
     commands:
       - echo "Sincronizando plugins do Terraform para o diretório compartilhado no S3..."
-      - aws s3 sync /tmp/states/${STATE_NAME}/.terraform/ s3://${aws_s3_bucket_Source_Name_0}/terraform-plugin-dir/.terraform/ --quiet
+      - aws s3 sync /tmp/states/${STATE_NAME}/.terraform/ s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/terraform-plugin-dir/.terraform/ --quiet
       - if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
-          aws s3 cp /tmp/states/${STATE_NAME}/terraform.lock.hcl s3://${aws_s3_bucket_Source_Name_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
+          aws s3 cp /tmp/states/${STATE_NAME}/terraform.lock.hcl s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
         elif [ -f /tmp/states/${STATE_NAME}/.terraform.lock.hcl ]; then
-          aws s3 cp /tmp/states/${STATE_NAME}/.terraform.lock.hcl s3://${aws_s3_bucket_Source_Name_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
+          aws s3 cp /tmp/states/${STATE_NAME}/.terraform.lock.hcl s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/terraform.lock.hcl --quiet;
         else
           echo "Lockfile não encontrado, não há necessidade de sincronizar.";
         fi
