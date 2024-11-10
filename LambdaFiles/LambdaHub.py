@@ -369,6 +369,7 @@ def lambda_handler(event, context):
     print("Event:", event)
     Information = "Source unknown!!"
     Message = "No Message!!"
+    EventSource = ""
     if 'CodePipeline.job' in event:
         EventSource = "aws:codepipeline"
     elif 'Records' in event:
