@@ -302,12 +302,12 @@ def download_and_process_files(bucket_name, json_data, command_type, is_test):
             logger.error(f"Erro ao acessar o arquivo {file_name}: {err}")
 
 
-bucket_name = os.getenv('aws_s3_bucket_Target_Name_0')
+bucket_name = os.getenv('AWS_S3_BUCKET_TARGET_NAME_0')
 logger.info(f"Nome do bucket obtido da variável de ambiente: {bucket_name}")
 
 if not bucket_name:
     raise EnvironmentError(
-        "Variável de ambiente 'aws_s3_bucket_Target_Name_0' não encontrada.")
+        "Variável de ambiente 'AWS_S3_BUCKET_TARGET_NAME_0' não encontrada.")
 
 command = os.getenv('Command')
 logger.info(f"Comando obtido da variável de ambiente: {command}")
