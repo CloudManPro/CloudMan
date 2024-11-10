@@ -1,10 +1,5 @@
 version: 0.2
 
-env:
-  variables:
-    aws_s3_bucket_Target_Name_0: "your-bucket-name"  # Nome do bucket S3 onde estão os arquivos
-    Command: "apply,/path/to/states"  # Comando e caminho, definir conforme necessário
-
 phases:
   install:
     commands:
@@ -18,7 +13,7 @@ phases:
       - echo "Installing Python dependencies..."
       - pip install boto3  # Instala boto3
       - echo "Downloading List.txt file from S3..."
-      - aws s3 cp s3://${aws_s3_bucket_Target_Name_0}/${path}/List.txt ./List.txt
+      - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/${path}/List.txt ./List.txt
       - echo "Content of the List.txt file:"
       - cat ./List.txt
       - echo "Installing Terraform..."
@@ -34,7 +29,7 @@ phases:
       - echo "Preparing build..."
       - echo "Syncing Terraform plugins from S3 to avoid re-downloading during init..."
       - mkdir -p /tmp/terraform/plugins/
-      - aws s3 sync s3://${aws_s3_bucket_Target_Name_0}/terraform-plugin-dir/.terraform/ /tmp/terraform/plugins/ --quiet
+      - aws s3 sync s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform/ /tmp/terraform/plugins/ --quiet
       - echo "Accessing the file from S3 bucket..."
 
   build:
@@ -45,5 +40,5 @@ phases:
   post_build:
     commands:
       - echo "Syncing updated Terraform plugins back to S3..."
-      - aws s3 sync /tmp/terraform/plugins/ s3://${aws_s3_bucket_Target_Name_0}/terraform-plugin-dir/.terraform/ --quiet
+      - aws s3 sync /tmp/terraform/plugins/ s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform/ --quiet
       - echo "Build completed successfully!"
