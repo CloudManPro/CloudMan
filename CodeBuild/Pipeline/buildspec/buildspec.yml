@@ -3,6 +3,7 @@ version: 0.2
 phases:
   install:
     commands:
+      - echo "Bucket Backend name:${AWS_S3_BUCKET_TARGET_NAME_0}"
       - echo "Reading and initializing the Command variable..."
       - |
         command_array=(${Command//,/ })
