@@ -11,12 +11,16 @@ import threading  # Import necessário para a thread de falha
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
-
-# Configuração do DynamoDB e S3
-dynamodb = boto3.resource('dynamodb', region_name='us-east-2')
-table_name = "TerraformBackend"
+user_id = os.getenv('USER_ID')
+state_name = os.getenv('STATE_NAME')
+command = os.getenv('COMMAND')
+build_id = os.getenv('CODEBUILD_BUILD_ID')
+s3_bucket = os.getenv('AWS_S3_BUCKET_SOURCE_NAME_0')
+s3_prefix = f"states/{state_name}/"
+table_name = os.getenv('AWS_DYNAMODB_TABLE_TARGET_NAME_0')
+dynamo_region = os.getenv('AWS_DYNAMODB_TABLE_TARGET_REGION_0')
+dynamodb = boto3.resource('dynamodb', region_name=dynamo_region)
 table = dynamodb.Table(table_name)
-
 s3_client = boto3.client('s3')
 
 ALLOWED_FILES = [
@@ -180,12 +184,6 @@ def register_build_in_dynamodb(build_id, s3_path):
 
 
 def main():
-    user_id = os.getenv('USER_ID')
-    state_name = os.getenv('STATE_NAME')
-    command = os.getenv('COMMAND')
-    build_id = os.getenv('CODEBUILD_BUILD_ID')
-    s3_bucket = os.getenv('AWS_S3_BUCKET_SOURCE_NAME_0')
-    s3_prefix = f"states/{state_name}/"
 
     logger.info(
         f"Parâmetros recebidos: user_id={user_id}, state_name={state_name}, command={command}, build_id={build_id}")
@@ -222,9 +220,9 @@ def main():
     if command == "destroy":
         delete_s3_prefix(s3_bucket, s3_prefix)
         delete_dynamodb_entry(s3_bucket, state_name)
-    else:
-        # Fazer upload dos arquivos necessários para o S3
-        upload_files_to_s3(work_dir, s3_bucket, s3_prefix)
+    # else:
+    #    # Fazer upload dos arquivos necessários para o S3
+    #    upload_files_to_s3(work_dir, s3_bucket, s3_prefix)
 
 
 if __name__ == "__main__":
