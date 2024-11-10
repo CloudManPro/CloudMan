@@ -100,6 +100,7 @@ def modify_main_tf(file_path, repo, branch):
             logger.info(f"Arquivo confirmado: {local_tmp_path}")
         else:
             logger.error(f"Arquivo ausente: {local_tmp_path}")
+    # logger.info(f"Arquivo: {content}")
 
 
 def main():
