@@ -5,14 +5,21 @@ phases:
     runtime-versions:
       python: 3.11
     commands:
+      - echo "Bucket Backend name:${AWS_S3_BUCKET_SOURCE_NAME_0}"
       - echo "Instalando dependências do Terraform..."
-      - curl -O https://releases.hashicorp.com/terraform/1.4.0/terraform_1.4.0_linux_arm64.zip --silent
-      - unzip -q terraform_1.4.0_linux_arm64.zip
+      - |
+        if [ -z "${TERRAFORM_VERSION}" ]; then
+          echo "A variável TERRAFORM_VERSION não está definida. Usando a versão padrão 1.4.0."
+          TERRAFORM_VERSION="1.4.0"
+        fi
+      - echo "Versão do Terraform:${TERRAFORM_VERSION}"
+      - wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_arm64.zip
+      - unzip -q terraform_${TERRAFORM_VERSION}_linux_arm64.zip
       - mkdir -p ~/.local/bin
       - mv terraform ~/.local/bin/
       - export PATH=$PATH:~/.local/bin
       - echo "Instalando dependências do Python..."
-      - pip install boto3 requests --quiet
+      - pip install boto3 requests --quiet  # Instala boto3 e requests
 
   pre_build:
     commands:
@@ -21,8 +28,9 @@ phases:
       - echo "Baixando arquivos Terraform e lockfile do S3..."
       - aws s3 cp s3://${AWS_S3_BUCKET_SOURCE_NAME_0}/states/${STATE_NAME}/ /tmp/states/${STATE_NAME}/ --recursive --quiet
       - echo "Renomeando terraform.lock.hcl para .terraform.lock.hcl, se necessário..."
-      - if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
-          mv /tmp/states/${STATE_NAME}/terraform.lock.hcl /tmp/states/${STATE_NAME}/.terraform.lock.hcl;
+      - |
+        if [ -f /tmp/states/${STATE_NAME}/terraform.lock.hcl ]; then
+          mv /tmp/states/${STATE_NAME}/terraform.lock.hcl /tmp/states/${STATE_NAME}/.terraform.lock.hcl
         fi
       - echo "Arquivos baixados do S3:"
       - ls -al /tmp/states/${STATE_NAME}
@@ -35,7 +43,3 @@ phases:
       - python InitTerraform.py
       - echo "Verificando se o terraform.lock.hcl foi criado..."
       - ls -al /tmp/states/${STATE_NAME}/
-
-artifacts:
-  files:
-    - '**/*'
