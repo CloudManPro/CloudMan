@@ -11,12 +11,13 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger()
 
 # Initialize AWS clients
-s3_client = boto3.client('s3')
+
 
 # Read environment variables
 bucket_name = os.getenv('AWS_S3_BUCKET_TARGET_NAME_0')
-# Ensure this matches your environment variables
-command = os.getenv('Command')
+bucket_region = os.getenv('AWS_S3_BUCKET_TARGET_REGION_0')
+s3_client = boto3.client('s3', region_name=bucket_region)
+
 build_id = os.getenv('CODEBUILD_BUILD_ID')
 table_name = os.getenv('AWS_DYNAMODB_TABLE_TARGET_NAME_0')
 dynamo_region = os.getenv('AWS_DYNAMODB_TABLE_TARGET_REGION_0')
@@ -26,19 +27,20 @@ user_id = os.getenv('USER_ID')
 if not bucket_name:
     raise EnvironmentError("Variable 'AWS_S3_BUCKET_TARGET_NAME_0' not found.")
 
+command = os.getenv('Command')
 if not command:
     raise EnvironmentError("Variable 'Command' not found.")
 
-# Parse command and path
 command_array = command.split(',')
 command_type = command_array[0]
 path = command_array[1] if len(command_array) > 1 else ''
 logger.info(f"Command type: {command_type}, Path: {path}")
-
-# Extract pipeline and stage names
 path_parts = path.split('/')
 PipelineName = path_parts[1] if len(path_parts) > 1 else ''
 CurrentStageName = path_parts[2] if len(path_parts) > 2 else ''
+
+# Get the directory where the current script is located
+script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Read List.txt
 local_file_path = os.path.join(os.getcwd(), 'List.txt')
@@ -46,6 +48,7 @@ try:
     with open(local_file_path, 'r', encoding='utf-8') as file:
         file_content = file.read()
     json_data = json.loads(file_content)
+    logger.info(f"Arquivo List.txt lido com sucesso")
 except Exception as err:
     logger.error(f"Error accessing or processing List.txt: {err}")
     json_data = {}
@@ -56,8 +59,6 @@ Approved = json_data.get("Approved", False)
 IsTest = json_data.get("IsTest", False)
 NextTestStageName = json_data.get("NextTestStageName", "")
 IsNextTest = NextTestStageName == CurrentStageName
-lambda_list = json_data.get("ListLambda", [])
-s3_list = json_data.get("ListS3", [])
 
 
 def main():
@@ -87,11 +88,21 @@ def main():
     handler.setFormatter(formatter)
     init_logger.addHandler(handler)
 
+    # Create a separate logger for modify_main_tf.py output without timestamp
+    modify_logger = logging.getLogger('ModifyMainTfLogger')
+    modify_logger.setLevel(logging.INFO)
+
+    # Create handler for modify_logger without timestamp
+    modify_handler = logging.StreamHandler()
+    modify_formatter = logging.Formatter('%(message)s')
+    modify_handler.setFormatter(modify_formatter)
+    modify_logger.addHandler(modify_handler)
+
     for state_name in states_to_process:
         logger.info(f"Processing state: {state_name}")
 
         # Create the necessary directory
-        state_dir = f"/tmp/states/{state_name}"
+        state_dir = os.path.join("/tmp/states", state_name)
         os.makedirs(state_dir, exist_ok=True)
 
         # Download necessary files from S3
@@ -106,6 +117,9 @@ def main():
                 logger.info(f"Downloaded {s3_key} to {local_file_path}")
             except Exception as e:
                 logger.warning(f"Could not download {s3_key}: {e}")
+                if file_name == 'main.tf':
+                    logger.error(f"'main.tf' is essential. Exiting.")
+                    sys.exit(1)
 
         # Rename terraform.lock.hcl to .terraform.lock.hcl if it exists
         lockfile_path = os.path.join(state_dir, 'terraform.lock.hcl')
@@ -117,13 +131,50 @@ def main():
         # Update only the STATE_NAME environment variable
         os.environ['STATE_NAME'] = state_name
 
-        # Call InitTerraform.py and capture output in real-time
+        # Verify that main.tf exists
+        main_tf_path = os.path.join(state_dir, 'main.tf')
+        if not os.path.isfile(main_tf_path):
+            logger.error(f"'main.tf' not found at {main_tf_path}")
+            sys.exit(1)
+
+        # Call modify_main_tf.py and capture output in real-time
         try:
+            logger.info(f"Calling modify_main_tf.py for state: {state_name}")
+            modify_main_tf_path = os.path.join(script_dir, 'modify_main_tf.py')
             process = subprocess.Popen(
-                ['python', 'InitTerraform.py'],
+                ['python', modify_main_tf_path, state_dir],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                universal_newlines=True
+                universal_newlines=True,
+                cwd=script_dir  # Run from the script directory
+            )
+            # Read and log output in real-time
+            for stdout_line in iter(process.stdout.readline, ""):
+                if stdout_line:
+                    modify_logger.info(stdout_line.strip())
+            process.stdout.close()
+            return_code = process.wait()
+            if return_code != 0:
+                logger.error(
+                    f"modify_main_tf.py failed for state {state_name} with return code {return_code}")
+                sys.exit(1)
+            logger.info(
+                f"modify_main_tf.py executed successfully for state: {state_name}")
+        except Exception as e:
+            logger.error(
+                f"Error executing modify_main_tf.py for state {state_name}: {e}")
+            sys.exit(1)
+
+        # Call InitTerraform.py and capture output in real-time
+        try:
+            logger.info(f"Calling InitTerraform.py for state: {state_name}")
+            init_terraform_path = os.path.join(script_dir, 'InitTerraform.py')
+            process = subprocess.Popen(
+                ['python', init_terraform_path, state_dir],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                cwd=script_dir  # Run from the script directory
             )
             # Read and log output in real-time
             for stdout_line in iter(process.stdout.readline, ""):
@@ -135,21 +186,56 @@ def main():
                 logger.error(
                     f"InitTerraform.py failed for state {state_name} with return code {return_code}")
                 sys.exit(1)
+            logger.info(
+                f"InitTerraform.py executed successfully for state: {state_name}")
         except Exception as e:
             logger.error(
                 f"Error executing InitTerraform.py for state {state_name}: {e}")
             sys.exit(1)
 
-    # Additional operations based on command type
-    if command_type == "destroy":
-        if Approved and IsNextTest:
-            # Delete temporary files or perform other cleanup
-            temp_prefix = f"temp/{PipelineName}"
-            # Implement deletion of temp_prefix in S3 if necessary
-            logger.info(f"Cleanup completed for temp prefix: {temp_prefix}")
-        elif not Approved:
-            logger.error("Build failed: test was rejected")
+    if command_type == "apply":
+        logger.info(
+            "Comando 'apply' detectado. Iniciando execução de Copy.py para copiar recursos.")
+        try:
+            # Definir o caminho para Copy.py (assumindo que está no mesmo diretório que o script atual)
+            copy_script_path = os.path.join(script_dir, 'Copy.py')
+
+            if not os.path.isfile(copy_script_path):
+                logger.error(
+                    f"Copy.py não encontrado no caminho: {copy_script_path}")
+                sys.exit(1)
+
+            # Executar Copy.py como um subprocesso
+            process = subprocess.Popen(
+                ['python', copy_script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True
+            )
+
+            # Ler e registrar a saída de Copy.py em tempo real
+            for stdout_line in iter(process.stdout.readline, ""):
+                if stdout_line:
+                    logger.info(f"Copy.py: {stdout_line.strip()}")
+
+            process.stdout.close()
+            return_code = process.wait()
+
+            if return_code != 0:
+                logger.error(
+                    f"Copy.py falhou com o código de retorno {return_code}")
+                sys.exit(1)
+
+            logger.info("Copy.py executado com sucesso.")
+        except Exception as e:
+            logger.error(f"Erro ao executar Copy.py: {e}")
             sys.exit(1)
+    # **Fim da Adição da Chamada para Copy.py**
+
+    if not Approved and command_type == "destroy":
+        logger.info(
+            f"Gerando erro para o poder se fazer retry no CodePipeline devido a não aprovação da última versão (green).")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

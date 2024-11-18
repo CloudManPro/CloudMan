@@ -22,6 +22,7 @@ dynamo_region = os.getenv('AWS_DYNAMODB_TABLE_TARGET_REGION_0')
 dynamodb = boto3.resource('dynamodb', region_name=dynamo_region)
 table = dynamodb.Table(table_name)
 s3_client = boto3.client('s3')
+logger.info(f"InitTerraform command: {command}")
 
 ALLOWED_FILES = [
     '.terraform.lock.hcl',
