@@ -96,8 +96,23 @@ def copy_s3_object(s3_client, source_bucket_name, target_bucket_name, obj_key):
         logger.info(
             f"Iniciando cópia do objeto {obj_key} de {source_bucket_name} para {target_bucket_name}")
 
+        # Get the source object's metadata
+        head_object = s3_client.head_object(
+            Bucket=source_bucket_name, Key=obj_key)
+        metadata = head_object.get('Metadata', {})
+        content_type = head_object.get('ContentType')
+
         copy_source = {'Bucket': source_bucket_name, 'Key': obj_key}
-        s3_client.copy(copy_source, target_bucket_name, obj_key)
+
+        # Prepare ExtraArgs
+        extra_args = {
+            'MetadataDirective': 'REPLACE',
+            'ContentType': content_type,
+            'Metadata': metadata
+        }
+
+        s3_client.copy(copy_source, target_bucket_name,
+                       obj_key, ExtraArgs=extra_args)
 
         logger.info(
             f"Objeto {obj_key} copiado com sucesso para {target_bucket_name}")
