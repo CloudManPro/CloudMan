@@ -7,10 +7,14 @@ import time
 from botocore.exceptions import ClientError
 import threading  # Import necessário para a thread de falha
 
-# Configure o logger
+# Configure o logger com nível WARNING por padrão
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
+# Reduzir os logs de boto3, botocore e urllib3 para WARNING
+logging.getLogger('boto3').setLevel(logging.WARNING)
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 user_id = os.getenv('USER_ID')
 state_name = os.getenv('STATE_NAME')
 command = os.getenv('COMMAND')
