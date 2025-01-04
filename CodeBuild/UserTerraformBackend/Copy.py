@@ -8,7 +8,8 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 import tempfile
-import time  # Necessário para implementar delays
+import time
+import mimetypes
 
 # Configuração do logger com nível DEBUG e formato detalhado
 logging.basicConfig(level=logging.DEBUG,
@@ -90,13 +91,13 @@ def copy_lambda_function(source_lambda_name, source_region, target_lambda_name, 
             f"Erro ao copiar a Lambda {source_lambda_name} para {target_lambda_name}: {e}")
 
 
-# Função para copiar um objeto S3
+# Função para copiar um objeto S3 preservando metadados
 def copy_s3_object(s3_client, source_bucket_name, target_bucket_name, obj_key):
     try:
         logger.info(
             f"Iniciando cópia do objeto {obj_key} de {source_bucket_name} para {target_bucket_name}")
 
-        # Get the source object's metadata
+        # Obter os metadados do objeto de origem
         head_object = s3_client.head_object(
             Bucket=source_bucket_name, Key=obj_key)
         metadata = head_object.get('Metadata', {})
@@ -104,7 +105,7 @@ def copy_s3_object(s3_client, source_bucket_name, target_bucket_name, obj_key):
 
         copy_source = {'Bucket': source_bucket_name, 'Key': obj_key}
 
-        # Prepare ExtraArgs
+        # Preparar ExtraArgs para preservar os metadados
         extra_args = {
             'MetadataDirective': 'REPLACE',
             'ContentType': content_type,
@@ -160,13 +161,8 @@ def sync_s3_buckets(source_bucket_name, target_bucket_name, region, max_workers=
             f"Erro ao sincronizar o bucket {source_bucket_name} para {target_bucket_name}: {e}")
 
 
-# Funções auxiliares para o processo de backup em 'test'
-
-
-def download_lambda_code(target_lambda_name, source_region):
-    """
-    Baixa o código da Lambda de destino e salva sem o sufixo.
-    """
+# Função para baixar o código de uma Lambda
+def download_lambda_code(target_lambda_name, source_region, backup_dir):
     source_client = boto3.client('lambda', region_name=source_region)
     try:
         logger.info(
@@ -176,37 +172,73 @@ def download_lambda_code(target_lambda_name, source_region):
         response = requests.get(code_url)
         logger.info(
             f"Código da Lambda {target_lambda_name} baixado com sucesso")
-        # Salvar o nome sem sufixo no backup
-        stripped_name = strip_suffix(target_lambda_name)
-        backup_lambda_path = f"Lambdas/{stripped_name}.zip"
-        return (backup_lambda_path, response.content, stripped_name)
+
+        # Identificar o nome original da Lambda (assumindo que 'target_lambda_name' já é o nome de destino)
+        source_lambda_name = get_source_name(
+            target_lambda_name, is_test_stage=True)
+
+        # Salvar o nome original no mapeamento
+        mapping = {}
+        mapping_path = os.path.join(backup_dir, "lambda_mapping.json")
+        if os.path.exists(mapping_path):
+            with open(mapping_path, 'r') as map_file:
+                mapping = json.load(map_file)
+
+        mapping[target_lambda_name] = source_lambda_name
+
+        with open(mapping_path, 'w') as map_file:
+            json.dump(mapping, map_file, indent=4)
+        logger.info(f"Mapeamento salvo em {mapping_path}")
+
+        # Salvar o conteúdo no diretório Lambdas com o nome original
+        backup_lambda_path = f"Lambdas/{source_lambda_name}.zip"
+        return (backup_lambda_path, response.content, source_lambda_name)
     except Exception as e:
         logger.error(
             f"Erro ao baixar código da Lambda {target_lambda_name}: {e}")
         return None
 
 
-def download_s3_object(bucket_name, obj_key):
-    """
-    Baixa um objeto S3 e salva no caminho sem sufixo no backup.
-    """
+# Função para baixar um objeto S3 e salvar metadados
+def download_s3_object(bucket_name, obj_key, s3_client, backup_dir):
     try:
         logger.info(f"Baixando objeto {obj_key} do bucket {bucket_name}")
-        # Ajustar região conforme necessário
-        s3_client = boto3.client('s3', region_name='us-east-1')
         response = s3_client.get_object(Bucket=bucket_name, Key=obj_key)
         content = response['Body'].read()
         logger.info(f"Objeto {obj_key} baixado com sucesso")
+
+        # Obter metadados do objeto
+        metadata = response.get('Metadata', {})
+        content_type = response.get('ContentType')
+
         # Remover o sufixo do bucket para salvar no backup
         stripped_bucket_name = strip_suffix(bucket_name)
         backup_s3_path = f"S3/{stripped_bucket_name}/{obj_key}"
-        return (backup_s3_path, content)
+
+        # Salvar o conteúdo no backup
+        target_path = os.path.join(backup_dir, backup_s3_path)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, 'wb') as f:
+            f.write(content)
+        logger.info(f"Objeto S3 salvo em {target_path}")
+
+        # Salvar metadados em um arquivo JSON
+        metadata_path = f"{target_path}.metadata.json"
+        with open(metadata_path, 'w') as meta_file:
+            json.dump({
+                'ContentType': content_type,
+                'Metadata': metadata
+            }, meta_file)
+        logger.info(f"Metadados do objeto {obj_key} salvos em {metadata_path}")
+
+        return True
     except Exception as e:
         logger.error(
             f"Erro ao baixar objeto {obj_key} do bucket {bucket_name}: {e}")
-        return None
+        return False
 
 
+# Função para criar um arquivo ZIP de uma pasta
 def create_zip_of_folder(folder_path):
     try:
         logger.info(f"Criando arquivo ZIP da pasta {folder_path}")
@@ -226,6 +258,24 @@ def create_zip_of_folder(folder_path):
         return None
 
 
+# Função para extrair um arquivo ZIP
+def extract_zip(zip_path, extract_to):
+    """
+    Extrai o conteúdo do arquivo ZIP para o diretório especificado.
+    """
+    try:
+        logger.info(f"Extraindo arquivo ZIP {zip_path} para {extract_to}")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+        logger.info(
+            f"Arquivo ZIP {zip_path} extraído com sucesso para {extract_to}")
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao extrair o arquivo ZIP {zip_path}: {e}")
+        return False
+
+
+# Função para fazer upload de um arquivo ZIP para o S3
 def upload_to_s3_in_memory(s3_client, bucket_name, object_key, zip_buffer):
     try:
         logger.info(
@@ -237,6 +287,7 @@ def upload_to_s3_in_memory(s3_client, bucket_name, object_key, zip_buffer):
         logger.error(f"Erro ao fazer upload do arquivo ZIP para S3: {e}")
 
 
+# Função para fazer upload do código de uma Lambda com tentativas de retry
 def upload_lambda_code(target_lambda_name, target_region, zip_content, max_retries=5):
     target_client = boto3.client('lambda', region_name=target_region)
     attempt = 0
@@ -253,7 +304,7 @@ def upload_lambda_code(target_lambda_name, target_region, zip_content, max_retri
             return  # Saia da função se o upload for bem-sucedido
         except target_client.exceptions.ResourceConflictException as e:
             attempt += 1
-            wait_time = 2 ** attempt  # Espera exponencial: 2, 4, 8, 16, 32 segundos
+            wait_time = 2 ** attempt  # Espera exponencial
             logger.warning(
                 f"ResourceConflictException ao atualizar a Lambda {target_lambda_name}: {e}. Tentando novamente em {wait_time} segundos...")
             time.sleep(wait_time)
@@ -265,94 +316,24 @@ def upload_lambda_code(target_lambda_name, target_region, zip_content, max_retri
         f"Falha ao atualizar a Lambda {target_lambda_name} após {max_retries} tentativas.")
 
 
-# Novas Funções para Restauração
-
-
-def download_backup_zip(s3_client, backup_bucket_name, backup_object_key, download_path):
-    """
-    Baixa o arquivo ZIP de backup do bucket S3 para um caminho local.
-    """
-    try:
-        logger.info(
-            f"Baixando arquivo de backup {backup_object_key} do bucket {backup_bucket_name} para {download_path}")
-        s3_client.download_file(
-            backup_bucket_name, backup_object_key, download_path)
-        logger.info(
-            f"Arquivo de backup baixado com sucesso para {download_path}")
-        return True
-    except Exception as e:
-        logger.error(
-            f"Erro ao baixar o arquivo de backup {backup_object_key} do bucket {backup_bucket_name}: {e}")
-        return False
-
-
-def extract_zip(zip_path, extract_to):
-    """
-    Extrai o conteúdo do arquivo ZIP para o diretório especificado.
-    """
-    try:
-        logger.info(f"Extraindo arquivo ZIP {zip_path} para {extract_to}")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_to)
-        logger.info(f"Arquivo ZIP extraído com sucesso para {extract_to}")
-        return True
-    except Exception as e:
-        logger.error(f"Erro ao extrair o arquivo ZIP {zip_path}: {e}")
-        return False
-
-
-def upload_lambda_from_backup(lambda_backup_mapping, target_lambda_name, target_region):
-    """
-    Faz upload do código ZIP da Lambda a partir do backup para a Lambda de destino.
-    """
-    stripped_lambda_name = strip_two_suffixes(target_lambda_name)
-    zip_content = lambda_backup_mapping.get(stripped_lambda_name)
-    if zip_content:
-        upload_lambda_code(target_lambda_name, target_region, zip_content)
-    else:
-        logger.warning(
-            f"Não foi encontrado o arquivo ZIP para a Lambda {stripped_lambda_name}. Upload para a Lambda {target_lambda_name} será ignorado.")
-
-
+# Função para fazer upload de objetos S3 a partir do backup, preservando metadados
 def upload_s3_from_backup(extracted_backup_dir, target_s3):
-    """
-    Faz upload dos objetos S3 a partir do backup para o bucket de destino.
-
-    Logs adicionais foram adicionados para melhorar a depuração, incluindo:
-    - Nomes dos buckets de origem e destino
-    - Caminhos completos dos arquivos de backup
-    - Chaves dos objetos S3
-    - Informações sobre cada etapa do processo de upload
-    """
     logger.info("Iniciando a função 'upload_s3_from_backup'.")
 
-    # Validação da estrutura de target_s3
     if len(target_s3) != 3:
         logger.warning(f"Par inválido encontrado em ListS3: {target_s3}")
         return
 
     target_bucket_name, target_region, target_account_id = target_s3
-    logger.debug(
-        f"Desempacotado target_s3: bucket='{target_bucket_name}', region='{target_region}', account_id='{target_account_id}'")
-
-    # Remover os dois últimos sufixos do bucket de destino para localizar o backup
     stripped_bucket_name = strip_two_suffixes(target_bucket_name)
     backup_s3_path = f"S3/{stripped_bucket_name}"
-    logger.debug(f"Nome do bucket sem sufixos: '{stripped_bucket_name}'")
-    logger.debug(f"Caminho de backup S3: '{backup_s3_path}'")
-
-    # Caminho completo no backup
     backup_s3_full_path = os.path.join(extracted_backup_dir, backup_s3_path)
-    logger.debug(
-        f"Caminho completo do backup S3 no sistema de arquivos local: '{backup_s3_full_path}'")
 
-    # Verificar se o diretório de backup existe
     if not os.path.exists(backup_s3_full_path):
         logger.warning(
             f"Diretório de backup para o bucket S3 '{stripped_bucket_name}' não existe em '{backup_s3_full_path}'. Upload será ignorado.")
         return
 
-    # Inicializar o cliente S3 para a região de destino
     try:
         s3_client = boto3.client('s3', region_name=target_region)
         logger.info(
@@ -362,38 +343,49 @@ def upload_s3_from_backup(extracted_backup_dir, target_s3):
             f"Falha ao inicializar o cliente S3 para a região '{target_region}': {e}")
         return
 
-    # Iterar sobre todos os objetos no diretório de backup S3
-    logger.info(
-        f"Iniciando iteração sobre os objetos no diretório de backup S3: '{backup_s3_full_path}'")
     for root, dirs, files in os.walk(backup_s3_full_path):
         for file in files:
+            if file.endswith('.metadata.json'):
+                continue  # Ignorar arquivos de metadados
             file_path = os.path.join(root, file)
-            logger.debug(f"Arquivo encontrado no backup: '{file_path}'")
-
-            # Determinar a chave do objeto S3
             relative_path = os.path.relpath(
                 file_path, start=backup_s3_full_path)
             obj_key = relative_path.replace(os.path.sep, '/')
-            logger.debug(f"Caminho relativo do arquivo: '{relative_path}'")
-            logger.debug(f"Chave do objeto S3 para upload: '{obj_key}'")
 
-            # Log detalhado antes do upload
+            # Obter Content-Type e Metadados do arquivo de metadados correspondente
+            metadata_file_path = f"{file_path}.metadata.json"
+            if os.path.exists(metadata_file_path):
+                with open(metadata_file_path, 'r') as meta_file:
+                    metadata = json.load(meta_file)
+                content_type = metadata.get(
+                    'ContentType', 'binary/octet-stream')
+                extra_args = {
+                    'ContentType': content_type,
+                    'Metadata': metadata.get('Metadata', {})
+                }
+            else:
+                # Se não houver arquivo de metadados, usar mimetypes
+                content_type, _ = mimetypes.guess_type(file_path)
+                if content_type is None:
+                    content_type = 'binary/octet-stream'
+                extra_args = {'ContentType': content_type}
+
             logger.info(
-                f"Iniciando upload do objeto '{obj_key}' para o bucket '{target_bucket_name}'.")
-            logger.debug(
-                f"Caminho completo do arquivo local para upload: '{file_path}'")
+                f"Iniciando upload do objeto '{obj_key}' para o bucket '{target_bucket_name}' com Content-Type '{extra_args.get('ContentType')}'.")
 
             try:
                 with open(file_path, 'rb') as data:
-                    s3_client.upload_fileobj(data, target_bucket_name, obj_key)
+                    s3_client.upload_fileobj(
+                        data,
+                        target_bucket_name,
+                        obj_key,
+                        ExtraArgs=extra_args
+                    )
                 logger.info(
                     f"Objeto '{obj_key}' enviado com sucesso para o bucket '{target_bucket_name}'.")
-                logger.debug(f"Upload concluído para o objeto '{obj_key}'.")
             except Exception as e:
                 logger.error(
                     f"Erro ao enviar o objeto '{obj_key}' para o bucket '{target_bucket_name}': {e}")
-                logger.debug(f"Detalhes do erro: {e}")
-                # Opcional: Registrar stack trace completo para erros críticos
                 logger.exception(
                     f"Exceção ao enviar o objeto '{obj_key}': {e}")
 
@@ -441,44 +433,6 @@ s3_list = json_data.get("ListS3", [])
 if CurrentStageName.lower() == "test":
     logger.info("CurrentStageName é 'test'. Iniciando processo de backup.")
 
-    # Processar ListLambda
-    logger.info(
-        f"Iniciando processamento de ListLambda com {len(lambda_list)} recursos")
-
-    for target_lambda in lambda_list:
-        if isinstance(target_lambda, list) and len(target_lambda) == 3:
-            target_lambda_name, target_region, target_account_id = target_lambda
-
-            # Identificar o nome da fonte
-            source_lambda_name = get_source_name(
-                target_lambda_name, is_test_stage=True)
-
-            # Realizar a cópia da Lambda de fonte para destino
-            copy_lambda_function(source_lambda_name, target_region,
-                                 target_lambda_name, target_region, target_account_id)
-        else:
-            logger.warning(
-                f"Formato inválido encontrado em ListLambda: {target_lambda}")
-
-    # Processar ListS3
-    logger.info(
-        f"Iniciando processamento de ListS3 com {len(s3_list)} buckets")
-
-    for target_s3 in s3_list:
-        if isinstance(target_s3, list) and len(target_s3) == 3:
-            target_bucket_name, target_region, target_account_id = target_s3
-
-            # Identificar o nome da fonte
-            source_bucket_name = get_source_name(
-                target_bucket_name, is_test_stage=True)
-
-            # Sincronizar buckets S3 de fonte para destino
-            sync_s3_buckets(source_bucket_name,
-                            target_bucket_name, target_region)
-        else:
-            logger.warning(
-                f"Formato inválido encontrado em ListS3: {target_s3}")
-
     # Processo de Backup
     backup_bucket_name = os.getenv('AWS_S3_BUCKET_TARGET_NAME_0')
     backup_bucket_region = os.getenv('AWS_S3_BUCKET_TARGET_REGION_0')
@@ -499,22 +453,22 @@ if CurrentStageName.lower() == "test":
         logger.info("Baixando códigos das Lambdas para backup.")
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_lambda = {
-                executor.submit(download_lambda_code, target_lambda[0], target_lambda[1]): target_lambda for target_lambda in lambda_list if isinstance(target_lambda, list) and len(target_lambda) == 3
+                executor.submit(download_lambda_code, target_lambda[0], target_lambda[1], backup_dir): target_lambda for target_lambda in lambda_list if isinstance(target_lambda, list) and len(target_lambda) == 3
             }
             # Armazenar mapeamento de Lambda base para conteúdo do ZIP
             lambda_backup_mapping = {}
             for future in as_completed(future_to_lambda):
                 result = future.result()
                 if result:
-                    backup_lambda_path, content, stripped_name = result
-                    # Salvar o conteúdo no diretório Lambdas
+                    backup_lambda_path, content, source_name = result
+                    # Salvar o conteúdo no diretório Lambdas com o nome original
                     target_path = os.path.join(backup_dir, backup_lambda_path)
                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
                     with open(target_path, 'wb') as f:
                         f.write(content)
                     logger.info(f"Arquivo Lambda salvo em {target_path}")
-                    # Mapear o nome base da Lambda para o conteúdo do ZIP
-                    lambda_backup_mapping[stripped_name] = content
+                    # Mapear o nome de destino para o conteúdo do ZIP
+                    lambda_backup_mapping[source_name] = content
 
         # Baixar objetos S3
         logger.info("Baixando objetos S3 para backup.")
@@ -528,7 +482,7 @@ if CurrentStageName.lower() == "test":
                         region_to_s3_client[target_region] = boto3.client(
                             's3', region_name=target_region)
 
-            future_to_s3 = {}
+            futures = []
             for target_s3 in s3_list:
                 if isinstance(target_s3, list) and len(target_s3) == 3:
                     target_bucket_name, target_region, target_account_id = target_s3
@@ -543,24 +497,12 @@ if CurrentStageName.lower() == "test":
                                     logger.debug(
                                         f"Objeto {obj_key} é um diretório. Pulando.")
                                     continue  # Ignorar diretórios
-                                # Remover o sufixo do bucket de destino para armazenar no backup
-                                stripped_bucket_name = strip_suffix(
-                                    target_bucket_name)
-                                backup_s3_path = f"S3/{stripped_bucket_name}/{obj_key}"
-                                future = executor.submit(
-                                    download_s3_object, target_bucket_name, obj_key)
-                                future_to_s3[future] = backup_s3_path
+                                futures.append(executor.submit(
+                                    download_s3_object, target_bucket_name, obj_key, s3_client, backup_dir))
 
-            for future in as_completed(future_to_s3):
-                result = future.result()
-                if result:
-                    backup_s3_path, content = result
-                    # Salvar o conteúdo no diretório S3 com caminho sem sufixo
-                    target_path = os.path.join(backup_dir, backup_s3_path)
-                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                    with open(target_path, 'wb') as f:
-                        f.write(content)
-                    logger.info(f"Objeto S3 salvo em {target_path}")
+            # Aguardar a conclusão de todas as tarefas
+            for future in as_completed(futures):
+                future.result()  # Levanta exceções, se houver
 
         # Verificar se a pasta de backup não está vazia antes de criar o ZIP
         if os.listdir(lambdas_dir) or os.listdir(s3_dir):
@@ -571,8 +513,6 @@ if CurrentStageName.lower() == "test":
 
             if zip_buffer:
                 # Definir chave do objeto no bucket de backup
-                # Supondo que o formato de CopyArtifactS3Path seja "/CopyArtifact/PipelineName/Version"
-                # Extraindo prefixo
                 clean_path = CopyArtifactS3Path.lstrip('/')
                 backup_object_key = f"{clean_path}/backup_{Version}.zip"
 
@@ -595,16 +535,36 @@ if CurrentStageName.lower() == "test":
             if isinstance(target_lambda, list) and len(target_lambda) == 3:
                 target_lambda_name, target_region, target_account_id = target_lambda
 
-                # Obter o conteúdo do ZIP do backup usando o nome base
-                stripped_name = strip_two_suffixes(target_lambda_name)
-                zip_content = lambda_backup_mapping.get(stripped_name)
-                if zip_content:
-                    # Fazer upload para a Lambda de destino com lógica de retry
-                    upload_lambda_code(target_lambda_name,
-                                       target_region, zip_content)
+                # Obter o nome original da Lambda a partir do mapeamento
+                # Carregar o mapeamento de Lambdas
+                mapping_path = os.path.join(backup_dir, "lambda_mapping.json")
+                if os.path.exists(mapping_path):
+                    with open(mapping_path, 'r') as map_file:
+                        lambda_mapping = json.load(map_file)
+                    logger.info(
+                        f"Mapeamento de Lambdas carregado de {mapping_path}")
+                else:
+                    logger.error(
+                        f"Arquivo de mapeamento {mapping_path} não encontrado. Upload das Lambdas será ignorado.")
+                    lambda_mapping = {}
+
+                source_lambda_name = lambda_mapping.get(target_lambda_name)
+                if source_lambda_name:
+                    # Caminho do arquivo ZIP correspondente
+                    zip_file_path = os.path.join(
+                        backup_dir, "Lambdas", f"{source_lambda_name}.zip")
+                    if os.path.exists(zip_file_path):
+                        with open(zip_file_path, 'rb') as f:
+                            zip_content = f.read()
+                        # Fazer upload para a Lambda de destino com lógica de retry
+                        upload_lambda_code(
+                            target_lambda_name, target_region, zip_content)
+                    else:
+                        logger.warning(
+                            f"Arquivo de backup {zip_file_path} não encontrado para a Lambda {target_lambda_name}. Upload será ignorado.")
                 else:
                     logger.warning(
-                        f"Não foi encontrado o arquivo ZIP para a Lambda {stripped_name}. Upload para a Lambda {target_lambda_name} será ignorado.")
+                        f"Não foi encontrado o mapeamento para a Lambda {target_lambda_name}. Upload será ignorado.")
             else:
                 logger.warning(
                     f"Formato inválido encontrado em ListLambda: {target_lambda}")
@@ -632,8 +592,16 @@ else:
         backup_object_key = f"{clean_path}/backup_{Version}.zip"
 
         # Baixar o arquivo ZIP de backup
-        download_success = download_backup_zip(
-            s3_backup_client, backup_bucket_name, backup_object_key, backup_zip_path)
+        try:
+            s3_backup_client.download_file(
+                backup_bucket_name, backup_object_key, backup_zip_path)
+            download_success = True
+            logger.info(
+                f"Arquivo ZIP de backup baixado com sucesso de s3://{backup_bucket_name}/{backup_object_key}")
+        except Exception as e:
+            logger.error(
+                f"Falha ao baixar o arquivo ZIP de backup de s3://{backup_bucket_name}/{backup_object_key}: {e}")
+            download_success = False
 
         if download_success:
             # Extrair o arquivo ZIP de backup
@@ -644,22 +612,16 @@ else:
                 logger.info(
                     "Iniciando restauração das Lambdas a partir do backup.")
                 # Carregar novamente o mapeamento de backup após extrair
-                # Neste contexto, assumimos que os arquivos ZIP das Lambdas estão em restore_dir/Lambdas/
                 lambda_backup_mapping = {}
-                lambdas_backup_path = os.path.join(restore_dir, "Lambdas")
-                if os.path.exists(lambdas_backup_path):
-                    for file in os.listdir(lambdas_backup_path):
-                        if file.endswith('.zip'):
-                            lambda_name = file.replace('.zip', '')
-                            file_path = os.path.join(lambdas_backup_path, file)
-                            with open(file_path, 'rb') as f:
-                                content = f.read()
-                            lambda_backup_mapping[lambda_name] = content
-                            logger.info(
-                                f"Arquivo Lambda {file} carregado para restauração.")
+                mapping_path = os.path.join(restore_dir, "lambda_mapping.json")
+                if os.path.exists(mapping_path):
+                    with open(mapping_path, 'r') as map_file:
+                        lambda_backup_mapping = json.load(map_file)
+                    logger.info(
+                        f"Mapeamento de Lambdas carregado de {mapping_path}")
                 else:
-                    logger.warning(
-                        f"Nenhum arquivo Lambda encontrado no backup.")
+                    logger.error(
+                        f"Arquivo de mapeamento {mapping_path} não encontrado. Restauração das Lambdas será ignorada.")
 
                 # Fazer upload para as Lambdas de destino
                 logger.info(
@@ -668,16 +630,25 @@ else:
                     if isinstance(target_lambda, list) and len(target_lambda) == 3:
                         target_lambda_name, target_region, target_account_id = target_lambda
 
-                        # Obter o conteúdo do ZIP do backup usando o nome base
-                        stripped_name = strip_two_suffixes(target_lambda_name)
-                        zip_content = lambda_backup_mapping.get(stripped_name)
-                        if zip_content:
-                            # Fazer upload para a Lambda de destino com lógica de retry
-                            upload_lambda_code(
-                                target_lambda_name, target_region, zip_content)
+                        # Obter o nome original da Lambda a partir do mapeamento
+                        source_lambda_name = lambda_backup_mapping.get(
+                            target_lambda_name)
+                        if source_lambda_name:
+                            # Caminho do arquivo ZIP correspondente
+                            zip_file_path = os.path.join(
+                                restore_dir, "Lambdas", f"{source_lambda_name}.zip")
+                            if os.path.exists(zip_file_path):
+                                with open(zip_file_path, 'rb') as f:
+                                    zip_content = f.read()
+                                # Fazer upload para a Lambda de destino com lógica de retry
+                                upload_lambda_code(
+                                    target_lambda_name, target_region, zip_content)
+                            else:
+                                logger.warning(
+                                    f"Arquivo de backup {zip_file_path} não encontrado para a Lambda {target_lambda_name}. Upload será ignorado.")
                         else:
                             logger.warning(
-                                f"Não foi encontrado o arquivo ZIP para a Lambda {stripped_name}. Upload para a Lambda {target_lambda_name} será ignorado.")
+                                f"Não foi encontrado o mapeamento para a Lambda {target_lambda_name}. Upload será ignorado.")
                     else:
                         logger.warning(
                             f"Formato inválido encontrado em ListLambda: {target_lambda}")
