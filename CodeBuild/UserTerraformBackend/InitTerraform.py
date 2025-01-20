@@ -20,7 +20,8 @@ s3_prefix = f"states/{state_name}/"
 table_name = os.getenv('AWS_DYNAMODB_TABLE_TARGET_NAME_0')
 dynamo_region = os.getenv('AWS_DYNAMODB_TABLE_TARGET_REGION_0')
 dynamodb = boto3.resource('dynamodb', region_name=dynamo_region)
-table = dynamodb.Table(table_name)
+if table_name:
+    table = dynamodb.Table(table_name)
 s3_client = boto3.client('s3')
 logger.info(f"InitTerraform command: {command}")
 
@@ -88,12 +89,13 @@ def delete_dynamodb_entry(bucket, state_name):
     # Exemplo: s3-cloudman-terraform-backend-us-east-2/states/State10/State10.tfstate-md5
     lock_id = f"{bucket}/states/{state_name}/{state_name}.tfstate-md5"
     try:
-        response = table.delete_item(
-            Key={
-                'LockID': lock_id
-            }
-        )
-        logger.info(f"Entrada no DynamoDB deletada com sucesso: {lock_id}")
+        if table_name:
+            response = table.delete_item(
+                Key={
+                    'LockID': lock_id
+                }
+            )
+            logger.info(f"Entrada no DynamoDB deletada com sucesso: {lock_id}")
     except ClientError as e:
         logger.error(f"Erro ao deletar entrada no DynamoDB: {e}")
 
@@ -170,14 +172,15 @@ def register_build_in_dynamodb(build_id, s3_path):
     ttl = int(time.time()) + \
         MIN_TTL_SECONDS  # TTL definido para 24 horas no futuro
     try:
-        response = table.put_item(
-            Item={
-                'LockID': build_id,
-                'S3Path': s3_path,
-                'TTL': ttl  # Atributo TTL
-            }
-        )
-        logger.info(f"Registro no DynamoDB bem-sucedido: {response}")
+        if table_name:
+            response = table.put_item(
+                Item={
+                    'LockID': build_id,
+                    'S3Path': s3_path,
+                    'TTL': ttl  # Atributo TTL
+                }
+            )
+            logger.info(f"Registro no DynamoDB bem-sucedido: {response}")
     except ClientError as e:
         logger.error(f"Erro ao registrar no DynamoDB: {e}")
 
@@ -205,7 +208,6 @@ def main():
         run_terraform_init(work_dir)
     except Exception as e:
         logger.error(f"Erro ao inicializar o Terraform: {e}")
-        sys.exit(1)
 
     # Executar o comando Terraform especificado
     command_success = run_terraform_command(command, work_dir)
