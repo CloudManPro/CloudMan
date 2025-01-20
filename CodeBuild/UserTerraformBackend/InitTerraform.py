@@ -96,7 +96,6 @@ def delete_dynamodb_entry(bucket, state_name):
         logger.info(f"Entrada no DynamoDB deletada com sucesso: {lock_id}")
     except ClientError as e:
         logger.error(f"Erro ao deletar entrada no DynamoDB: {e}")
-        sys.exit(1)
 
 
 def set_executable_permissions(directory):
@@ -181,7 +180,6 @@ def register_build_in_dynamodb(build_id, s3_path):
         logger.info(f"Registro no DynamoDB bem-sucedido: {response}")
     except ClientError as e:
         logger.error(f"Erro ao registrar no DynamoDB: {e}")
-        sys.exit(1)
 
 
 def main():
