@@ -43,17 +43,17 @@ sudo systemctl start httpd
 sudo systemctl enable httpd
 
 # Definição das variáveis
-EC2NAME=$Name
-SECRET_NAME_ARN=$aws_secretsmanager_secret_version_Source_ARN_0
-DBNAME=$aws_db_instance_Target_Name_0
-SECRETREGION=$aws_secretsmanager_secret_version_Source_Region_0
-RDS_ENDPOINT=$aws_db_instance_Target_Endpoint_0
+EC2NAME=$NAME
+SECRET_NAME_ARN=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0
+DBNAME=$AWS_DB_INSTANCE_TARGET_NAME_0
+SECRETREGION=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0
+RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
 # Extração do endereço e da porta do endpoint
 ENDPOINT_ADDRESS=$(echo $RDS_ENDPOINT | cut -d: -f1)
 
-if [ ! -z "$aws_secretsmanager_secret_version_Source_ARN_0" ] && [ "$aws_secretsmanager_secret_version_Source_ARN_0" != "none" ]; then
+if [ ! -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" ] && [ "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" != "none" ]; then
     # Recupera os valores dos segredos do AWS Secrets Manager
-    SOURCE_NAME_VALUE=$(aws secretsmanager get-secret-value --secret-id $aws_secretsmanager_secret_version_Source_ARN_0 --query 'SecretString' --output text --region $SECRETREGION)
+    SOURCE_NAME_VALUE=$(aws secretsmanager get-secret-value --secret-id $AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 --query 'SecretString' --output text --region $SECRETREGION)
     DB_USER=$(echo $SOURCE_NAME_VALUE | jq -r .username)
     DB_PASSWORD=$(echo $SOURCE_NAME_VALUE | jq -r .password)
 else
@@ -62,13 +62,13 @@ else
     DB_PASSWORD="TypeNewPassword"
 fi
 
-#instala o client MySQL
+# Instala o client MySQL
 sudo yum install -y mysql
 
 # Verifica se o EFS ID existe e é diferente de none
-if [ ! -z "$aws_efs_file_system_Target_ID_0" ] && [ "$aws_efs_file_system_Target_ID_0" != "none" ]; then
+if [ ! -z "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" ] && [ "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" != "none" ]; then
     # Montagem do EFS
-    EFS_ID=$aws_efs_file_system_Target_ID_0
+    EFS_ID=$AWS_EFS_FILE_SYSTEM_TARGET_ID_0
     sudo mkdir -p /var/www/html
     sudo yum install -y amazon-efs-utils
     sudo mount -t efs $EFS_ID:/ /var/www/html
