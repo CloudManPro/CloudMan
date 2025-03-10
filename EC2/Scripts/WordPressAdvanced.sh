@@ -30,13 +30,15 @@ sudo systemctl enable httpd
 
 # Lê as variáveis de ambiente
 ID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+
 # Definição das variáveis
-EC2NAME=$Name
-SECRET_NAME_ARN=$aws_secretsmanager_secret_version_Source_ARN_0
-DBNAME=$aws_db_instance_Target_Name_0
-SECRETREGION=$aws_secretsmanager_secret_version_Source_Region_0
-RDS_ENDPOINT=$aws_db_instance_Target_Endpoint_0
-S3_BUCKET_ARN=$aws_s3_bucket_Target_ARN_0
+EC2NAME=$NAME
+SECRET_NAME_ARN=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0
+DBNAME=$AWS_DB_INSTANCE_TARGET_NAME_0
+SECRETREGION=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0
+RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
+S3_BUCKET_ARN=$AWS_S3_BUCKET_TARGET_ARN_0
+
 # Extração do endereço e da porta do endpoint
 ENDPOINT_ADDRESS=$(echo $RDS_ENDPOINT | cut -d: -f1)
 
@@ -49,7 +51,7 @@ DB_PASSWORD=$(echo $SOURCE_NAME_VALUE | jq -r .password)
 sudo yum install -y mysql
 
 # Montagem do EFS
-EFS_TARGET_ARN=$aws_efs_file_system_Target_ARN_0
+EFS_TARGET_ARN=$AWS_EFS_FILE_SYSTEM_TARGET_ARN_0
 sudo mkdir /var/www/html
 sudo yum install -y amazon-efs-utils
 sudo mount -t efs $EFS_TARGET_ARN:/ /var/www/html
