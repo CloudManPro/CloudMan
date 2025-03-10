@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Carrega as variáveis de ambiente
+# Carrega as variáveis de ambiente a partir do arquivo correto
 set -a
-source /etc/environment
+source /home/ec2-user/.env
 set +a
 
 # Atualiza os pacotes e instala o servidor web Apache
