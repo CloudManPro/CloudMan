@@ -4,26 +4,38 @@ exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 
 echo "[UserData] Starting script execution..."
 
-# --- Configuration (Replace placeholders via Terraform interpolation) ---
-# Substitua estes pelos valores corretos do seu ambiente Terraform
-EFS_ID="fs-xxxxxxxxxxxxxxxxx"
-AP_ID="fsap-xxxxxxxxxxxxxxxxx"
+# --- Configuration (Valores a serem substituídos via Terraform) ---
+# Substitua estes placeholders pelos atributos corretos dos seus recursos Terraform
+# Exemplo: EFS_DNS_NAME="${aws_efs_file_system.EFSName.dns_name}"
+EFS_DNS_NAME="fs-xxxxxxxx.efs.us-east-1.amazonaws.com" # <-- **IMPORTANTE: Use o DNS Name REAL aqui**
+AP_ID="fsap-xxxxxxxxxxxxxxxxx"                         # <-- Use o ID do Access Point REAL
 EFS_MOUNT_POINT="/var/www/html"
-DB_SECRET_ARN="arn:aws:secretsmanager:us-east-1:ACCOUNTID:secret:SecretWPress-xxxxxx"
-DB_NAME="WPRDS"
-DB_ENDPOINT_ADDRESS="wprds.xxxxxxxxxx.us-east-1.rds.amazonaws.com"
-REGION="us-east-1"
-# S3_BUCKET_NAME removido pois não será usado diretamente no script
+DB_SECRET_ARN="arn:aws:secretsmanager:us-east-1:ACCOUNTID:secret:SecretWPress-xxxxxx" # <-- Use o ARN REAL do Secret
+DB_NAME="WPRDS"                                        # <-- Use o Nome do DB REAL
+DB_ENDPOINT_ADDRESS="wprds.xxxxxxxxxx.us-east-1.rds.amazonaws.com" # <-- Use o Endpoint REAL do RDS
+REGION="us-east-1"                                     # <-- Use a Região REAL
 # --- End Configuration ---
 
-echo "[UserData] Configuration Values:"
-echo "[UserData]   EFS_ID: ${EFS_ID}"
-echo "[UserData]   AP_ID: ${AP_ID}"
-echo "[UserData]   EFS_MOUNT_POINT: ${EFS_MOUNT_POINT}"
-echo "[UserData]   DB_SECRET_ARN: ${DB_SECRET_ARN}"
-echo "[UserData]   DB_NAME: ${DB_NAME}"
-echo "[UserData]   DB_ENDPOINT_ADDRESS: ${DB_ENDPOINT_ADDRESS}"
-echo "[UserData]   REGION: ${REGION}"
+# --- Logging das Variáveis Recebidas ---
+echo "[UserData] --- Configuration Values Check ---"
+echo "[UserData] EFS DNS Name        : ${EFS_DNS_NAME}"
+echo "[UserData] Access Point ID     : ${AP_ID}"
+echo "[UserData] EFS Mount Point     : ${EFS_MOUNT_POINT}"
+echo "[UserData] DB Secret ARN       : ${DB_SECRET_ARN}"
+echo "[UserData] DB Name             : ${DB_NAME}"
+echo "[UserData] DB Endpoint Address : ${DB_ENDPOINT_ADDRESS}"
+echo "[UserData] AWS Region          : ${REGION}"
+echo "[UserData] --- End Configuration Values Check ---"
+
+# Verifica se as variáveis críticas têm valores (simples verificação de não vazio)
+if [ -z "${EFS_DNS_NAME}" ] || [ "${EFS_DNS_NAME}" == "fs-xxxxxxxx.efs.us-east-1.amazonaws.com" ] || \
+   [ -z "${AP_ID}" ] || [ "${AP_ID}" == "fsap-xxxxxxxxxxxxxxxxx" ] || \
+   [ -z "${DB_SECRET_ARN}" ] || [ "${DB_SECRET_ARN}" == "arn:aws:secretsmanager:us-east-1:ACCOUNTID:secret:SecretWPress-xxxxxx" ] || \
+   [ -z "${DB_ENDPOINT_ADDRESS}" ] || [ "${DB_ENDPOINT_ADDRESS}" == "wprds.xxxxxxxxxx.us-east-1.rds.amazonaws.com" ]; then
+    echo "[UserData] FATAL: One or more critical configuration variables seem to be using placeholder values or are empty. Aborting."
+    echo "[UserData] Please ensure Terraform is passing the correct values (EFS DNS Name, AP ID, Secret ARN, DB Endpoint)."
+    exit 1
+fi
 
 # Installs
 echo "[UserData] Running yum update..."
@@ -39,33 +51,43 @@ echo "[UserData] Package installations complete."
 # EFS Mount
 echo "[UserData] Creating EFS mount point directory: ${EFS_MOUNT_POINT}"
 sudo mkdir -p ${EFS_MOUNT_POINT}
-echo "[UserData] Starting EFS mount attempts..."
+echo "[UserData] Starting EFS mount attempts using DNS Name: ${EFS_DNS_NAME} and Access Point: ${AP_ID}..."
 MAX_RETRIES=3
 RETRY_COUNT=0
 MOUNT_SUCCESS=false
 while [ ${RETRY_COUNT} -lt ${MAX_RETRIES} ]; do
     echo "[UserData] Attempting mount (${RETRY_COUNT}/${MAX_RETRIES})..."
-    sudo mount -t efs -o tls,accesspoint=${AP_ID} ${EFS_ID}:/ ${EFS_MOUNT_POINT}
-    MOUNT_EXIT_CODE=$? # Captura o código de saída do mount
+    # --- CORREÇÃO AQUI: Usa EFS_DNS_NAME ---
+    sudo mount -t efs -o tls,accesspoint=${AP_ID} ${EFS_DNS_NAME}:/ ${EFS_MOUNT_POINT}
+    MOUNT_EXIT_CODE=$?
     if [ ${MOUNT_EXIT_CODE} -eq 0 ] && mountpoint -q ${EFS_MOUNT_POINT}; then
         echo "[UserData] EFS mount successful."
         MOUNT_SUCCESS=true
         break
     fi
     RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "[UserData] EFS mount failed (Exit Code: ${MOUNT_EXIT_CODE}). Retrying in 3 seconds..."
+    # Tenta obter erro específico do mount.efs
+    MOUNT_ERROR=$(tail -n 5 /var/log/messages | grep 'mount.efs')
+    echo "[UserData] EFS mount failed (Exit Code: ${MOUNT_EXIT_CODE}). Error hint: ${MOUNT_ERROR}. Retrying in 3 seconds..."
     sleep 3
 done
 
 if [ "$MOUNT_SUCCESS" = false ]; then
     echo "[UserData] FATAL: EFS mount failed after ${MAX_RETRIES} attempts. Aborting."
+    sudo systemctl status amazon-efs-mount-watchdog || echo "[UserData] amazon-efs-mount-watchdog status check failed."
     exit 1
 fi
 
 echo "[UserData] Adding EFS entry to /etc/fstab..."
-FSTAB_ENTRY="${EFS_ID}:/ ${EFS_MOUNT_POINT} efs _netdev,tls,accesspoint=${AP_ID} 0 0"
-echo "$FSTAB_ENTRY" | sudo tee -a /etc/fstab
-echo "[UserData] fstab entry potentially added."
+# --- CORREÇÃO AQUI TAMBÉM (para fstab): Usa DNS Name ---
+FSTAB_ENTRY="${EFS_DNS_NAME}:/ ${EFS_MOUNT_POINT} efs _netdev,tls,accesspoint=${AP_ID} 0 0"
+# Verifica se já existe para evitar duplicatas
+if ! grep -qF -- "$FSTAB_ENTRY" /etc/fstab; then
+    echo "$FSTAB_ENTRY" | sudo tee -a /etc/fstab
+    echo "[UserData] fstab entry added."
+else
+    echo "[UserData] fstab entry already exists."
+fi
 
 # Apache
 echo "[UserData] Starting and enabling httpd service..."
@@ -76,7 +98,7 @@ echo "[UserData] httpd service started and enabled."
 # Secrets
 echo "[UserData] Attempting to retrieve secret from ARN: ${DB_SECRET_ARN}"
 SOURCE_NAME_VALUE=$(aws secretsmanager get-secret-value --secret-id ${DB_SECRET_ARN} --query 'SecretString' --output text --region ${REGION})
-SECRET_RETRIEVAL_CODE=$? # Captura o código de saída
+SECRET_RETRIEVAL_CODE=$?
 echo "[UserData] AWS CLI exit code for get-secret-value: ${SECRET_RETRIEVAL_CODE}"
 
 if [ ${SECRET_RETRIEVAL_CODE} -ne 0 ] || [ -z "$SOURCE_NAME_VALUE" ]; then
@@ -91,7 +113,7 @@ DB_PASSWORD=$(echo ${SOURCE_NAME_VALUE} | jq -r .password)
 echo "[UserData] Parsing complete."
 
 if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" == "null" ] ; then
-     echo "[UserData] FATAL: Failed to parse username or password from secret JSON. Received: '${SOURCE_NAME_VALUE}'. Aborting."
+     echo "[UserData] FATAL: Failed to parse username or password from secret JSON. Received: [REDACTED]. Aborting." # Não loga o segredo completo
      exit 1
 fi
 echo "[UserData] Secret parsing successful. User: ${DB_USER}"
@@ -140,7 +162,6 @@ if [ -x /usr/local/bin/wp ]; then
     else
         echo "[UserData] WP core already installed."
     fi
-    # --->>> SEÇÃO DE INSTALAÇÃO DO PLUGIN S3 REMOVIDA DAQUI <<<---
 else
     # Fallback Manual WP
     echo "[UserData] WARNING: WP-CLI not found or failed to install. Attempting manual WP installation."
@@ -174,7 +195,6 @@ else
     else
          echo "[UserData] WP files seem to exist (manual check). Skipping manual download/config."
     fi
-    # --->>> REMOVIDA A MENSAGEM SOBRE INSTALAÇÃO MANUAL DO PLUGIN S3 DAQUI <<<---
 fi
 
 # Permissions & Restart
@@ -186,4 +206,4 @@ sudo chmod 644 ${EFS_MOUNT_POINT}/wp-config.php # Garante leitura
 echo "[UserData] Restarting httpd service..."
 sudo systemctl restart httpd
 
-echo "[UserData] Script finished."
+echo "[UserData] Script finished successfully." # Mudado para indicar sucesso no final
