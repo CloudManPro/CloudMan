@@ -1,40 +1,6 @@
 #!/bin/bash
 
-# Log principal do User Data (cloud-init)
-# Redireciona stdout/stderr para o log do cloud-init E para o console/syslog
-exec > >(tee /var/log/cloud-init-output.log|logger -t user-data -s 2>/dev/console) 2>&1
-
-echo "--- Iniciando script User Data ---"
-
-# --- 1. Criação do Arquivo .env (Bloco fornecido pelo usuário) ---
-echo "INFO: Criando o arquivo /home/ec2-user/.env com as variáveis fornecidas..."
-echo "NAME=Gen-AMI-WordPress" > /home/ec2-user/.env
-echo "REGION=us-east-1" >> /home/ec2-user/.env
-echo "ACCOUNT=746669211265" >> /home/ec2-user/.env
-echo "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0=SecretWPress" >> /home/ec2-user/.env
-echo "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0=us-east-1" >> /home/ec2-user/.env
-echo "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=${data.aws_secretsmanager_secret_version.SecretWPress.arn}" >> /home/ec2-user/.env
-echo "AWS_S3_BUCKET_TARGET_NAME_SCRIPT=projeto1-script" >> /home/ec2-user/.env
-echo "AWS_S3_BUCKET_TARGET_REGION_SCRIPT=us-east-1" >> /home/ec2-user/.env
-echo "AWS_S3_SCRIPT_KEY=WordPressProfessional.sh" >> /home/ec2-user/.env # <-- Certifique-se que esta linha existe e está correta!
-echo "AWS_AMI_FROM_INSTANCE_TARGET_NAME_0=AMI-WP" >> /home/ec2-user/.env
-echo "AWS_AMI_FROM_INSTANCE_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
-echo "AWS_S3_BUCKET_TARGET_NAME_0=s3-projeto1-wp-offload" >> /home/ec2-user/.env
-echo "AWS_S3_BUCKET_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
-echo "AWS_DB_INSTANCE_TARGET_NAME_0=WPRDS" >> /home/ec2-user/.env
-echo "AWS_DB_INSTANCE_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
-echo "AWS_DB_INSTANCE_TARGET_ENDPOINT_0=${data.aws_db_instance.WPRDS.endpoint}" >> /home/ec2-user/.env
-echo "AWS_EFS_FILE_SYSTEM_TARGET_NAME_0=WPProjeto1" >> /home/ec2-user/.env
-echo "AWS_EFS_FILE_SYSTEM_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
-echo "AWS_EFS_FILE_SYSTEM_TARGET_ID_0=${data.aws_efs_file_system.WPProjeto1.id}" >> /home/ec2-user/.env
-echo "AWS_EFS_FILE_SYSTEM_TARGET_ARN_0=${data.aws_efs_file_system.WPProjeto1.arn}" >> /home/ec2-user/.env
-echo "AWS_EFS_ACCESS_POINT_TARGET_ID_0=${aws_efs_access_point.EFS_Access_Point_Gen-AMI-WordPress_To_WPProjeto1.id}" >> /home/ec2-user/.env
-echo "AWS_EFS_ACCESS_POINT_TARGET_PATH_0=/mnt" >> /home/ec2-user/.env
-echo "AWS_CLOUDWATCH_LOG_GROUP_TARGET_NAME_0=/aws/ec2/Gen-AMI-WordPress" >> /home/ec2-user/.env
-echo "AWS_CLOUDWATCH_LOG_GROUP_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
-echo "INFO: Arquivo /home/ec2-user/.env criado."
-
-# --- 2. Ajuste de Permissões ---
+. Ajuste de Permissões ---
 # Usando caminho literal para evitar problemas com variáveis de shell
 echo "INFO: Ajustando permissões para /home/ec2-user/.env..."
 chmod 644 /home/ec2-user/.env
