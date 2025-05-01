@@ -1,4 +1,6 @@
-#!/bin/bash
+set -a
+source /home/ec2-user/.env
+set +a
 
 # Script de teste simples baixado do S3
 
