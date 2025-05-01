@@ -13,30 +13,21 @@ echo "REGION=us-east-1" >> /home/ec2-user/.env
 echo "ACCOUNT=746669211265" >> /home/ec2-user/.env
 echo "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0=SecretWPress" >> /home/ec2-user/.env
 echo "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0=us-east-1" >> /home/ec2-user/.env
-# Assumindo que Terraform substituirá esta variável antes de passar para UserData
 echo "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=${data.aws_secretsmanager_secret_version.SecretWPress.arn}" >> /home/ec2-user/.env
 echo "AWS_S3_BUCKET_TARGET_NAME_SCRIPT=projeto1-script" >> /home/ec2-user/.env
 echo "AWS_S3_BUCKET_TARGET_REGION_SCRIPT=us-east-1" >> /home/ec2-user/.env
-# IMPORTANTE: Adicione a linha AWS_S3_SCRIPT_KEY aqui se ainda não estiver incluída pelo Terraform/ferramenta!
-# Exemplo: echo "AWS_S3_SCRIPT_KEY=WodPressProfessional.sh" >> /home/ec2-user/.env
-# Se a linha abaixo já define a chave, ótimo. Caso contrário, adicione acima.
-# Verifique se 'WodPressProfessional.sh' é realmente o valor que você quer para AWS_S3_SCRIPT_KEY
-echo "AWS_S3_SCRIPT_KEY=WodPressProfessional.sh" >> /home/ec2-user/.env # <-- Certifique-se que esta linha existe e está correta!
+echo "AWS_S3_SCRIPT_KEY=WordPressProfessional.sh" >> /home/ec2-user/.env # <-- Certifique-se que esta linha existe e está correta!
 echo "AWS_AMI_FROM_INSTANCE_TARGET_NAME_0=AMI-WP" >> /home/ec2-user/.env
 echo "AWS_AMI_FROM_INSTANCE_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
 echo "AWS_S3_BUCKET_TARGET_NAME_0=s3-projeto1-wp-offload" >> /home/ec2-user/.env
 echo "AWS_S3_BUCKET_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
 echo "AWS_DB_INSTANCE_TARGET_NAME_0=WPRDS" >> /home/ec2-user/.env
 echo "AWS_DB_INSTANCE_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
-# Assumindo que Terraform substituirá esta variável
 echo "AWS_DB_INSTANCE_TARGET_ENDPOINT_0=${data.aws_db_instance.WPRDS.endpoint}" >> /home/ec2-user/.env
 echo "AWS_EFS_FILE_SYSTEM_TARGET_NAME_0=WPProjeto1" >> /home/ec2-user/.env
 echo "AWS_EFS_FILE_SYSTEM_TARGET_REGION_0=us-east-1" >> /home/ec2-user/.env
-# Assumindo que Terraform substituirá esta variável
 echo "AWS_EFS_FILE_SYSTEM_TARGET_ID_0=${data.aws_efs_file_system.WPProjeto1.id}" >> /home/ec2-user/.env
-# Assumindo que Terraform substituirá esta variável
 echo "AWS_EFS_FILE_SYSTEM_TARGET_ARN_0=${data.aws_efs_file_system.WPProjeto1.arn}" >> /home/ec2-user/.env
-# Assumindo que Terraform substituirá esta variável
 echo "AWS_EFS_ACCESS_POINT_TARGET_ID_0=${aws_efs_access_point.EFS_Access_Point_Gen-AMI-WordPress_To_WPProjeto1.id}" >> /home/ec2-user/.env
 echo "AWS_EFS_ACCESS_POINT_TARGET_PATH_0=/mnt" >> /home/ec2-user/.env
 echo "AWS_CLOUDWATCH_LOG_GROUP_TARGET_NAME_0=/aws/ec2/Gen-AMI-WordPress" >> /home/ec2-user/.env
