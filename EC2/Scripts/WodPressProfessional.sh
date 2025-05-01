@@ -13,7 +13,7 @@ DB_SECRET_ARN="arn:aws:secretsmanager:us-east-1:ACCOUNTID:secret:SecretWPress-xx
 DB_NAME="WPRDS"
 DB_ENDPOINT_ADDRESS="wprds.xxxxxxxxxx.us-east-1.rds.amazonaws.com"
 REGION="us-east-1"
-S3_BUCKET_NAME="s3-projeto1-wp-offload"
+# S3_BUCKET_NAME removido pois não será usado diretamente no script
 # --- End Configuration ---
 
 echo "[UserData] Configuration Values:"
@@ -24,7 +24,6 @@ echo "[UserData]   DB_SECRET_ARN: ${DB_SECRET_ARN}"
 echo "[UserData]   DB_NAME: ${DB_NAME}"
 echo "[UserData]   DB_ENDPOINT_ADDRESS: ${DB_ENDPOINT_ADDRESS}"
 echo "[UserData]   REGION: ${REGION}"
-echo "[UserData]   S3_BUCKET_NAME: ${S3_BUCKET_NAME}"
 
 # Installs
 echo "[UserData] Running yum update..."
@@ -82,7 +81,6 @@ echo "[UserData] AWS CLI exit code for get-secret-value: ${SECRET_RETRIEVAL_CODE
 
 if [ ${SECRET_RETRIEVAL_CODE} -ne 0 ] || [ -z "$SOURCE_NAME_VALUE" ]; then
     echo "[UserData] FATAL: Failed to get secret or secret value is empty. AWS CLI Exit Code: ${SECRET_RETRIEVAL_CODE}. Aborting."
-    # Você pode querer desmontar o EFS aqui se ele foi montado: sudo umount ${EFS_MOUNT_POINT}
     exit 1
 fi
 echo "[UserData] Secret retrieval successful."
@@ -90,7 +88,7 @@ echo "[UserData] Secret retrieval successful."
 echo "[UserData] Parsing secret JSON..."
 DB_USER=$(echo ${SOURCE_NAME_VALUE} | jq -r .username)
 DB_PASSWORD=$(echo ${SOURCE_NAME_VALUE} | jq -r .password)
-echo "[UserData] Parsing complete." # Não loga os valores aqui por segurança
+echo "[UserData] Parsing complete."
 
 if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" == "null" ] ; then
      echo "[UserData] FATAL: Failed to parse username or password from secret JSON. Received: '${SOURCE_NAME_VALUE}'. Aborting."
@@ -104,27 +102,23 @@ curl -s -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.
 CURL_EXIT_CODE=$?
 if [ ${CURL_EXIT_CODE} -ne 0 ]; then
      echo "[UserData] WARNING: curl command failed (Exit Code: ${CURL_EXIT_CODE}) while downloading WP-CLI."
-     # Script continua para o fallback
 elif [ ! -f wp-cli.phar ]; then
      echo "[UserData] WARNING: wp-cli.phar not found after curl command."
-     # Script continua para o fallback
 else
     chmod +x wp-cli.phar
     sudo mv wp-cli.phar /usr/local/bin/wp
     MV_EXIT_CODE=$?
     if [ ${MV_EXIT_CODE} -ne 0 ]; then
         echo "[UserData] WARNING: Failed to move wp-cli.phar to /usr/local/bin/wp (Exit Code: ${MV_EXIT_CODE})."
-         # Script continua para o fallback
     else
         echo "[UserData] WP-CLI installed to /usr/local/bin/wp."
     fi
 fi
 
-# WordPress & Plugin Install (via WP-CLI if available)
+# WordPress Install (via WP-CLI if available)
 if [ -x /usr/local/bin/wp ]; then
     echo "[UserData] WP-CLI found. Proceeding with WP-CLI installation path..."
     echo "[UserData] Checking if WP core is installed..."
-    # Nota: --allow-root é geralmente necessário aqui porque o script roda como root
     if ! sudo -u apache /usr/local/bin/wp core is-installed --path=${EFS_MOUNT_POINT} --allow-root; then
         echo "[UserData] WP core not installed. Downloading..."
         sudo -u apache /usr/local/bin/wp core download --path=${EFS_MOUNT_POINT} --allow-root
@@ -146,25 +140,7 @@ if [ -x /usr/local/bin/wp ]; then
     else
         echo "[UserData] WP core already installed."
     fi
-
-    # Instala/Ativa Plugin S3
-    PLUGIN_SLUG="amazon-s3-and-cloudfront"
-    echo "[UserData] Checking S3 plugin (${PLUGIN_SLUG})..."
-    if ! sudo -u apache /usr/local/bin/wp plugin is-installed ${PLUGIN_SLUG} --path=${EFS_MOUNT_POINT} --allow-root; then
-        echo "[UserData] S3 plugin not installed. Installing and activating..."
-        sudo -u apache /usr/local/bin/wp plugin install ${PLUGIN_SLUG} --activate --path=${EFS_MOUNT_POINT} --allow-root
-        PLUGIN_INSTALL_CODE=$?
-        echo "[UserData] WP plugin install exit code: ${PLUGIN_INSTALL_CODE}"
-        if [ ${PLUGIN_INSTALL_CODE} -eq 0 ]; then echo "[UserData] S3 Plugin installed & activated."; else echo "[UserData] WARNING: S3 plugin install failed."; fi
-    elif ! sudo -u apache /usr/local/bin/wp plugin is-active ${PLUGIN_SLUG} --path=${EFS_MOUNT_POINT} --allow-root; then
-         echo "[UserData] S3 plugin installed but not active. Activating..."
-         sudo -u apache /usr/local/bin/wp plugin activate ${PLUGIN_SLUG} --path=${EFS_MOUNT_POINT} --allow-root
-         PLUGIN_ACTIVATE_CODE=$?
-         echo "[UserData] WP plugin activate exit code: ${PLUGIN_ACTIVATE_CODE}"
-         if [ ${PLUGIN_ACTIVATE_CODE} -eq 0 ]; then echo "[UserData] S3 Plugin activated."; else echo "[UserData] WARNING: S3 plugin activation failed."; fi
-    else
-        echo "[UserData] S3 Plugin already installed and active."
-    fi
+    # --->>> SEÇÃO DE INSTALAÇÃO DO PLUGIN S3 REMOVIDA DAQUI <<<---
 else
     # Fallback Manual WP
     echo "[UserData] WARNING: WP-CLI not found or failed to install. Attempting manual WP installation."
@@ -198,7 +174,7 @@ else
     else
          echo "[UserData] WP files seem to exist (manual check). Skipping manual download/config."
     fi
-     echo "[UserData] Reminder: Manual S3 Plugin install needed via WP Admin if WP-CLI failed."
+    # --->>> REMOVIDA A MENSAGEM SOBRE INSTALAÇÃO MANUAL DO PLUGIN S3 DAQUI <<<---
 fi
 
 # Permissions & Restart
@@ -206,7 +182,7 @@ echo "[UserData] Setting final permissions for ${EFS_MOUNT_POINT}..."
 sudo chown -R apache:apache ${EFS_MOUNT_POINT}
 sudo find ${EFS_MOUNT_POINT} -type d -exec chmod 755 {} \;
 sudo find ${EFS_MOUNT_POINT} -type f -exec chmod 644 {} \;
-sudo chmod 644 ${EFS_MOUNT_POINT}/wp-config.php
+sudo chmod 644 ${EFS_MOUNT_POINT}/wp-config.php # Garante leitura
 echo "[UserData] Restarting httpd service..."
 sudo systemctl restart httpd
 
