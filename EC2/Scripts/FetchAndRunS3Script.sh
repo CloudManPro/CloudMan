@@ -1,101 +1,120 @@
-set -a
-source /home/ec2-user/.env
-set +a
-# --- Configuração ---
-# Arquivo de ambiente (ajuste o caminho se necessário)
-# ATENÇÃO: User Data normalmente executa como root. Se o .env está em /home/ec2-user,
-#          o root precisa ter permissão para lê-lo, ou você pode precisar copiar/mover
-#          o .env para um local acessível por root (ex: /etc/environment ou /root/.env)
-#          ou executar este script como ec2-user.
-#          Para simplicidade, vamos assumir que é legível ou ajustar conforme necessidade.
-ENV_FILE="/home/ec2-user/.env"
+# --- 2. Ajuste de Permissões ---
+echo "INFO: Ajustando permissões para $ENV_FILE..."
+# Garante que o usuário root (que executa cloud-init) possa ler o arquivo
+chmod 644 "$ENV_FILE"
+# Garante que o diretório /home/ec2-user seja acessível (geralmente é, mas por segurança)
+chmod o+x /home/ec2-user
+echo "INFO: Permissões ajustadas."
 
-# Arquivo de log para depuração
-LOG_FILE="/var/log/fetch_and_run_s3_script.log"
+# --- 3. Carregamento e Exportação das Variáveis do .env ---
+echo "INFO: Carregando e exportando variáveis de $ENV_FILE..."
+set -a # Habilita a exportação automática de variáveis subsequentes
+source "$ENV_FILE"
+set +a # Desabilita a exportação automática
+echo "INFO: Variáveis carregadas e marcadas para exportação."
 
-# Diretório temporário para baixar o script
+# --- 4. Debugging (Opcional, mas útil) ---
+# Verifica se as variáveis S3 foram carregadas neste ponto
+DEBUG_LOG="/var/log/user-data-debug.log"
+echo "--- Debug User Data Vars ---" > "$DEBUG_LOG"
+echo "Timestamp: $(date)" >> "$DEBUG_LOG"
+echo "AWS_S3_BUCKET_TARGET_NAME_SCRIPT = ${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-NAO CARREGADA}" >> "$DEBUG_LOG"
+echo "AWS_S3_BUCKET_TARGET_REGION_SCRIPT = ${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-NAO CARREGADA}" >> "$DEBUG_LOG"
+echo "AWS_S3_SCRIPT_KEY = ${AWS_S3_SCRIPT_KEY:-NAO CARREGADA}" >> "$DEBUG_LOG"
+echo "---------------------------" >> "$DEBUG_LOG"
+echo "INFO: Log de debug das variáveis S3 gravado em $DEBUG_LOG"
+
+# --- 5. Lógica para Baixar e Executar Script do S3 ---
+FETCH_LOG_FILE="/var/log/fetch_and_run_s3_script.log"
 TMP_DIR="/tmp"
 
-# --- Funções Auxiliares ---
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+# --- Funções Auxiliares (Escopo Local para esta seção) ---
+_log_fetch() {
+    # Note o uso de _log_fetch para evitar conflito se o script S3 tiver uma função log
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - FETCH_RUN - $1" | tee -a "$FETCH_LOG_FILE"
 }
 
-# --- Início da Execução ---
-# Redireciona toda a saída (stdout e stderr) para o arquivo de log E para o console
-exec > >(tee -a "$LOG_FILE") 2>&1
+# --- Início da Execução Fetch/Run ---
+# Redireciona a saída desta seção específica para seu próprio log
+# Usamos chaves {} para agrupar os comandos e redirecionar a saída deles
+{
+    _log_fetch "INFO: Iniciando lógica para buscar e executar script do S3."
 
-log "INFO: Iniciando script para buscar e executar script do S3."
+    # 5.1. Verifica se o AWS CLI está instalado
+    if ! command -v aws &>/dev/null; then
+        _log_fetch "ERRO: AWS CLI não encontrado. Tentando instalar..."
+        # Tenta instalar - ajuste 'yum' se usar outra distro (ex: 'apt-get' para Ubuntu)
+        if command -v yum &> /dev/null; then
+             yum install -y aws-cli
+        elif command -v apt-get &> /dev/null; then
+             apt-get update && apt-get install -y awscli
+        else
+            _log_fetch "ERRO: Gerenciador de pacotes não suportado para instalar AWS CLI automaticamente."
+             exit 1 # Falha o User Data
+        fi
+        # Verifica novamente após a tentativa de instalação
+        if ! command -v aws &> /dev/null; then
+           _log_fetch "ERRO: Falha ao instalar AWS CLI."
+           exit 1 # Falha o User Data
+        fi
+    fi
+    _log_fetch "INFO: AWS CLI encontrado."
 
-# 1. Verifica se o AWS CLI está instalado
-if ! command -v aws &>/dev/null; then
-    log "ERRO: AWS CLI não encontrado. Por favor, instale-o (ex: sudo yum install aws-cli -y)."
-    exit 1
-fi
-log "INFO: AWS CLI encontrado."
+    # 5.2. Verifica se as variáveis necessárias ESTÃO NO AMBIENTE (foram exportadas acima)
+    # Esta verificação agora deve funcionar corretamente
+    if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] || \
+       [ -z "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}" ] || \
+       [ -z "${AWS_S3_SCRIPT_KEY:-}" ]; then
+        _log_fetch "ERRO: Uma ou mais variáveis S3 necessárias não estão definidas no ambiente."
+        _log_fetch "ERRO: Verifique se AWS_S3_BUCKET_TARGET_NAME_SCRIPT, AWS_S3_BUCKET_TARGET_REGION_SCRIPT, e AWS_S3_SCRIPT_KEY foram carregadas e exportadas corretamente."
+        _log_fetch "ERRO: Valores atuais: BUCKET='${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}', REGION='${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}', KEY='${AWS_S3_SCRIPT_KEY:-}'"
+        exit 1 # Falha o User Data
+    fi
+    _log_fetch "INFO: Variáveis S3 necessárias encontradas no ambiente: BUCKET=${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}, REGION=${AWS_S3_BUCKET_TARGET_REGION_SCRIPT}, KEY=${AWS_S3_SCRIPT_KEY}"
 
-# 2. Verifica se o arquivo .env existe
-if [ ! -f "$ENV_FILE" ]; then
-    log "ERRO: Arquivo de ambiente '$ENV_FILE' não encontrado."
-    exit 1
-fi
-log "INFO: Arquivo de ambiente '$ENV_FILE' encontrado."
+    # 5.3. Define o caminho de destino local para o script baixado
+    LOCAL_SCRIPT_PATH=$(mktemp "$TMP_DIR/s3_script.XXXXXX.sh")
+    _log_fetch "INFO: Script S3 será baixado para: $LOCAL_SCRIPT_PATH"
 
-# 3. Carrega as variáveis de ambiente
-# Usamos 'set -a' para exportar as variáveis lidas para sub-processos (como aws cli)
-# e 'set +a' para parar de exportar depois. '.' (source) executa no shell atual.
-set -a
-. "$ENV_FILE"
-set +a
-log "INFO: Variáveis de ambiente carregadas de '$ENV_FILE'."
+    # Garante a limpeza do script temporário na saída (normal ou erro)
+    trap '_log_fetch "INFO: Limpando script temporário $LOCAL_SCRIPT_PATH"; rm -f "$LOCAL_SCRIPT_PATH"' EXIT SIGHUP SIGINT SIGTERM
 
-# 4. Verifica se as variáveis necessárias foram carregadas
-if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] ||
-    [ -z "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}" ] ||
-    [ -z "${AWS_S3_SCRIPT_KEY:-}" ]; then
-    log "ERRO: Uma ou mais variáveis necessárias não estão definidas no arquivo '$ENV_FILE'."
-    log "ERRO: Verifique AWS_S3_BUCKET_TARGET_NAME_SCRIPT, AWS_S3_BUCKET_TARGET_REGION_SCRIPT, e AWS_S3_SCRIPT_KEY."
-    exit 1
-fi
-log "INFO: Variáveis necessárias encontradas: BUCKET=${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}, REGION=${AWS_S3_BUCKET_TARGET_REGION_SCRIPT}, KEY=${AWS_S3_SCRIPT_KEY}"
+    # 5.4. Constrói o URI S3
+    S3_URI="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_SCRIPT_KEY}"
+    _log_fetch "INFO: Tentando baixar de: $S3_URI"
 
-# 5. Define o caminho de destino local para o script baixado
-LOCAL_SCRIPT_PATH=$(mktemp "$TMP_DIR/s3_script.XXXXXX.sh")
-log "INFO: Script será baixado para: $LOCAL_SCRIPT_PATH"
+    # 5.5. Baixa o script do S3 usando AWS CLI
+    # As variáveis exportadas ($AWS_...) são usadas aqui implicitamente pelo CLI (se Role estiver correto) ou explicitamente pela região
+    if ! aws s3 cp "$S3_URI" "$LOCAL_SCRIPT_PATH" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
+        _log_fetch "ERRO: Falha ao baixar o script de '$S3_URI'."
+        _log_fetch "ERRO: Verifique as permissões do IAM Role da instância (s3:GetObject), o nome/existência do bucket/chave S3 e a região."
+        exit 1 # Falha o User Data
+    fi
+    _log_fetch "INFO: Script S3 baixado com sucesso."
 
-# Garante a limpeza do script temporário na saída (normal ou erro)
-trap 'rm -f "$LOCAL_SCRIPT_PATH"' EXIT SIGHUP SIGINT SIGTERM
+    # 5.6. Torna o script baixado executável
+    chmod +x "$LOCAL_SCRIPT_PATH"
+    _log_fetch "INFO: Permissão de execução adicionada a '$LOCAL_SCRIPT_PATH'."
 
-# 6. Constrói o URI S3
-S3_URI="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_SCRIPT_KEY}"
-log "INFO: Tentando baixar de: $S3_URI"
+    # 5.7. Executa o script baixado
+    # O script baixado herdará as variáveis exportadas na seção 3
+    _log_fetch "INFO: Executando o script baixado: $LOCAL_SCRIPT_PATH"
+    if "$LOCAL_SCRIPT_PATH"; then
+        _log_fetch "INFO: Script baixado ($LOCAL_SCRIPT_PATH) executado com sucesso."
+    else
+        # Captura o código de saída do script baixado
+        EXIT_CODE=$?
+        _log_fetch "ERRO: O script baixado ($LOCAL_SCRIPT_PATH) falhou com o código de saída: $EXIT_CODE."
+        # Decide se o script principal deve falhar também.
+        # Se o script S3 falhar, provavelmente queremos que o User Data falhe.
+        exit $EXIT_CODE
+    fi
 
-# 7. Baixa o script do S3 usando AWS CLI
-if ! aws s3 cp "$S3_URI" "$LOCAL_SCRIPT_PATH" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
-    log "ERRO: Falha ao baixar o script de '$S3_URI'."
-    log "ERRO: Verifique as permissões do IAM Role da instância, o nome do bucket/chave e a região."
-    exit 1
-fi
-log "INFO: Script baixado com sucesso."
+    _log_fetch "INFO: Lógica fetch_and_run_s3_script concluída com sucesso."
 
-# 8. Torna o script baixado executável
-chmod +x "$LOCAL_SCRIPT_PATH"
-log "INFO: Permissão de execução adicionada a '$LOCAL_SCRIPT_PATH'."
+} > >(tee -a "$FETCH_LOG_FILE") 2>&1 # Fim do bloco redirecionado para FETCH_LOG_FILE
 
-# 9. Executa o script baixado
-log "INFO: Executando o script baixado: $LOCAL_SCRIPT_PATH"
-if "$LOCAL_SCRIPT_PATH"; then
-    log "INFO: Script baixado ($LOCAL_SCRIPT_PATH) executado com sucesso."
-else
-    # Captura o código de saída do script baixado
-    EXIT_CODE=$?
-    log "ERRO: O script baixado ($LOCAL_SCRIPT_PATH) falhou com o código de saída: $EXIT_CODE."
-    # Decide se o script principal deve falhar também
-    # exit $EXIT_CODE # Descomente esta linha se a falha do script baixado deve parar tudo.
-fi
+# A limpeza do arquivo temporário será feita pelo 'trap' configurado dentro do bloco
 
-log "INFO: Script fetch_and_run_s3_script.sh concluído."
-
-# A limpeza do arquivo temporário será feita pelo 'trap'
-
+echo "--- Script User Data concluído com sucesso ---"
 exit 0
