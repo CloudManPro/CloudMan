@@ -1,5 +1,6 @@
-#!/bin/bash
-
+set -a
+source /home/ec2-user/.env
+set +a
 # --- Configuração ---
 # Arquivo de ambiente (ajuste o caminho se necessário)
 # ATENÇÃO: User Data normalmente executa como root. Se o .env está em /home/ec2-user,
