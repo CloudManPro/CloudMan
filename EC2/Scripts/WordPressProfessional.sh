@@ -1,15 +1,20 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.5 (Baseado na v1.4, Tenta silenciar mais yum/extras, adiciona notas sobre user-data)
-# Descrição: Instala e configura WordPress em Amazon Linux 2,
-# utilizando Apache, PHP 7.4, EFS para /var/www/html, e RDS via Secrets Manager.
-# Destinado a ser executado por um script de user data que baixa este do S3.
+# Versão: 1.6 (Baseado na v1.5, Adiciona log TEMPORÁRIO de senha para debug do sed)
+# DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2... (resto da descrição)
 # --- Configuração Inicial e Logging ---
 set -e # Sair imediatamente se um comando falhar
 # set -x # Descomente para debug detalhado de comandos
 LOG_FILE="/var/log/wordpress-setup.log"
 # Redireciona toda a saída (stdout e stderr) para o arquivo de log E para o console/cloud-init-output.log
 exec > >(tee -a "${LOG_FILE}") 2>&1
+
+# --- BLOCO DE ALERTA INICIAL ---
+echo "#####################################################################"
+echo "### WARNING: TEMPORARY PASSWORD LOGGING ENABLED FOR DEBUGGING!    ###"
+echo "### REMOVE THE DEBUG PASSWORD LOGGING BLOCKS BEFORE PRODUCTION!   ###"
+echo "#####################################################################"
+# --- FIM DO BLOCO DE ALERTA INICIAL ---
 
 echo "INFO: =================================================="
 echo "INFO: --- Iniciando Script WordPress Setup ($(date)) ---"
@@ -46,8 +51,13 @@ for var_name in "${essential_vars[@]}"; do
         echo "ERRO: Variável de ambiente essencial '$var_name' não definida ou vazia."
         error_found=1
     else
-        if [[ "$var_name" != *"SECRET"* && "$var_name" != *"PASSWORD"* && "$var_name" != *"USER"* && "$var_name" != *"ARN"* && "$var_name" != *"REGION"* ]]; then # Evita logar infos sensíveis
-             echo "DEBUG: Variável $var_name = ${!var_name}"
+        # Log DEBUG aprimorado para evitar ARNs/Regiões completos se não necessário
+        if [[ "$var_name" != *"SECRET"* && "$var_name" != *"PASSWORD"* && "$var_name" != *"USER"* && "$var_name" != *"ARN"* && "$var_name" != *"REGION"* ]]; then
+            echo "DEBUG: Variável $var_name = ${!var_name}"
+        elif [[ "$var_name" == *"_REGION_"* ]]; then
+            echo "DEBUG: Variável $var_name = ${!var_name}" # Região geralmente ok para logar
+        elif [[ "$var_name" == *"_ARN_"* ]]; then
+            echo "DEBUG: Variável $var_name = ...${!var_name: -30}" # Log parcial do ARN
         fi
     fi
 done
@@ -60,18 +70,11 @@ echo "INFO: Verificação de variáveis essenciais concluída com sucesso."
 
 # --- Instalação de Pré-requisitos ---
 echo "INFO: Iniciando instalação de pacotes via YUM (modo extra silencioso)..."
-# Adicionado > /dev/null para suprimir stdout do yum (listas de pacotes, etc.)
-# stderr (erros, mensagens de lock) ainda deve ser capturado pelo log principal.
-sudo yum install -y -q httpd jq epel-release aws-cli mysql amazon-efs-utils > /dev/null # MODIFICADO: Adicionado > /dev/null
-
-# Habilita o repositório do Amazon Linux Extra para PHP 7.4
+sudo yum install -y -q httpd jq epel-release aws-cli mysql amazon-efs-utils >/dev/null
 echo "INFO: Habilitando amazon-linux-extras para PHP 7.4 (modo extra silencioso)..."
-# Adicionado &> /dev/null para suprimir stdout E stderr (lista de tópicos) DESTE comando.
-sudo amazon-linux-extras enable php7.4 -y &> /dev/null # MODIFICADO: Alterado para &> /dev/null
-
-# Instala PHP 7.4 e módulos - Adicionado > /dev/null
+sudo amazon-linux-extras enable php7.4 -y &>/dev/null
 echo "INFO: Instalando PHP 7.4 e módulos (modo extra silencioso)..."
-sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap > /dev/null # MODIFICADO: Adicionado > /dev/null
+sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap >/dev/null
 echo "INFO: Instalação de pacotes de pré-requisitos concluída."
 
 # --- Configuração e Inicialização do Apache ---
@@ -91,7 +94,7 @@ if ! command -v aws &>/dev/null || ! command -v jq &>/dev/null; then
     exit 1
 fi
 
-echo "INFO: Tentando obter segredo (ARN: ...${SECRET_NAME_ARN: -20}) da região '$SECRET_REGION'..." # Log parcial do ARN
+echo "INFO: Tentando obter segredo (ARN: ...${SECRET_NAME_ARN: -30}) da região '$SECRET_REGION'..."
 if ! SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME_ARN" --query 'SecretString' --output text --region "$SECRET_REGION"); then
     echo "ERRO: Falha ao executar 'aws secretsmanager get-secret-value'. Verifique ARN, região e permissões IAM."
     exit 1
@@ -106,6 +109,14 @@ echo "INFO: Extraindo username e password do JSON do segredo..."
 DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username)
 DB_PASSWORD=$(echo "$SECRET_STRING_VALUE" | jq -r .password)
 
+# ### DEBUG PASSWORD START ### <--- LOCALIZADOR PARA REMOÇÃO
+echo "#####################################################################"
+echo "### WARNING: TEMPORARY DEBUG LOG - RAW PASSWORD VALUE FOLLOWS!    ###"
+echo "DEBUG: Raw DB_PASSWORD retrieved: '$DB_PASSWORD'"
+echo "### REMOVE THIS DEBUG BLOCK AFTER DIAGNOSIS!                      ###"
+echo "#####################################################################"
+# ### DEBUG PASSWORD END ### <--- LOCALIZADOR PARA REMOÇÃO
+
 if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" == "null" ]; then
     echo "ERRO: Falha ao extrair 'username' ou 'password' do JSON do segredo."
     echo "DEBUG: Segredo parcial: $(echo "$SECRET_STRING_VALUE" | cut -c 1-50)..."
@@ -114,6 +125,7 @@ fi
 echo "INFO: Credenciais do banco de dados extraídas com sucesso (Usuário: $DB_USER)."
 
 # --- Montagem do EFS ---
+# ... (código da montagem EFS - sem alterações) ...
 echo "INFO: Iniciando montagem do EFS..."
 EFS_ID=$AWS_EFS_FILE_SYSTEM_TARGET_ID_0
 MOUNT_POINT="/var/www/html"
@@ -133,26 +145,27 @@ fi
 echo "INFO: EFS '$EFS_ID' montado com sucesso em '$MOUNT_POINT'."
 
 # --- Download e Configuração do WordPress ---
+# ... (código do download/extração/movimentação do WP - sem alterações) ...
 WP_DIR_TEMP="/tmp/wordpress-latest"
 mkdir -p "$WP_DIR_TEMP"
 cd "$WP_DIR_TEMP"
 
 echo "INFO: Baixando a versão mais recente do WordPress (modo silencioso)..."
-wget -q https://wordpress.org/latest.tar.gz # -q já é eficaz aqui
+wget -q https://wordpress.org/latest.tar.gz
 if [ ! -f "latest.tar.gz" ]; then
     echo "ERRO: Falha ao baixar WordPress (latest.tar.gz não encontrado)."
     exit 1
 fi
 
 echo "INFO: Extraindo WordPress..."
-tar -xzf latest.tar.gz # Saída do tar é mínima, geralmente ok
+tar -xzf latest.tar.gz
 if [ ! -d "wordpress" ]; then
     echo "ERRO: Diretório 'wordpress' não encontrado após extração."
     exit 1
 fi
 
 echo "INFO: Movendo arquivos do WordPress para '$MOUNT_POINT' (EFS) (modo menos verboso)..."
-sudo rsync -a --remove-source-files wordpress/ "$MOUNT_POINT/" # -a (sem -v) é eficaz
+sudo rsync -a --remove-source-files wordpress/ "$MOUNT_POINT/"
 cd /tmp
 rm -rf "$WP_DIR_TEMP"
 echo "INFO: Arquivos do WordPress movidos e diretório temporário limpo."
@@ -170,18 +183,59 @@ RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
 ENDPOINT_ADDRESS=$(echo "$RDS_ENDPOINT" | cut -d: -f1)
 echo "DEBUG: Usando Endpoint Address para DB_HOST: $ENDPOINT_ADDRESS"
 
-echo "INFO: Substituindo placeholders de DB no $CONFIG_FILE..."
-sudo sed -i "s#database_name_here#$DBNAME#" "$CONFIG_FILE"
-sudo sed -i "s#username_here#$DB_USER#" "$CONFIG_FILE"
-sudo sed -i "s#password_here#$DB_PASSWORD#" "$CONFIG_FILE"
-sudo sed -i "s#localhost#$ENDPOINT_ADDRESS#" "$CONFIG_FILE"
+# --- INÍCIO DA MODIFICAÇÃO PARA SED SEGURO ---
+echo "INFO: Preparando variáveis para substituição segura no $CONFIG_FILE..."
 
+# Escapa caracteres especiais para o sed (delimitador #, e outros comuns como &, /, \ )
+# Aprimorado para incluir backslash (\) no escape
+SAFE_DBNAME=$(echo "$DBNAME" | sed -e 's/[&#\/\\\\]/\\&/g')
+SAFE_DB_USER=$(echo "$DB_USER" | sed -e 's/[&#\/\\\\]/\\&/g')
+SAFE_DB_PASSWORD=$(echo "$DB_PASSWORD" | sed -e 's/[&#\/\\\\]/\\&/g')
+SAFE_ENDPOINT_ADDRESS=$(echo "$ENDPOINT_ADDRESS" | sed -e 's/[&#\/\\\\]/\\&/g')
+
+# ### DEBUG PASSWORD START ### <--- LOCALIZADOR PARA REMOÇÃO
+echo "#####################################################################"
+echo "### WARNING: TEMPORARY DEBUG LOG - ESCAPED PASSWORD VALUE FOLLOWS! ###"
+echo "DEBUG: Escaped SAFE_DB_PASSWORD for sed: '$SAFE_DB_PASSWORD'"
+echo "### REMOVE THIS DEBUG BLOCK AFTER DIAGNOSIS!                       ###"
+echo "#####################################################################"
+# ### DEBUG PASSWORD END ### <--- LOCALIZADOR PARA REMOÇÃO
+
+echo "INFO: Substituindo placeholders de DB no $CONFIG_FILE (com escape)..."
+# Agora usamos as variáveis seguras (SAFE_*) no comando sed
+sudo sed -i "s#database_name_here#$SAFE_DBNAME#" "$CONFIG_FILE"
+sudo sed -i "s#username_here#$SAFE_DB_USER#" "$CONFIG_FILE"
+# Verifica se o comando anterior falhou antes de tentar a senha (ajuda a isolar)
+if [ $? -ne 0 ]; then
+    echo "ERRO: Falha no sed ao substituir username."
+    exit 1
+fi
+
+sudo sed -i "s#password_here#$SAFE_DB_PASSWORD#" "$CONFIG_FILE"
+# Verifica se o comando da senha falhou
+if [ $? -ne 0 ]; then
+    echo "ERRO: Falha no sed ao substituir password. Verifique caracteres especiais e o valor logado."
+    exit 1
+fi
+
+sudo sed -i "s#localhost#$SAFE_ENDPOINT_ADDRESS#" "$CONFIG_FILE"
+# Verifica se o último comando falhou
+if [ $? -ne 0 ]; then
+    echo "ERRO: Falha no sed ao substituir localhost/endpoint."
+    exit 1
+fi
+
+echo "INFO: Placeholders de DB substituídos com sucesso."
+# --- FIM DA MODIFICAÇÃO PARA SED SEGURO ---
+
+# --- SALTS, FS_METHOD, Permissões ---
+# ... (código restante para SALTS, FS_METHOD, Permissões, Reiniciar Apache - sem alterações) ...
 echo "INFO: Obtendo e configurando chaves de segurança (SALTS) no $CONFIG_FILE (modo silencioso)..."
-SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/) # -sL é eficaz
+SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 if [ -z "$SALT" ]; then
     echo "ERRO: Falha ao obter SALTS da API do WordPress."
 else
-    echo "INFO: Removendo/Inserindo SALTS..." # Mensagem consolidada
+    echo "INFO: Removendo/Inserindo SALTS..."
     sudo sed -i "/define( *'AUTH_KEY'/d;/define( *'SECURE_AUTH_KEY'/d;/define( *'LOGGED_IN_KEY'/d;/define( *'NONCE_KEY'/d;/define( *'AUTH_SALT'/d;/define( *'SECURE_AUTH_SALT'/d;/define( *'LOGGED_IN_SALT'/d;/define( *'NONCE_SALT'/d" "$CONFIG_FILE"
     MARKER_LINE='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
     ESCAPED_SALT=$(echo "$SALT" | sed -e 's/[\/&]/\\&/g')
@@ -192,19 +246,18 @@ $ESCAPED_SALT
     echo "INFO: SALTS configurados com sucesso."
 fi
 
-# --- Forçar Método de Escrita Direto ---
 echo "INFO: Verificando/Adicionando FS_METHOD 'direct' ao $CONFIG_FILE..."
 FS_METHOD_LINE="define( 'FS_METHOD', 'direct' );"
 MARKER_LINE='/* That*'\''*s all, stop editing! Happy publishing. */'
 if [ -f "$CONFIG_FILE" ]; then
     if sudo grep -q "define( *'FS_METHOD' *, *'direct' *);" "$CONFIG_FILE"; then
-        echo "INFO: FS_METHOD 'direct' já está definido." # Mais curto
+        echo "INFO: FS_METHOD 'direct' já está definido."
     else
-        echo "INFO: Inserindo FS_METHOD 'direct'..." # Mais curto
+        echo "INFO: Inserindo FS_METHOD 'direct'..."
         sudo sed -i "/$MARKER_LINE/i\\
 $FS_METHOD_LINE
 " "$CONFIG_FILE"
-        echo "INFO: FS_METHOD 'direct' adicionado." # Mais curto
+        echo "INFO: FS_METHOD 'direct' adicionado."
     fi
 else
     echo "WARN: $CONFIG_FILE não encontrado para adicionar FS_METHOD."
@@ -212,7 +265,6 @@ fi
 
 echo "INFO: Configuração final do wp-config.php concluída."
 
-# --- Ajuste de Permissões ---
 echo "INFO: Ajustando permissões de arquivos/diretórios em '$MOUNT_POINT'..."
 sudo chown -R apache:apache "$MOUNT_POINT"
 echo "INFO: Definindo permissões base (755 dirs, 644 files)..."
@@ -241,7 +293,7 @@ echo "INFO: Ajuste de permissões concluído."
 
 # --- Reiniciar Apache ---
 echo "INFO: Reiniciando o Apache..."
-sudo systemctl restart httpd # Saída é mínima, ok
+sudo systemctl restart httpd
 echo "INFO: Apache reiniciado."
 
 # --- Conclusão ---
@@ -249,6 +301,12 @@ echo "INFO: =================================================="
 echo "INFO: --- Script WordPress Setup concluído com sucesso! ($(date)) ---"
 echo "INFO: Acesse o IP/DNS da instância para finalizar a instalação via navegador."
 echo "INFO: Log completo (com menos verbosidade) em: ${LOG_FILE}"
+# --- BLOCO DE ALERTA FINAL ---
+echo "#####################################################################"
+echo "### WARNING: TEMPORARY PASSWORD LOGGING WAS ENABLED!              ###"
+echo "### REMEMBER TO REMOVE THE DEBUG PASSWORD LOGGING BLOCKS NOW!     ###"
+echo "#####################################################################"
+# --- FIM DO BLOCO DE ALERTA FINAL ---
 echo "INFO: =================================================="
 
 exit 0
