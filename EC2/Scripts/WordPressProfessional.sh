@@ -1,6 +1,6 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.6 (Baseado na v1.5, Adiciona log TEMPORÁRIO de senha para debug do sed)
+# Versão: 1.7 (Baseado na v1.6, Corrige escape dos SALTS, adiciona debug SALT)
 # DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2... (resto da descrição)
 # --- Configuração Inicial e Logging ---
 set -e # Sair imediatamente se um comando falhar
@@ -11,8 +11,8 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 
 # --- BLOCO DE ALERTA INICIAL ---
 echo "#####################################################################"
-echo "### WARNING: TEMPORARY PASSWORD LOGGING ENABLED FOR DEBUGGING!    ###"
-echo "### REMOVE THE DEBUG PASSWORD LOGGING BLOCKS BEFORE PRODUCTION!   ###"
+echo "### WARNING: TEMPORARY DEBUG LOGGING ENABLED (PASSWORD & SALT)!   ###"
+echo "### REMOVE THE DEBUG LOGGING BLOCKS BEFORE PRODUCTION!            ###"
 echo "#####################################################################"
 # --- FIM DO BLOCO DE ALERTA INICIAL ---
 
@@ -51,13 +51,12 @@ for var_name in "${essential_vars[@]}"; do
         echo "ERRO: Variável de ambiente essencial '$var_name' não definida ou vazia."
         error_found=1
     else
-        # Log DEBUG aprimorado para evitar ARNs/Regiões completos se não necessário
         if [[ "$var_name" != *"SECRET"* && "$var_name" != *"PASSWORD"* && "$var_name" != *"USER"* && "$var_name" != *"ARN"* && "$var_name" != *"REGION"* ]]; then
-            echo "DEBUG: Variável $var_name = ${!var_name}"
+             echo "DEBUG: Variável $var_name = ${!var_name}"
         elif [[ "$var_name" == *"_REGION_"* ]]; then
-            echo "DEBUG: Variável $var_name = ${!var_name}" # Região geralmente ok para logar
+             echo "DEBUG: Variável $var_name = ${!var_name}"
         elif [[ "$var_name" == *"_ARN_"* ]]; then
-            echo "DEBUG: Variável $var_name = ...${!var_name: -30}" # Log parcial do ARN
+             echo "DEBUG: Variável $var_name = ...${!var_name: -30}"
         fi
     fi
 done
@@ -70,11 +69,11 @@ echo "INFO: Verificação de variáveis essenciais concluída com sucesso."
 
 # --- Instalação de Pré-requisitos ---
 echo "INFO: Iniciando instalação de pacotes via YUM (modo extra silencioso)..."
-sudo yum install -y -q httpd jq epel-release aws-cli mysql amazon-efs-utils >/dev/null
+sudo yum install -y -q httpd jq epel-release aws-cli mysql amazon-efs-utils > /dev/null
 echo "INFO: Habilitando amazon-linux-extras para PHP 7.4 (modo extra silencioso)..."
-sudo amazon-linux-extras enable php7.4 -y &>/dev/null
+sudo amazon-linux-extras enable php7.4 -y &> /dev/null
 echo "INFO: Instalando PHP 7.4 e módulos (modo extra silencioso)..."
-sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap >/dev/null
+sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap > /dev/null
 echo "INFO: Instalação de pacotes de pré-requisitos concluída."
 
 # --- Configuração e Inicialização do Apache ---
@@ -125,7 +124,6 @@ fi
 echo "INFO: Credenciais do banco de dados extraídas com sucesso (Usuário: $DB_USER)."
 
 # --- Montagem do EFS ---
-# ... (código da montagem EFS - sem alterações) ...
 echo "INFO: Iniciando montagem do EFS..."
 EFS_ID=$AWS_EFS_FILE_SYSTEM_TARGET_ID_0
 MOUNT_POINT="/var/www/html"
@@ -145,7 +143,6 @@ fi
 echo "INFO: EFS '$EFS_ID' montado com sucesso em '$MOUNT_POINT'."
 
 # --- Download e Configuração do WordPress ---
-# ... (código do download/extração/movimentação do WP - sem alterações) ...
 WP_DIR_TEMP="/tmp/wordpress-latest"
 mkdir -p "$WP_DIR_TEMP"
 cd "$WP_DIR_TEMP"
@@ -183,11 +180,9 @@ RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
 ENDPOINT_ADDRESS=$(echo "$RDS_ENDPOINT" | cut -d: -f1)
 echo "DEBUG: Usando Endpoint Address para DB_HOST: $ENDPOINT_ADDRESS"
 
-# --- INÍCIO DA MODIFICAÇÃO PARA SED SEGURO ---
+# --- INÍCIO DA MODIFICAÇÃO PARA SED SEGURO (DB Creds) ---
 echo "INFO: Preparando variáveis para substituição segura no $CONFIG_FILE..."
-
 # Escapa caracteres especiais para o sed (delimitador #, e outros comuns como &, /, \ )
-# Aprimorado para incluir backslash (\) no escape
 SAFE_DBNAME=$(echo "$DBNAME" | sed -e 's/[&#\/\\\\]/\\&/g')
 SAFE_DB_USER=$(echo "$DB_USER" | sed -e 's/[&#\/\\\\]/\\&/g')
 SAFE_DB_PASSWORD=$(echo "$DB_PASSWORD" | sed -e 's/[&#\/\\\\]/\\&/g')
@@ -202,69 +197,81 @@ echo "#####################################################################"
 # ### DEBUG PASSWORD END ### <--- LOCALIZADOR PARA REMOÇÃO
 
 echo "INFO: Substituindo placeholders de DB no $CONFIG_FILE (com escape)..."
-# Agora usamos as variáveis seguras (SAFE_*) no comando sed
 sudo sed -i "s#database_name_here#$SAFE_DBNAME#" "$CONFIG_FILE"
 sudo sed -i "s#username_here#$SAFE_DB_USER#" "$CONFIG_FILE"
-# Verifica se o comando anterior falhou antes de tentar a senha (ajuda a isolar)
-if [ $? -ne 0 ]; then
-    echo "ERRO: Falha no sed ao substituir username."
-    exit 1
-fi
-
+if [ $? -ne 0 ]; then echo "ERRO: Falha no sed ao substituir username."; exit 1; fi
 sudo sed -i "s#password_here#$SAFE_DB_PASSWORD#" "$CONFIG_FILE"
-# Verifica se o comando da senha falhou
-if [ $? -ne 0 ]; then
-    echo "ERRO: Falha no sed ao substituir password. Verifique caracteres especiais e o valor logado."
-    exit 1
-fi
-
+if [ $? -ne 0 ]; then echo "ERRO: Falha no sed ao substituir password. Verifique caracteres especiais e o valor logado."; exit 1; fi
 sudo sed -i "s#localhost#$SAFE_ENDPOINT_ADDRESS#" "$CONFIG_FILE"
-# Verifica se o último comando falhou
-if [ $? -ne 0 ]; then
-    echo "ERRO: Falha no sed ao substituir localhost/endpoint."
-    exit 1
-fi
-
+if [ $? -ne 0 ]; then echo "ERRO: Falha no sed ao substituir localhost/endpoint."; exit 1; fi
 echo "INFO: Placeholders de DB substituídos com sucesso."
-# --- FIM DA MODIFICAÇÃO PARA SED SEGURO ---
+# --- FIM DA MODIFICAÇÃO PARA SED SEGURO (DB Creds) ---
 
-# --- SALTS, FS_METHOD, Permissões ---
-# ... (código restante para SALTS, FS_METHOD, Permissões, Reiniciar Apache - sem alterações) ...
+# --- Configuração dos SALTS ---
 echo "INFO: Obtendo e configurando chaves de segurança (SALTS) no $CONFIG_FILE (modo silencioso)..."
 SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 if [ -z "$SALT" ]; then
-    echo "ERRO: Falha ao obter SALTS da API do WordPress."
+    echo "ERRO: Falha ao obter SALTS da API do WordPress. Verifique conectividade/firewall para api.wordpress.org."
+    # Considerar sair aqui se SALTS são mandatórios: exit 1;
 else
     echo "INFO: Removendo/Inserindo SALTS..."
+    # Remove linhas existentes de SALT
     sudo sed -i "/define( *'AUTH_KEY'/d;/define( *'SECURE_AUTH_KEY'/d;/define( *'LOGGED_IN_KEY'/d;/define( *'NONCE_KEY'/d;/define( *'AUTH_SALT'/d;/define( *'SECURE_AUTH_SALT'/d;/define( *'LOGGED_IN_SALT'/d;/define( *'NONCE_SALT'/d" "$CONFIG_FILE"
+
     MARKER_LINE='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
-    ESCAPED_SALT=$(echo "$SALT" | sed -e 's/[\/&]/\\&/g')
+
+    # Escape mais agressivo para SALT: escapa /, &, e \
+    ESCAPED_SALT=$(echo "$SALT" | sed -e 's/[\/&\\\\]/\\&/g') # MODIFICADO AQUI (v1.7)
+
+    # ### DEBUG SALT START ### <--- ADICIONADO DEBUG TEMPORÁRIO (v1.7)
+    echo "#####################################################################"
+    echo "### WARNING: TEMPORARY DEBUG LOG - ESCAPED SALT VALUE FOLLOWS!   ###"
+    echo "DEBUG: Escaped SALT for sed (first 100 chars): '$(echo "$ESCAPED_SALT" | head -c 100)...'"
+    echo "### REMOVE THIS DEBUG BLOCK AFTER DIAGNOSIS!                       ###"
+    echo "#####################################################################"
+    # ### DEBUG SALT END ### <--- ADICIONADO DEBUG TEMPORÁRIO (v1.7)
+
+    # Insere os novos salts antes da linha marcador
     # shellcheck disable=SC2001
     sudo sed -i "/$MARKER_LINE/i\\
 $ESCAPED_SALT
 " "$CONFIG_FILE"
+    # Verifica se o comando sed falhou
+    if [ $? -ne 0 ]; then # ADICIONADO VERIFICAÇÃO DE ERRO (v1.7)
+        echo "ERRO: Falha no sed ao inserir SALTS. Verifique caracteres especiais no valor escapado logado."
+        exit 1
+    fi
     echo "INFO: SALTS configurados com sucesso."
-fi
+fi # Fim do bloco de configuração dos SALTS
 
+# --- Forçar Método de Escrita Direto ---
 echo "INFO: Verificando/Adicionando FS_METHOD 'direct' ao $CONFIG_FILE..."
 FS_METHOD_LINE="define( 'FS_METHOD', 'direct' );"
-MARKER_LINE='/* That*'\''*s all, stop editing! Happy publishing. */'
+MARKER_LINE='/* That*'\''*s all, stop editing! Happy publishing. */' # Marcador para grep/sed
 if [ -f "$CONFIG_FILE" ]; then
+    # Verifica se a linha já existe
     if sudo grep -q "define( *'FS_METHOD' *, *'direct' *);" "$CONFIG_FILE"; then
         echo "INFO: FS_METHOD 'direct' já está definido."
     else
         echo "INFO: Inserindo FS_METHOD 'direct'..."
-        sudo sed -i "/$MARKER_LINE/i\\
+        # Usa sed para inserir antes da linha marcador (usando o mesmo marcador dos SALTS)
+        MARKER_LINE_SED='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
+        sudo sed -i "/$MARKER_LINE_SED/i\\
 $FS_METHOD_LINE
 " "$CONFIG_FILE"
+         # Verifica se o comando sed falhou
+        if [ $? -ne 0 ]; then
+             echo "ERRO: Falha no sed ao inserir FS_METHOD."
+             exit 1
+        fi
         echo "INFO: FS_METHOD 'direct' adicionado."
     fi
 else
     echo "WARN: $CONFIG_FILE não encontrado para adicionar FS_METHOD."
 fi
-
 echo "INFO: Configuração final do wp-config.php concluída."
 
+# --- Ajuste de Permissões ---
 echo "INFO: Ajustando permissões de arquivos/diretórios em '$MOUNT_POINT'..."
 sudo chown -R apache:apache "$MOUNT_POINT"
 echo "INFO: Definindo permissões base (755 dirs, 644 files)..."
@@ -303,8 +310,8 @@ echo "INFO: Acesse o IP/DNS da instância para finalizar a instalação via nave
 echo "INFO: Log completo (com menos verbosidade) em: ${LOG_FILE}"
 # --- BLOCO DE ALERTA FINAL ---
 echo "#####################################################################"
-echo "### WARNING: TEMPORARY PASSWORD LOGGING WAS ENABLED!              ###"
-echo "### REMEMBER TO REMOVE THE DEBUG PASSWORD LOGGING BLOCKS NOW!     ###"
+echo "### WARNING: TEMPORARY DEBUG LOGGING WAS ENABLED!                 ###"
+echo "### REMEMBER TO REMOVE THE DEBUG PASSWORD & SALT LOGGING BLOCKS!  ###"
 echo "#####################################################################"
 # --- FIM DO BLOCO DE ALERTA FINAL ---
 echo "INFO: =================================================="
