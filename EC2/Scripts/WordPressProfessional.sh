@@ -14,13 +14,6 @@ LOG_FILE="/var/log/wordpress-setup.log"
 # Redireciona toda a saída (stdout e stderr) para o arquivo de log E para o console/cloud-init-output.log
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
-echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup ($(date)) ---"
-echo "INFO: Log principal em: ${LOG_FILE}"
-echo "INFO: Usuário atual: $(whoami)"
-echo "INFO: Diretório atual: $(pwd)"
-echo "INFO: =================================================="
-
 # --- Carregamento de Variáveis de Ambiente ---
 # Tenta carregar do .env como um fallback ou garantia, embora deva herdar do script pai (user_data).
 if [ -f "/home/ec2-user/.env" ]; then
@@ -34,35 +27,6 @@ else
     echo "WARN: Arquivo /home/ec2-user/.env não encontrado. Confiando nas variáveis de ambiente herdadas/exportadas pelo script pai."
 fi
 
-# --- Verificação de Variáveis Essenciais ---
-echo "INFO: Verificando variáveis de ambiente essenciais..."
-essential_vars=(
-    "NAME"                                              # Nome da instância/configuração
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"    # ARN do segredo do DB
-    "AWS_DB_INSTANCE_TARGET_NAME_0"                     # Nome do banco de dados (schema)
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0" # Região do segredo
-    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"                 # Endpoint completo do RDS (host:porta)
-    "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"                   # ID do EFS
-)
-error_found=0
-for var_name in "${essential_vars[@]}"; do
-    # Usando indireção de variável ${!var_name} para obter o valor
-    if [ -z "${!var_name:-}" ]; then
-        echo "ERRO: Variável de ambiente essencial '$var_name' não está definida ou está vazia!"
-        error_found=1
-    else
-        # Logar variáveis não sensíveis para confirmação
-        if [[ "$var_name" != *"SECRET"* && "$var_name" != *"PASSWORD"* && "$var_name" != *"USER"* ]]; then
-            echo "DEBUG: Variável $var_name = ${!var_name}"
-        fi
-    fi
-done
-
-if [ "$error_found" -eq 1 ]; then
-    echo "ERRO: Falha na verificação de variáveis essenciais. Verifique o .env ou a exportação do script pai. Saindo."
-    exit 1
-fi
-echo "INFO: Verificação de variáveis essenciais concluída com sucesso."
 
 # --- Instalação de Pré-requisitos ---
 echo "INFO: Iniciando instalação de pacotes via YUM..."
