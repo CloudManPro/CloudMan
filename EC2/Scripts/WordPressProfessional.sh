@@ -1,7 +1,9 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.8 (Baseado na v1.7, Remove logs de debug, Corrige inserção de SALT com sed -r)
-# DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2... (resto da descrição)
+# Versão: 1.9 (Baseado na v1.8, Remove log parcial do ARN do Secret)
+# DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2,
+# utilizando Apache, PHP 7.4, EFS para /var/www/html, e RDS via Secrets Manager.
+# Destinado a ser executado por um script de user data que baixa este do S3.
 # --- Configuração Inicial e Logging ---
 set -e # Sair imediatamente se um comando falhar
 # set -x # Descomente para debug detalhado de comandos
@@ -43,7 +45,7 @@ for var_name in "${essential_vars[@]}"; do
     if [ -z "${!var_name:-}" ]; then
         echo "ERRO: Variável de ambiente essencial '$var_name' não definida ou vazia."
         error_found=1
-    # Removido log DEBUG das variáveis aqui para limpeza
+    # Removido completamente o log DEBUG das variáveis para segurança e limpeza
     fi
 done
 
@@ -55,8 +57,11 @@ echo "INFO: Verificação de variáveis essenciais concluída com sucesso."
 
 # --- Instalação de Pré-requisitos ---
 echo "INFO: Iniciando instalação de pacotes via YUM (modo extra silencioso)..."
+# A saída padrão (stdout) é redirecionada para /dev/null para reduzir logs
+# A saída de erro (stderr) ainda será capturada pelo 'exec > >(tee ...)' inicial
 sudo yum install -y -q httpd jq epel-release aws-cli mysql amazon-efs-utils > /dev/null
 echo "INFO: Habilitando amazon-linux-extras para PHP 7.4 (modo extra silencioso)..."
+# Redireciona stdout e stderr para /dev/null para silenciar completamente este comando
 sudo amazon-linux-extras enable php7.4 -y &> /dev/null
 echo "INFO: Instalando PHP 7.4 e módulos (modo extra silencioso)..."
 sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap > /dev/null
@@ -79,13 +84,15 @@ if ! command -v aws &>/dev/null || ! command -v jq &>/dev/null; then
     exit 1
 fi
 
-echo "INFO: Tentando obter segredo (ARN: ...${SECRET_NAME_ARN: -30}) da região '$SECRET_REGION'..."
+# Log genérico sem expor ARN completo ou região, se não necessário
+echo "INFO: Tentando obter segredo do Secrets Manager..."
 if ! SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME_ARN" --query 'SecretString' --output text --region "$SECRET_REGION"); then
     echo "ERRO: Falha ao executar 'aws secretsmanager get-secret-value'. Verifique ARN, região e permissões IAM."
     exit 1
 fi
 if [ -z "$SECRET_STRING_VALUE" ]; then
-    echo "ERRO: AWS CLI retornou valor vazio do segredo '$SECRET_NAME_ARN'."
+    # Não loga o ARN aqui por segurança
+    echo "ERRO: AWS CLI retornou valor vazio do segredo."
     exit 1
 fi
 echo "INFO: Segredo bruto obtido com sucesso."
@@ -93,11 +100,11 @@ echo "INFO: Segredo bruto obtido com sucesso."
 echo "INFO: Extraindo username e password do JSON do segredo..."
 DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username)
 DB_PASSWORD=$(echo "$SECRET_STRING_VALUE" | jq -r .password)
-# REMOVIDO Bloco de Debug da Senha Bruta
 
 if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" == "null" ]; then
     echo "ERRO: Falha ao extrair 'username' ou 'password' do JSON do segredo."
-    echo "DEBUG: Segredo parcial: $(echo "$SECRET_STRING_VALUE" | cut -c 1-50)..." # Mantém debug parcial
+    # Mantém log parcial do segredo para debug essencial SE a extração falhar
+    echo "DEBUG: Segredo parcial (se extração falhar): $(echo "$SECRET_STRING_VALUE" | cut -c 1-50)..."
     exit 1
 fi
 echo "INFO: Credenciais do banco de dados extraídas com sucesso (Usuário: $DB_USER)." # Não loga a senha
@@ -141,7 +148,7 @@ if [ ! -d "wordpress" ]; then
 fi
 
 echo "INFO: Movendo arquivos do WordPress para '$MOUNT_POINT' (EFS) (modo menos verboso)..."
-sudo rsync -a --remove-source-files wordpress/ "$MOUNT_POINT/"
+sudo rsync -a --remove-source-files wordpress/ "$MOUNT_POINT/" # -a é menos verboso que -av
 cd /tmp
 rm -rf "$WP_DIR_TEMP"
 echo "INFO: Arquivos do WordPress movidos e diretório temporário limpo."
@@ -157,7 +164,6 @@ sudo cp "$MOUNT_POINT/wp-config-sample.php" "$CONFIG_FILE"
 
 RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
 ENDPOINT_ADDRESS=$(echo "$RDS_ENDPOINT" | cut -d: -f1)
-# Removido DEBUG do Endpoint Address
 
 # --- INÍCIO DA MODIFICAÇÃO PARA SED SEGURO (DB Creds) ---
 echo "INFO: Preparando variáveis para substituição segura no $CONFIG_FILE..."
@@ -166,8 +172,6 @@ SAFE_DBNAME=$(echo "$DBNAME" | sed -e 's/[&#\/\\\\]/\\&/g')
 SAFE_DB_USER=$(echo "$DB_USER" | sed -e 's/[&#\/\\\\]/\\&/g')
 SAFE_DB_PASSWORD=$(echo "$DB_PASSWORD" | sed -e 's/[&#\/\\\\]/\\&/g')
 SAFE_ENDPOINT_ADDRESS=$(echo "$ENDPOINT_ADDRESS" | sed -e 's/[&#\/\\\\]/\\&/g')
-
-# REMOVIDO Bloco de Debug da Senha Escapada
 
 echo "INFO: Substituindo placeholders de DB no $CONFIG_FILE (com escape)..."
 sudo sed -i "s#database_name_here#$SAFE_DBNAME#" "$CONFIG_FILE"
@@ -185,41 +189,33 @@ echo "INFO: Obtendo e configurando chaves de segurança (SALTS) no $CONFIG_FILE 
 SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 if [ -z "$SALT" ]; then
     echo "ERRO: Falha ao obter SALTS da API do WordPress. Verifique conectividade/firewall para api.wordpress.org."
-    # Se SALTS são críticos, descomente a linha abaixo para sair em caso de falha
+    # Se SALTS são críticos, considere sair aqui descomentando a linha abaixo
     # exit 1;
 else
     echo "INFO: Removendo/Inserindo SALTS usando arquivo temporário..."
     # Remove linhas existentes de SALT
     sudo sed -i "/define( *'AUTH_KEY'/d;/define( *'SECURE_AUTH_KEY'/d;/define( *'LOGGED_IN_KEY'/d;/define( *'NONCE_KEY'/d;/define( *'AUTH_SALT'/d;/define( *'SECURE_AUTH_SALT'/d;/define( *'LOGGED_IN_SALT'/d;/define( *'NONCE_SALT'/d" "$CONFIG_FILE"
 
-    MARKER_LINE_SED='\/\* That'\''s all, stop editing! Happy publishing\. \*\/' # Marcador para sed
-
-    # --- INÍCIO DA CORREÇÃO SED SALT (v1.8) ---
-    # Usa um arquivo temporário para inserir os SALTS, evitando problemas de escape/interpretação do shell
+    # --- INÍCIO DA CORREÇÃO SED SALT (v1.8 / v1.9) ---
+    # Usa um arquivo temporário para inserir os SALTS de forma robusta
     TEMP_SALT_FILE=$(mktemp)
     # Escreve o conteúdo ORIGINAL do SALT no arquivo temporário
     echo "$SALT" > "$TEMP_SALT_FILE"
 
-    # Usa o comando 'r' (read file) do sed para inserir o conteúdo do arquivo temp ANTES da linha marcador
-    # O comando -e "/.../r file" lê o conteúdo do arquivo após encontrar a linha
-    # Para inserir ANTES, precisamos de um truque: encontrar a linha ANTERIOR ao marcador ou usar um marcador diferente se possível.
-    # Alternativa mais segura: Inserir DEPOIS de um marcador conhecido ANTES do ponto de inserção desejado.
-    # Vamos usar o marcador do DB_COLLATE como ponto de referência ANTERIOR.
+    # Marcador para inserir os SALTS DEPOIS dele
     DB_COLLATE_MARKER="/define( *'DB_COLLATE'/"
-    # Insere o conteúdo do arquivo temporário DEPOIS da linha DB_COLLATE
+    # Usa o comando 'r' (read file) do sed para inserir o conteúdo do arquivo temp DEPOIS da linha DB_COLLATE
     sudo sed -i -e "$DB_COLLATE_MARKER r $TEMP_SALT_FILE" "$CONFIG_FILE"
 
     # Limpa o arquivo temporário
     rm -f "$TEMP_SALT_FILE"
-    # --- FIM DA CORREÇÃO SED SALT (v1.8) ---
-
-    # REMOVIDO Bloco de Debug do SALT Escapado
+    # --- FIM DA CORREÇÃO SED SALT ---
 
     # Verifica se o comando sed falhou
     if [ $? -ne 0 ]; then
         echo "ERRO: Falha no sed ao inserir SALTS a partir do arquivo temporário."
         # Tenta limpar o arquivo temporário mesmo em caso de erro
-        rm -f "$TEMP_SALT_FILE"
+        rm -f "$TEMP_SALT_FILE" # Garante limpeza
         exit 1
     fi
     echo "INFO: SALTS configurados com sucesso."
@@ -228,7 +224,7 @@ fi # Fim do bloco de configuração dos SALTS
 # --- Forçar Método de Escrita Direto ---
 echo "INFO: Verificando/Adicionando FS_METHOD 'direct' ao $CONFIG_FILE..."
 FS_METHOD_LINE="define( 'FS_METHOD', 'direct' );"
-# Usaremos o mesmo marcador final que antes para inserir o FS_METHOD
+# Marcador final para inserir ANTES dele
 MARKER_LINE_SED='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
 if [ -f "$CONFIG_FILE" ]; then
     # Verifica se a linha já existe
@@ -236,7 +232,7 @@ if [ -f "$CONFIG_FILE" ]; then
         echo "INFO: FS_METHOD 'direct' já está definido."
     else
         echo "INFO: Inserindo FS_METHOD 'direct'..."
-        # Usa sed para inserir ANTES da linha marcador final. Isso é geralmente seguro para uma única linha simples.
+        # Usa sed para inserir ANTES da linha marcador final
         sudo sed -i "/$MARKER_LINE_SED/i\\
 $FS_METHOD_LINE
 " "$CONFIG_FILE"
@@ -256,7 +252,6 @@ echo "INFO: Configuração final do wp-config.php concluída."
 echo "INFO: Ajustando permissões de arquivos/diretórios em '$MOUNT_POINT'..."
 sudo chown -R apache:apache "$MOUNT_POINT"
 echo "INFO: Definindo permissões base (755 dirs, 644 files)..."
-# A saída do find é mínima, mantida para confirmação visual se necessário
 sudo find "$MOUNT_POINT" -type d -exec chmod 755 {} \;
 sudo find "$MOUNT_POINT" -type f -exec chmod 644 {} \;
 
@@ -290,7 +285,6 @@ echo "INFO: =================================================="
 echo "INFO: --- Script WordPress Setup concluído com sucesso! ($(date)) ---"
 echo "INFO: Acesse o IP/DNS da instância para finalizar a instalação via navegador."
 echo "INFO: Log completo (com menos verbosidade) em: ${LOG_FILE}"
-# REMOVIDO Bloco de Alerta Final sobre Debugging
 echo "INFO: =================================================="
 
 exit 0
