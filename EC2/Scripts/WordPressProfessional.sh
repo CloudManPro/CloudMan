@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.1
+# Versão: 1.3 (Baseado na v1.2, Adiciona FS_METHOD e Permissões wp-content)
 # Descrição: Instala e configura WordPress em Amazon Linux 2,
 # utilizando Apache, PHP 7.4, EFS para /var/www/html, e RDS via Secrets Manager.
 # Destinado a ser executado por um script de user data que baixa este do S3.
@@ -37,12 +37,12 @@ fi
 # --- Verificação de Variáveis Essenciais ---
 echo "INFO: Verificando variáveis de ambiente essenciais..."
 essential_vars=(
-    "NAME"                            # Nome da instância/configuração
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" # ARN do segredo do DB
-    "AWS_DB_INSTANCE_TARGET_NAME_0"   # Nome do banco de dados (schema)
+    "NAME"                                              # Nome da instância/configuração
+    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"    # ARN do segredo do DB
+    "AWS_DB_INSTANCE_TARGET_NAME_0"                     # Nome do banco de dados (schema)
     "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0" # Região do segredo
-    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0" # Endpoint completo do RDS (host:porta)
-    "AWS_EFS_FILE_SYSTEM_TARGET_ID_0" # ID do EFS
+    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"                 # Endpoint completo do RDS (host:porta)
+    "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"                   # ID do EFS
 )
 error_found=0
 for var_name in "${essential_vars[@]}"; do
@@ -53,7 +53,7 @@ for var_name in "${essential_vars[@]}"; do
     else
         # Logar variáveis não sensíveis para confirmação
         if [[ "$var_name" != *"SECRET"* && "$var_name" != *"PASSWORD"* && "$var_name" != *"USER"* ]]; then
-             echo "DEBUG: Variável $var_name = ${!var_name}"
+            echo "DEBUG: Variável $var_name = ${!var_name}"
         fi
     fi
 done
@@ -96,7 +96,7 @@ SECRETREGION=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0
 DBNAME=$AWS_DB_INSTANCE_TARGET_NAME_0 # Nome do schema/DB
 
 # Verifica se AWS CLI e JQ estão disponíveis (double check)
-if ! command -v aws &> /dev/null || ! command -v jq &> /dev/null; then
+if ! command -v aws &>/dev/null || ! command -v jq &>/dev/null; then
     echo "ERRO: Comandos 'aws' ou 'jq' não encontrados no PATH após a tentativa de instalação. Saindo."
     exit 1
 fi
@@ -146,8 +146,8 @@ fi
 
 # Verifica se a montagem foi realmente bem-sucedida
 if ! mountpoint -q "$MOUNT_POINT"; then
-  echo "ERRO: Comando 'mount' retornou sucesso, mas '$MOUNT_POINT' não é um ponto de montagem válido!"
-  exit 1
+    echo "ERRO: Comando 'mount' retornou sucesso, mas '$MOUNT_POINT' não é um ponto de montagem válido!"
+    exit 1
 fi
 echo "INFO: EFS '$EFS_ID' montado com sucesso em '$MOUNT_POINT'."
 
@@ -173,8 +173,6 @@ echo "INFO: Movendo arquivos do WordPress para '$MOUNT_POINT' (EFS)..."
 # Move o *conteúdo* do diretório wordpress para o ponto de montagem
 # Usar rsync é mais robusto para copiar, especialmente se houver arquivos existentes
 sudo rsync -av --remove-source-files wordpress/ "$MOUNT_POINT/"
-# Se preferir mv (cuidado se o destino não estiver vazio):
-# sudo mv wordpress/* "$MOUNT_POINT/"
 
 # Limpa o diretório temporário
 cd /tmp
@@ -182,8 +180,9 @@ rm -rf "$WP_DIR_TEMP"
 echo "INFO: Arquivos do WordPress movidos e diretório temporário limpo."
 
 # --- Configuração do wp-config.php ---
-cd "$MOUNT_POINT" # Muda para o diretório raiz do WordPress no EFS
-echo "INFO: Configurando wp-config.php em '$MOUNT_POINT'..."
+cd "$MOUNT_POINT"                        # Muda para o diretório raiz do WordPress no EFS
+CONFIG_FILE="$MOUNT_POINT/wp-config.php" # Define variável para o arquivo de config
+echo "INFO: Configurando $CONFIG_FILE..."
 
 if [ ! -f "wp-config-sample.php" ]; then
     echo "ERRO: wp-config-sample.php não encontrado em '$MOUNT_POINT'. A cópia do WordPress falhou?"
@@ -191,7 +190,7 @@ if [ ! -f "wp-config-sample.php" ]; then
 fi
 
 # Copia o arquivo de exemplo
-sudo cp wp-config-sample.php wp-config.php
+sudo cp wp-config-sample.php "$CONFIG_FILE"
 
 # Extrai o endereço do host do endpoint (removendo a porta)
 RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
@@ -199,58 +198,113 @@ ENDPOINT_ADDRESS=$(echo "$RDS_ENDPOINT" | cut -d: -f1)
 echo "DEBUG: Usando Endpoint Address para DB_HOST: $ENDPOINT_ADDRESS"
 
 # Substitui os placeholders no wp-config.php
-echo "INFO: Substituindo placeholders de DB no wp-config.php..."
-sudo sed -i "s/database_name_here/$DBNAME/g" wp-config.php
-sudo sed -i "s/username_here/$DB_USER/g" wp-config.php
-sudo sed -i "s/password_here/$DB_PASSWORD/g" wp-config.php # Cuidado com caracteres especiais na senha - considere escapar
-sudo sed -i "s/localhost/$ENDPOINT_ADDRESS/g" wp-config.php
+echo "INFO: Substituindo placeholders de DB no $CONFIG_FILE..."
+# Usa delimitadores diferentes (como #) no sed caso a senha contenha barras /
+sudo sed -i "s#database_name_here#$DBNAME#g" "$CONFIG_FILE"
+sudo sed -i "s#username_here#$DB_USER#g" "$CONFIG_FILE"
+sudo sed -i "s#password_here#$DB_PASSWORD#g" "$CONFIG_FILE"
+sudo sed -i "s#localhost#$ENDPOINT_ADDRESS#g" "$CONFIG_FILE"
 
 # Adiciona/Substitui as chaves de segurança (SALTS) - MUITO IMPORTANTE!
-echo "INFO: Obtendo e configurando chaves de segurança (SALTS) no wp-config.php..."
+echo "INFO: Obtendo e configurando chaves de segurança (SALTS) no $CONFIG_FILE..."
 SALT=$(curl -L https://api.wordpress.org/secret-key/1.1/salt/)
 if [ -z "$SALT" ]; then
     echo "WARN: Falha ao obter SALTS da API do WordPress. Usando placeholders (menos seguro)."
 else
     # Remove as linhas de definição de salt existentes (do define até o ponto-e-vírgula)
-    sudo sed -i '/define( *'\''AUTH_KEY'\''/d' wp-config.php
-    sudo sed -i '/define( *'\''SECURE_AUTH_KEY'\''/d' wp-config.php
-    sudo sed -i '/define( *'\''LOGGED_IN_KEY'\''/d' wp-config.php
-    sudo sed -i '/define( *'\''NONCE_KEY'\''/d' wp-config.php
-    sudo sed -i '/define( *'\''AUTH_SALT'\''/d' wp-config.php
-    sudo sed -i '/define( *'\''SECURE_AUTH_SALT'\''/d' wp-config.php
-    sudo sed -i '/define( *'\''LOGGED_IN_SALT'\''/d' wp-config.php
-    sudo sed -i '/define( *'\''NONCE_SALT'\''/d' wp-config.php
+    sudo sed -i "/define( *'AUTH_KEY'/d" "$CONFIG_FILE"
+    sudo sed -i "/define( *'SECURE_AUTH_KEY'/d" "$CONFIG_FILE"
+    sudo sed -i "/define( *'LOGGED_IN_KEY'/d" "$CONFIG_FILE"
+    sudo sed -i "/define( *'NONCE_KEY'/d" "$CONFIG_FILE"
+    sudo sed -i "/define( *'AUTH_SALT'/d" "$CONFIG_FILE"
+    sudo sed -i "/define( *'SECURE_AUTH_SALT'/d" "$CONFIG_FILE"
+    sudo sed -i "/define( *'LOGGED_IN_SALT'/d" "$CONFIG_FILE"
+    sudo sed -i "/define( *'NONCE_SALT'/d" "$CONFIG_FILE"
 
     # Insere os novos salts antes da linha '*/' ou '$table_prefix'
-    MARKER_LINE="\/\* That's all, stop editing! Happy publishing. \*\/"
-    # Alternativamente, use: MARKER_LINE="\$table_prefix"
-    # Escapa barras no SALT para o sed
-    ESCAPED_SALT=$(echo "$SALT" | sed 's/[\/&]/\\&/g')
-    sudo sed -i "/$MARKER_LINE/i $ESCAPED_SALT" wp-config.php
+    MARKER_LINE='\/\* That'\''s all, stop editing! Happy publishing. \*\/' # Linha marcador escapada para sed
+    # Escapa caracteres especiais (&, /) no SALT para o sed
+    ESCAPED_SALT=$(echo "$SALT" | sed -e 's/[\/&]/\\&/g')
+
+    # Usa sed 'i\' para inserir texto multi-linha corretamente
+    sudo sed -i "/$MARKER_LINE/i\\
+$ESCAPED_SALT
+" "$CONFIG_FILE"
+
     echo "INFO: SALTS configurados com sucesso."
 fi
+# Fim do bloco de configuração dos SALTS
 
-echo "INFO: Configuração do wp-config.php concluída."
+# --- Forçar Método de Escrita Direto ---                       <--- Bloco Adicionado ---
+echo "INFO: Verificando/Adicionando FS_METHOD 'direct' ao $CONFIG_FILE..."
+FS_METHOD_LINE="define( 'FS_METHOD', 'direct' );"
+# Reutiliza o marcador definido acima para os SALTS
+# MARKER_LINE='\/\* That'\''s all, stop editing! Happy publishing. \*\/'
 
-# --- Ajuste de Permissões ---
+# Garante que o arquivo existe antes de tentar ler/escrever nele
+if [ -f "$CONFIG_FILE" ]; then
+    # Verifica se a linha já existe para evitar duplicação
+    if sudo grep -qF "$FS_METHOD_LINE" "$CONFIG_FILE"; then
+        echo "INFO: FS_METHOD 'direct' já está definido em $CONFIG_FILE."
+    else
+        echo "INFO: Inserindo FS_METHOD 'direct' antes da linha marcador em $CONFIG_FILE..."
+        # Insere a linha ANTES da linha marcador usando sed i\
+        sudo sed -i "/$MARKER_LINE/i\\
+$FS_METHOD_LINE
+" "$CONFIG_FILE"
+        echo "INFO: FS_METHOD 'direct' adicionado com sucesso."
+    fi
+else
+    echo "WARN: $CONFIG_FILE não encontrado para adicionar FS_METHOD. O setup pode ter falhado anteriormente."
+fi
+# --- Fim do Bloco FS_METHOD ---                               <--- Fim do Bloco Adicionado ---
+
+echo "INFO: Configuração final do wp-config.php concluída."
+
+# --- Ajuste de Permissões ---                                 <--- Bloco Modificado ---
+# Esta seção é crucial para permitir que o WordPress funcione corretamente com FS_METHOD='direct'
 echo "INFO: Ajustando permissões de arquivos/diretórios em '$MOUNT_POINT'..."
-# Define o usuário/grupo apache como proprietário de tudo
+
+# 1. Define o usuário/grupo apache como proprietário de tudo (importante para consistência)
 sudo chown -R apache:apache "$MOUNT_POINT"
 
-# Define permissões mais específicas (recomendado pelo WordPress)
-sudo find "$MOUNT_POINT" -type d -exec chmod 755 {} \; # Diretórios: rwxr-xr-x
-sudo find "$MOUNT_POINT" -type f -exec chmod 644 {} \; # Arquivos: rw-r--r--
+# 2. Define permissões padrão recomendadas pelo WordPress como base
+#    Diretórios: 755 (rwxr-xr-x)
+#    Arquivos:   644 (rw-r--r--)
+echo "INFO: Definindo permissões base (755 para dirs, 644 para files)..."
+sudo find "$MOUNT_POINT" -type d -exec chmod 755 {} \;
+sudo find "$MOUNT_POINT" -type f -exec chmod 644 {} \;
 
-# Permite que o WordPress gerencie o wp-config.php se necessário (opcional, menos seguro)
-# sudo chmod 660 "$MOUNT_POINT/wp-config.php"
+# 3. Permissões mais permissivas *especificamente* para wp-content e seus subdiretórios/arquivos
+#    Isso permite que o processo do servidor web (grupo 'apache') escreva onde necessário
+#    Diretórios: 775 (rwxrwxr-x)
+#    Arquivos:   664 (rw-rw-r--)
+echo "INFO: Ajustando permissões específicas para wp-content (775 para dirs, 664 para files)..."
+WP_CONTENT_DIR="$MOUNT_POINT/wp-content"
+if [ -d "$WP_CONTENT_DIR" ]; then
+    sudo find "$WP_CONTENT_DIR" -type d -exec chmod 775 {} \;
+    sudo find "$WP_CONTENT_DIR" -type f -exec chmod 664 {} \;
+    echo "INFO: Permissões de wp-content ajustadas para 775/664."
 
-# Permite escrita no diretório de uploads
-if [ -d "$MOUNT_POINT/wp-content/uploads" ]; then
-    echo "INFO: Ajustando permissões para wp-content/uploads..."
-    sudo chmod -R 775 "$MOUNT_POINT/wp-content/uploads" # Permite escrita pelo grupo (apache)
+    # 4. Garante que o diretório de uploads exista e tenha as permissões corretas (já cobertas pelo find acima, mas garante existência)
+    UPLOAD_DIR="$WP_CONTENT_DIR/uploads"
+    echo "INFO: Garantindo que o diretório de uploads ($UPLOAD_DIR) exista..."
+    sudo mkdir -p "$UPLOAD_DIR"
+    # A propriedade e permissões já devem estar corretas devido aos comandos anteriores
+    sudo chown -R apache:apache "$UPLOAD_DIR" # Garante propriedade caso mkdir tenha criado com outro dono
+    sudo chmod 775 "$UPLOAD_DIR"              # Garante permissão no diretório raiz de uploads
+else
+    echo "WARN: Diretório '$WP_CONTENT_DIR' não encontrado para ajuste fino de permissões."
 fi
 
-echo "INFO: Permissões ajustadas."
+# 5. Protege o arquivo wp-config.php (remove permissão de leitura para 'outros')
+if [ -f "$CONFIG_FILE" ]; then
+    echo "INFO: Protegendo $CONFIG_FILE (chmod 640)..."
+    sudo chmod 640 "$CONFIG_FILE"
+fi
+
+echo "INFO: Ajuste de permissões concluído."
+# --- Fim do Bloco de Permissões Modificado ---                <--- Fim da Modificação ---
 
 # --- Reiniciar Apache ---
 echo "INFO: Reiniciando o Apache para aplicar todas as alterações..."
