@@ -1,4 +1,15 @@
-from flask import Flask, request, jsonify
+# Nome do arquivo: JmeterServer.py
+# Versão: 1.3.11 (Debug Enhanced for Parameter Verification)
+# Changelog:
+# v1.3.11 (2025-05-12):
+#    - Rota /upload_and_start: Adicionados prints de depuração explícitos para
+#      verificar valores lidos do formulário e propriedades -J montadas.
+# v1.3.10 (2025-05-12):
+#    - Rota /upload_and_start: Ajustada a lógica de envio das propriedades
+#      para o modo Duração e modo Loops para alinhar com JMX v3.
+# ... (resto do changelog)
+
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import subprocess
 import os
@@ -6,429 +17,443 @@ import signal
 import time
 import shutil
 import errno
-# import zipfile # Não mais necessário para este fluxo
 import boto3
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
-import mimetypes  # Para ajudar a determinar o ContentType
+import mimetypes
+import re
 
-# File JmeterServer.py
 app = Flask(__name__)
 CORS(app)
 
 # --- Configurações ---
 JMETER_HOME_ENV = os.getenv('JMETER_HOME')
 JMETER_EXECUTABLE = None
-
 S3_BUCKET_NAME = os.getenv('AWS_S3_BUCKET_TARGET_NAME_REPORT')
 S3_BUCKET_REGION = os.getenv('AWS_S3_BUCKET_TARGET_REGION_REPORT')
 
-
+# ... (código de inicialização do JMETER_EXECUTABLE e pastas - sem alterações) ...
 if JMETER_HOME_ENV and os.path.isdir(JMETER_HOME_ENV):
     temp_executable = os.path.join(JMETER_HOME_ENV, 'bin', 'jmeter')
     if os.path.isfile(temp_executable) and os.access(temp_executable, os.X_OK):
         JMETER_EXECUTABLE = temp_executable
-        print(
-            f"INFO: Usando JMETER_EXECUTABLE de JMETER_HOME: {JMETER_EXECUTABLE}")
-    else:
-        print(
-            f"AVISO: JMETER_HOME ({JMETER_HOME_ENV}) não é um executável válido. Tentando PATH.")
+    if not JMETER_EXECUTABLE:  # Fallback
         JMETER_EXECUTABLE = shutil.which("jmeter")
-        if JMETER_EXECUTABLE:
-            print(
-                f"INFO: JMETER_EXECUTABLE encontrado no PATH: {JMETER_EXECUTABLE}")
-        else:
-            print("ERRO CRÍTICO: JMeter não encontrado em JMETER_HOME nem no PATH.")
 else:
-    if JMETER_HOME_ENV:
-        print(
-            f"AVISO: JMETER_HOME ('{JMETER_HOME_ENV}') não é um diretório válido. Tentando encontrar 'jmeter' no PATH.")
-    else:
-        print("INFO: JMETER_HOME não está definido. Tentando encontrar 'jmeter' no PATH.")
     JMETER_EXECUTABLE = shutil.which("jmeter")
-    if JMETER_EXECUTABLE:
-        print(
-            f"INFO: JMETER_EXECUTABLE encontrado no PATH: {JMETER_EXECUTABLE}")
-    else:
-        print("ERRO CRÍTICO: 'jmeter' não encontrado no PATH e JMETER_HOME não definido ou inválido.")
+
+if JMETER_EXECUTABLE:
+    print(f"INFO: JMETER_EXECUTABLE encontrado em: {JMETER_EXECUTABLE}")
+else:
+    print(
+        f"ERRO CRÍTICO: JMeter não encontrado. Verifique JMETER_HOME ('{JMETER_HOME_ENV}') ou se 'jmeter' está no PATH do sistema.")
 
 UPLOAD_FOLDER = 'jmeter_uploads'
 RESULTS_FOLDER = 'jmeter_results'
 LOGS_FOLDER = 'jmeter_logs'
 REPORTS_TEMP_FOLDER = 'jmeter_html_reports_temp'
+for folder in [UPLOAD_FOLDER, RESULTS_FOLDER, LOGS_FOLDER, REPORTS_TEMP_FOLDER]:
+    os.makedirs(folder, exist_ok=True)
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(RESULTS_FOLDER, exist_ok=True)
-os.makedirs(LOGS_FOLDER, exist_ok=True)
-os.makedirs(REPORTS_TEMP_FOLDER, exist_ok=True)
-
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 30
+POLL_INTERVAL_SECONDS = 1
 jmeter_process_pid = None
 current_log_file_path = None
 current_results_file_path = None
 
+# ... (funções parse_jmeter_log_summary, generate_html_report, upload_directory_to_s3 - sem alterações) ...
+
+
+def parse_jmeter_log_summary(log_content):
+    summary = {"type": None, "samples": None, "time_segment_seconds": None, "throughput_rps": None, "avg_response_time_ms": None, "min_response_time_ms": None, "max_response_time_ms": None,
+               "errors_count": None, "errors_percentage": None, "active_threads": None, "started_threads": None, "finished_threads": None, "raw_line": None, "parsed_timestamp": None}
+    last_summary_line = next((line for line in reversed(
+        log_content.splitlines()) if "INFO o.a.j.r.Summariser: summary " in line), None)
+    if not last_summary_line:
+        return summary
+    summary["raw_line"] = last_summary_line
+    try:
+        summary["parsed_timestamp"] = last_summary_line.split(" INFO")[0]
+    except:
+        pass
+    patterns = {
+        "final": r"summary\s*=\s*(\d+)\s*in\s*(\d{2}:\d{2}:\d{2})\s*=\s*([\d\.]+)/s\s*Avg:\s*(\d+)\s*Min:\s*(\d+)\s*Max:\s*(\d+)\s*Err:\s*(\d+)\s*\(([\d\.]+)%\)",
+        "incremental": r"summary\s*\+\s*(\d+)\s*in\s*(\d{2}:\d{2}:\d{2})\s*=\s*([\d\.]+)/s\s*Avg:\s*(\d+)\s*Min:\s*(\d+)\s*Max:\s*(\d+)\s*Err:\s*(\d+)\s*\(([\d\.]+)%\)\s*Active:\s*(\d+)\s*Started:\s*(\d+)\s*Finished:\s*(\d+)"
+    }
+    match = None
+    if "summary =" in last_summary_line:
+        summary["type"] = "final"
+        match = re.search(patterns["final"], last_summary_line)
+    elif "summary +" in last_summary_line:
+        summary["type"] = "incremental"
+        match = re.search(patterns["incremental"], last_summary_line)
+
+    if match:
+        try:
+            groups = match.groups()
+            summary.update({"samples": int(groups[0]), "throughput_rps": float(groups[2]), "avg_response_time_ms": int(groups[3]), "min_response_time_ms": int(
+                groups[4]), "max_response_time_ms": int(groups[5]), "errors_count": int(groups[6]), "errors_percentage": float(groups[7])})
+            h, m, s = map(int, groups[1].split(':'))
+            summary["time_segment_seconds"] = h * 3600 + m * 60 + s
+            if summary["type"] == "incremental" and len(groups) >= 11:
+                summary.update({"active_threads": int(groups[8]), "started_threads": int(
+                    groups[9]), "finished_threads": int(groups[10])})
+            elif summary["type"] == "final":
+                summary["active_threads"] = 0
+        except (IndexError, ValueError) as e:
+            print(
+                f"ERRO parse_jmeter_log_summary: {last_summary_line} - Erro: {e}")
+    return summary
+
 
 def generate_html_report(jtl_file, report_output_folder):
     if not JMETER_EXECUTABLE:
-        print("ERRO generate_html_report: JMETER_EXECUTABLE não está definido.")
-        return False, "Executável do JMeter não configurado no servidor."
+        return False, "JMeter não configurado."
     if not os.path.exists(jtl_file):
-        print(
-            f"ERRO generate_html_report: Arquivo JTL '{jtl_file}' não encontrado.")
-        return False, f"Arquivo de resultados '{jtl_file}' não encontrado."
-
+        return False, f"JTL '{jtl_file}' não encontrado."
     if os.path.exists(report_output_folder):
         try:
             shutil.rmtree(report_output_folder)
-            print(
-                f"INFO generate_html_report: Pasta de relatório existente '{report_output_folder}' removida.")
         except Exception as e:
-            msg = f"Erro ao remover pasta de relatório existente '{report_output_folder}': {str(e)}"
-            print(f"ERRO generate_html_report: {msg}")
-            return False, msg
-
-    report_command = [
-        JMETER_EXECUTABLE,
-        '-g', jtl_file,
-        '-o', report_output_folder
-    ]
-    print(
-        f"INFO generate_html_report: Gerando relatório HTML com comando: {' '.join(report_command)}")
+            return False, f"Erro ao remover dir. relatório: {e}"
     try:
-        completed_process = subprocess.run(
-            report_command, capture_output=True, text=True, check=False)
-        if completed_process.returncode == 0:
-            print(
-                f"INFO generate_html_report: Relatório HTML gerado com sucesso em '{report_output_folder}'.")
+        os.makedirs(report_output_folder, exist_ok=True)
+    except Exception as e:
+        return False, f"Erro ao criar dir. relatório: {e}"
+    cmd = [JMETER_EXECUTABLE, '-g', jtl_file, '-o', report_output_folder]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           check=False, encoding='utf-8', errors='replace')
+        if p.returncode == 0:
             return True, f"Relatório HTML gerado em '{report_output_folder}'."
         else:
-            error_msg = f"Falha ao gerar relatório HTML. Código de saída: {completed_process.returncode}\nOutput:\n{completed_process.stdout}\nError:\n{completed_process.stderr}"
-            print(f"ERRO generate_html_report: {error_msg}")
-            return False, error_msg
+            return False, f"Falha relatório HTML (cód: {p.returncode}):\n{p.stdout}\n{p.stderr}"
     except Exception as e:
-        error_msg = f"Exceção ao gerar relatório HTML: {str(e)}"
-        print(f"ERRO generate_html_report: {error_msg}")
-        return False, error_msg
-
-# REMOVIDA: def zip_directory(folder_path, zip_path):
+        return False, f"Exceção relatório HTML: {e}"
 
 
-def upload_directory_to_s3(local_directory_path, bucket_name, s3_target_prefix, region_name):
-    """
-    Faz upload do conteúdo de um diretório local para um prefixo S3.
-    """
-    if not bucket_name or not region_name:
-        return False, "Nome do bucket S3 ou região não configurados nas variáveis de ambiente."
-
-    s3_client = boto3.client('s3', region_name=region_name)
-    uploaded_files_count = 0
-    errors_encountered = []
-
-    # Garante que o prefixo termine com / para simular uma pasta
-    if s3_target_prefix and not s3_target_prefix.endswith('/'):
-        s3_target_prefix += '/'
-
-    for root, _, files in os.walk(local_directory_path):
+def upload_directory_to_s3(local_dir, bucket, s3_prefix, region):
+    if not bucket or not region:
+        return False, "Bucket S3 ou região N/D."
+    s3 = boto3.client('s3', region_name=region)
+    count, errors = 0, []
+    if not os.path.isdir(local_dir):
+        return False, f"Dir. local '{local_dir}' não encontrado."
+    if s3_prefix and not s3_prefix.endswith('/'):
+        s3_prefix += '/'
+    for root, _, files in os.walk(local_dir):
         for filename in files:
-            local_file_path = os.path.join(root, filename)
-            # Cria o caminho relativo para manter a estrutura de pastas no S3
-            relative_path = os.path.relpath(
-                local_file_path, local_directory_path)
-            s3_file_key = os.path.join(s3_target_prefix, relative_path).replace(
-                "\\", "/")  # Garante barras /
-
-            # Tenta adivinhar o ContentType
-            content_type, _ = mimetypes.guess_type(local_file_path)
-            if content_type is None:
-                content_type = 'application/octet-stream'  # Default
-
-            # Define ContentType para HTML especificamente para renderização correta
+            local_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(local_path, local_dir)
+            s3_key = os.path.join(s3_prefix, rel_path).replace("\\", "/")
+            ct, _ = mimetypes.guess_type(local_path)
+            ct = ct or 'application/octet-stream'
             if filename.lower().endswith(('.html', '.htm')):
-                content_type = 'text/html; charset=utf-8'
+                ct = 'text/html; charset=utf-8'
             elif filename.lower().endswith('.css'):
-                content_type = 'text/css; charset=utf-8'
+                ct = 'text/css; charset=utf-8'
             elif filename.lower().endswith('.js'):
-                content_type = 'application/javascript; charset=utf-8'
-
+                ct = 'application/javascript; charset=utf-8'
             try:
-                print(
-                    f"INFO upload_directory_to_s3: Uploading '{local_file_path}' to '{bucket_name}/{s3_file_key}' with ContentType: {content_type}")
-                with open(local_file_path, 'rb') as f:
-                    s3_client.put_object(
-                        Bucket=bucket_name, Key=s3_file_key, Body=f, ContentType=content_type)
-                uploaded_files_count += 1
-            except FileNotFoundError:
-                msg = f"Arquivo local '{local_file_path}' não encontrado para upload."
-                print(f"ERRO upload_directory_to_s3: {msg}")
-                errors_encountered.append(msg)
-            except (NoCredentialsError, PartialCredentialsError):
-                msg = "Credenciais AWS não encontradas/incompletas."
-                print(f"ERRO upload_directory_to_s3: {msg}")
-                errors_encountered.append(msg)
-                return False, msg  # Erro crítico, interrompe
-            except ClientError as e:
-                msg = f"Erro do cliente S3 ao fazer upload de '{s3_file_key}': {str(e)}"
-                print(f"ERRO upload_directory_to_s3: {msg}")
-                errors_encountered.append(msg)
+                with open(local_path, 'rb') as f:
+                    s3.put_object(Bucket=bucket, Key=s3_key,
+                                  Body=f, ContentType=ct)
+                count += 1
             except Exception as e:
-                msg = f"Erro inesperado durante upload de '{s3_file_key}': {str(e)}"
-                print(f"ERRO upload_directory_to_s3: {msg}")
-                errors_encountered.append(msg)
-
-    if errors_encountered:
-        return False, f"Upload para S3 concluído com {len(errors_encountered)} erro(s). {uploaded_files_count} arquivos enviados. Erros: {'; '.join(errors_encountered)}"
-
-    # URL para o index.html principal do relatório
-    s3_index_url = f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{s3_target_prefix}index.html"
-    # Ou, se o bucket estiver configurado para hospedagem de site estático:
-    # s3_index_url = f"http://{bucket_name}.s3-website-{region_name}.amazonaws.com/{s3_target_prefix}index.html"
-
-    msg_success = f"Upload de {uploaded_files_count} arquivos para S3 (prefixo: '{s3_target_prefix}') bem-sucedido. Relatório: {s3_index_url}"
-    print(f"INFO upload_directory_to_s3: {msg_success}")
-    return True, msg_success
+                if isinstance(e, (NoCredentialsError, PartialCredentialsError)):
+                    return False, "Credenciais AWS não encontradas."
+                errors.append(f"Erro S3/upload '{s3_key}': {str(e)}")
+                break
+    if errors:
+        return False, f"Upload S3: {len(errors)} erro(s). {count} arquivos. Erros: {'; '.join(errors)}"
+    s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{s3_prefix}index.html"
+    return True, f"Upload {count} arquivos S3 OK. Relatório: {s3_url}"
 
 
 @app.route('/health_check', methods=['GET'])
 def health_check():
-    # ... (código existente, sem alterações aqui)
-    if JMETER_EXECUTABLE and os.path.exists(JMETER_EXECUTABLE):
-        jmeter_status = "ok"
-        jmeter_msg = JMETER_EXECUTABLE
-    elif JMETER_EXECUTABLE and not os.path.isabs(JMETER_EXECUTABLE) and shutil.which(JMETER_EXECUTABLE):
-        jmeter_status = "ok"
-        jmeter_msg = f"Comando '{JMETER_EXECUTABLE}' encontrado no PATH."
-    else:
-        jmeter_status = "warning"
-        jmeter_msg_detail = "Executável do JMeter não foi encontrado ou não está configurado corretamente. "
-        jmeter_msg_detail += f"Verifique a variável de ambiente JMETER_HOME e se 'jmeter' está no PATH do servidor. "
-        jmeter_msg_detail += f"Tentativa de usar: '{JMETER_EXECUTABLE if JMETER_EXECUTABLE else 'Não determinado'}'. "
-        jmeter_msg_detail += f"JMETER_HOME no ambiente do servidor: '{JMETER_HOME_ENV if JMETER_HOME_ENV else 'Não definido'}'."
-        print(f"DEBUG health_check: {jmeter_msg_detail}")
-        jmeter_msg = jmeter_msg_detail
-
+    # ... (código da rota health_check - sem alterações) ...
+    j_ok = JMETER_EXECUTABLE and os.path.exists(JMETER_EXECUTABLE)
+    j_msg = f"JMeter: {JMETER_EXECUTABLE}" if j_ok else f"JMeter N/D (EXE: {JMETER_EXECUTABLE or 'N/A'}, HOME: {JMETER_HOME_ENV or 'N/A'})"
     s3_ok = S3_BUCKET_NAME and S3_BUCKET_REGION
-    s3_status_msg = f"Bucket: {S3_BUCKET_NAME if S3_BUCKET_NAME else 'NÃO DEFINIDO'}, Região: {S3_BUCKET_REGION if S3_BUCKET_REGION else 'NÃO DEFINIDO'}"
-
-    final_status = "ok"
-    messages = ["Servidor backend está operacional."]
-    if jmeter_status == "warning":
-        final_status = "ok_with_warning"
-        messages.append(f"Aviso JMeter: {jmeter_msg}")
-    else:
-        messages.append(f"JMeter Path: {jmeter_msg}")
-
-    if not s3_ok:
-        final_status = "ok_with_warning"
-        messages.append(f"Aviso S3: Configuração incompleta. {s3_status_msg}")
-    else:
-        messages.append(f"Configuração S3: {s3_status_msg}")
-
-    return jsonify({
-        "status": final_status,
-        "message": "\n".join(messages),
-        "jmeter_path_status": jmeter_status,
-        "jmeter_path_detail": jmeter_msg,
-        "s3_configured": s3_ok,
-        "s3_config_detail": s3_status_msg
-    }), 200
+    s3_msg = f"S3 Relatórios: Bucket {S3_BUCKET_NAME or 'N/D'}, Região {S3_BUCKET_REGION or 'N/D'}"
+    status = "ok_with_warning" if not j_ok or not s3_ok else "ok"
+    msgs = ["Backend operacional.", j_msg, s3_msg]
+    return jsonify({"status": status, "message": "\n".join(msgs), "jmeter_path_status": "ok" if j_ok else "warning", "jmeter_path_detail": j_msg, "s3_configured": s3_ok, "s3_config_detail": s3_msg}), 200
 
 
 @app.route('/upload_and_start', methods=['POST'])
 def upload_and_start():
-    # ... (código existente, sem alterações aqui)
     global jmeter_process_pid, current_log_file_path, current_results_file_path
-
     if not JMETER_EXECUTABLE:
-        print("ERRO upload_and_start: JMETER_EXECUTABLE não está definido.")
-        return jsonify({"message": "Configuração do JMeter no servidor está incompleta. Executável não encontrado."}), 500
-
+        return jsonify({"message": "Erro crítico: JMeter não configurado."}), 500
     if jmeter_process_pid:
         try:
             os.kill(jmeter_process_pid, 0)
-            print(
-                f"INFO upload_and_start: Teste JMeter já em execução com PID {jmeter_process_pid}.")
-            return jsonify({"message": f"Um teste JMeter já está em execução com PID {jmeter_process_pid}. Pare-o primeiro."}), 409
+            return jsonify({"message": f"Teste já em execução (PID {jmeter_process_pid})."}), 409
         except OSError:
             jmeter_process_pid = None
-            current_log_file_path = None
-            current_results_file_path = None
-
     if 'jmxFile' not in request.files:
-        return jsonify({"message": "Nenhum arquivo .jmx enviado"}), 400
+        return jsonify({"message": "Nenhum .jmx enviado."}), 400
     file = request.files['jmxFile']
-    if file.filename == '':
-        return jsonify({"message": "Nenhum arquivo selecionado"}), 400
+    if not file.filename or not file.filename.lower().endswith('.jmx'):
+        return jsonify({"message": ".jmx inválido."}), 400
 
-    if file and file.filename.endswith('.jmx'):
-        safe_filename = os.path.basename(file.filename)
-        filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
-        file.save(filepath)
+    form_data = request.form
 
-        base_name = os.path.splitext(safe_filename)[0]
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
+    # --- DEBUG: Logar todos os dados recebidos do formulário ---
+    print("\n" + "="*10 + " DEBUG: Dados Recebidos do Formulário " + "="*10)
+    for key, value in form_data.items():
+        print(f"  Form['{key}']: {value}")
+    print("="*50 + "\n")
+    # --- FIM DEBUG ---
 
-        current_log_file_path = os.path.join(
-            LOGS_FOLDER, f"{base_name}_{timestamp}.log")
-        current_results_file_path = os.path.join(
-            RESULTS_FOLDER, f"{base_name}_{timestamp}.jtl")
+    target_host = form_data.get('TARGET_HOST')
+    target_protocol = form_data.get('TARGET_PROTOCOL', 'https')
+    num_threads = form_data.get('NUM_THREADS', '1')
+    ramp_up = form_data.get('RAMP_UP', '0')
+    control_mode = form_data.get('CONTROL_MODE', 'duration')
+    duration_from_form = form_data.get('DURATION')
+    test_loops_from_form = form_data.get('TEST_LOOPS')
+    summariser_interval = form_data.get('SUMMARISER_INTERVAL', '10')
 
-        jmeter_command = [
-            JMETER_EXECUTABLE,
-            '-Djava.awt.headless=true',
-            '-n',
-            '-t', filepath,
-            '-l', current_results_file_path,
-            '-j', current_log_file_path
-        ]
-        try:
+    timer_type = form_data.get('TIMER_TYPE', 'constant')
+    c_delay = form_data.get('C_DELAY', '100')
+    ur_range = form_data.get('UR_RANGE', '1000')
+    ur_offset = form_data.get('UR_OFFSET', '0')
+    gr_deviation = form_data.get('GR_DEVIATION', '100')
+    gr_offset = form_data.get('GR_OFFSET', '300')
+
+    safe_filename = os.path.basename(file.filename)
+    filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+    file.save(filepath)
+    base_name = os.path.splitext(safe_filename)[0]
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    current_log_file_path = os.path.join(
+        LOGS_FOLDER, f"{base_name}_{timestamp}.log")
+    current_results_file_path = os.path.join(
+        RESULTS_FOLDER, f"{base_name}_{timestamp}.jtl")
+
+    jmeter_command = [JMETER_EXECUTABLE, '-Djava.awt.headless=true']
+    if summariser_interval and summariser_interval.strip():
+        jmeter_command.append(
+            f"-Jsummariser.interval={summariser_interval.strip()}")
+
+    # --- DEBUG: Logar propriedades -J que estão sendo adicionadas ---
+    print("\n" + "="*10 + " DEBUG: Montando Comando JMeter (-J Props) " + "="*10)
+
+    def add_jmeter_prop(prop_name, prop_value, default_value=None):
+        value_to_use = None
+        original_value = prop_value  # Store original for logging
+        if prop_value is not None and str(prop_value).strip():
+            value_to_use = str(prop_value).strip()
+        elif default_value is not None:
+            value_to_use = str(default_value).strip()
+            # Indicate default usage
+            original_value = f"{original_value} (Usando Default: {default_value})"
+
+        if value_to_use is not None:
+            prop_string = f"-J{prop_name}={value_to_use}"
+            jmeter_command.append(prop_string)
             print(
-                f"INFO upload_and_start: Executando comando JMeter: {' '.join(jmeter_command)}")
-            process = subprocess.Popen(jmeter_command)
-            jmeter_process_pid = process.pid
+                f"  Adicionando: {prop_string} (Valor Original/Form: {original_value})")
+        else:
             print(
-                f"INFO upload_and_start: JMeter iniciado com PID {jmeter_process_pid}.")
-            return jsonify({
-                "message": f"Plano de teste '{safe_filename}' carregado e JMeter iniciado.",
-                "pid": jmeter_process_pid,
-                "log_file": current_log_file_path,
-                "results_file": current_results_file_path
-            }), 200
-        except Exception as e:
-            jmeter_process_pid = None
-            current_log_file_path = None
-            current_results_file_path = None
-            print(f"ERRO upload_and_start: Erro ao iniciar JMeter: {str(e)}")
-            return jsonify({"message": f"Erro ao iniciar JMeter: {str(e)}"}), 500
-    else:
-        return jsonify({"message": "Arquivo inválido. Por favor, envie um arquivo .jmx"}), 400
+                f"  SKIP: Propriedade {prop_name} não adicionada (Valor Original/Form: {original_value}, Default: {default_value})")
+
+    add_jmeter_prop("TARGET_HOST", target_host)
+    add_jmeter_prop("TARGET_PROTOCOL", target_protocol, "https")
+    add_jmeter_prop("NUM_THREADS", num_threads, "1")
+    add_jmeter_prop("RAMP_UP", ramp_up, "0")
+
+    # Timer properties
+    add_jmeter_prop("TIMER_TYPE", timer_type, "constant")
+    if timer_type == 'constant':
+        add_jmeter_prop("C_DELAY", c_delay, "100")
+    elif timer_type == 'uniform_random':
+        add_jmeter_prop("UR_RANGE", ur_range, "1000")
+        add_jmeter_prop("UR_OFFSET", ur_offset, "0")
+    elif timer_type == 'gaussian_random':
+        add_jmeter_prop("GR_DEVIATION", gr_deviation, "100")
+        add_jmeter_prop("GR_OFFSET", gr_offset, "300")
+
+    # Control Mode properties - Logic for JMX v3
+    if control_mode == 'duration':
+        prop_string = "-JUSE_SCHEDULER=true"
+        jmeter_command.append(prop_string)
+        print(f"  Adicionando: {prop_string} (Modo Duração)")
+        add_jmeter_prop("DURATION", duration_from_form, "60")
+        # Não enviamos TEST_LOOPS no modo Duração para JMX v3
+
+    elif control_mode == 'loops':
+        prop_string = "-JUSE_SCHEDULER=false"
+        jmeter_command.append(prop_string)
+        print(f"  Adicionando: {prop_string} (Modo Loops)")
+        loops_val = test_loops_from_form.strip(
+        ) if test_loops_from_form and test_loops_from_form.strip() else "1"
+        add_jmeter_prop("TEST_LOOPS", loops_val, "1")
+
+    print("="*55 + "\n")
+    # --- FIM DEBUG ---
+
+    jmeter_command.extend(['-n', '-t', filepath, '-l',
+                          current_results_file_path, '-j', current_log_file_path])
+
+    try:
+        # --- DEBUG: Logar comando final ---
+        print("\nINFO: Comando JMeter final a ser executado:")
+        print(f"  {' '.join(jmeter_command)}\n")
+        # --- FIM DEBUG ---
+        process = subprocess.Popen(jmeter_command)
+        jmeter_process_pid = process.pid
+        print(
+            f"INFO: JMeter ('{safe_filename}') iniciado PID {jmeter_process_pid}.")
+        return jsonify({"message": f"Teste '{safe_filename}' iniciado.", "pid": jmeter_process_pid, "log_file": current_log_file_path, "results_file": current_results_file_path}), 200
+    except Exception as e:
+        print(f"ERRO: Falha ao iniciar JMeter: {e}")
+        current_log_file_path = None
+        current_results_file_path = None
+        return jsonify({"message": f"Erro ao iniciar JMeter: {e}"}), 500
 
 
+# ... (rotas /stop_test, /get_current_log, /get_latest_summary_metrics - sem alterações) ...
 @app.route('/stop_test', methods=['POST'])
 def stop_test():
-    global jmeter_process_pid, current_log_file_path, current_results_file_path
+    global jmeter_process_pid, current_results_file_path
+    pid_to_stop = jmeter_process_pid
+    msg_parts = []
+    was_jmeter_running = pid_to_stop is not None
 
-    jmeter_process_pid_original_value = jmeter_process_pid
-    final_message = []
-
-    if jmeter_process_pid is None:
-        final_message.append("Nenhum teste JMeter em execução para parar.")
-    else:
+    if was_jmeter_running:
         try:
-            print(
-                f"INFO stop_test: Tentando parar o processo JMeter com PID: {jmeter_process_pid}")
-            os.kill(jmeter_process_pid, signal.SIGTERM)
-            time.sleep(2)
-            try:
-                os.kill(jmeter_process_pid, 0)
-                print(
-                    f"AVISO stop_test: Processo {jmeter_process_pid} ainda existe após SIGTERM. Enviando SIGKILL.")
-                os.kill(jmeter_process_pid, signal.SIGKILL)
-                final_message.append(
-                    f"Sinal SIGKILL enviado para forçar parada do JMeter PID {jmeter_process_pid}.")
-            except OSError as ex:
-                if ex.errno == errno.ESRCH:
-                    final_message.append(
-                        f"Processo JMeter PID {jmeter_process_pid} parado com sucesso (após SIGTERM).")
-                else:
-                    raise
-            except Exception as e_inner:
-                err_msg = f"Erro inesperado ao tentar SIGKILL no processo {jmeter_process_pid}: {str(e_inner)}"
-                print(f"ERRO stop_test: {err_msg}")
-                final_message.append(
-                    f"Processo JMeter PID {jmeter_process_pid} pode não ter sido parado corretamente após SIGTERM ({err_msg}).")
+            os.kill(pid_to_stop, signal.SIGTERM)
+            msg_parts.append(f"SIGTERM enviado para PID {pid_to_stop}.")
+            stopped_graciously = False
+            for _ in range(int(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS / POLL_INTERVAL_SECONDS)):
+                time.sleep(POLL_INTERVAL_SECONDS)
+                try:
+                    os.kill(pid_to_stop, 0)
+                except OSError as e:
+                    if e.errno == errno.ESRCH:
+                        msg_parts.append(
+                            f"PID {pid_to_stop} parou graciosamente.")
+                        stopped_graciously = True
+                        break
+                    else:
+                        raise
+            if not stopped_graciously:
+                msg_parts.append(
+                    f"PID {pid_to_stop} não parou com SIGTERM após {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS}s. Enviando SIGKILL.")
+                try:
+                    os.kill(pid_to_stop, signal.SIGKILL)
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    msg_parts.append(
+                        f"SIGKILL enviado para PID {pid_to_stop}.")
+                except OSError as e:
+                    if e.errno == errno.ESRCH:
+                        msg_parts.append(
+                            f"PID {pid_to_stop} já parado antes do SIGKILL (ou parou rapidamente).")
+                    else:
+                        msg_parts.append(
+                            f"Erro ao enviar SIGKILL para PID {pid_to_stop}: {e}")
             jmeter_process_pid = None
-        except OSError as e:
-            if e.errno == errno.ESRCH:
-                final_message.append(
-                    f"Processo JMeter com PID {jmeter_process_pid_original_value} não encontrado. Pode já ter sido parado ou terminado.")
-                jmeter_process_pid = None
-            else:
-                err_msg = f"Erro OSError ao parar o processo JMeter: {str(e)}"
-                print(f"ERRO stop_test: {err_msg}")
-                final_message.append(err_msg)
-                return jsonify({"message": "\n".join(final_message)}), 500
         except Exception as e:
-            err_msg = f"Erro inesperado ao parar JMeter: {str(e)}"
-            print(f"ERRO stop_test: {err_msg}")
-            final_message.append(err_msg)
-            return jsonify({"message": "\n".join(final_message)}), 500
+            msg_parts.append(f"Erro ao tentar parar PID {pid_to_stop}: {e}")
+            jmeter_process_pid = None
+    else:
+        msg_parts.append(
+            "Nenhum processo JMeter ativo para parar. Tentando gerar relatório do último JTL (se existir).")
 
-    # --- Geração de Relatório e Upload para S3 ---
-    report_details_msg = ""
-    if current_results_file_path and os.path.exists(current_results_file_path):
+    report_url = ""
+    results_processed = current_results_file_path
+
+    if current_results_file_path and os.path.exists(current_results_file_path) and os.path.getsize(current_results_file_path) > 0:
         print(
-            f"INFO stop_test: Tentando gerar relatório para {current_results_file_path}")
-        timestamp_report = time.strftime("%Y%m%d-%H%M%S")
+            f"INFO stop_test/generate_report: Processando JTL '{current_results_file_path}' para relatório.")
+        ts_report = time.strftime("%Y%m%d-%H%M%S")
         report_base_name = os.path.splitext(
             os.path.basename(current_results_file_path))[0]
+        report_dir_temp = os.path.join(
+            REPORTS_TEMP_FOLDER, f"{report_base_name}_html_{ts_report}")
 
-        report_output_dir_temp = os.path.join(
-            REPORTS_TEMP_FOLDER, f"{report_base_name}_html_{timestamp_report}")
+        report_ok, report_msg_gen = generate_html_report(
+            current_results_file_path, report_dir_temp)
+        msg_parts.append(f"Geração do Relatório: {report_msg_gen}")
 
-        report_success, report_msg = generate_html_report(
-            current_results_file_path, report_output_dir_temp)
-        final_message.append(f"Geração de Relatório: {report_msg}")
-
-        if report_success:
-            # Não vamos mais zipar. Vamos fazer upload do diretório.
-            # Prefixo no S3
-            s3_report_prefix = f"jmeter-reports/{report_base_name}_{timestamp_report}"
-
+        if report_ok:
+            s3_prefix_report = f"jmeter-reports/{report_base_name}_{ts_report}"
             if S3_BUCKET_NAME and S3_BUCKET_REGION:
-                upload_ok, upload_msg = upload_directory_to_s3(
-                    report_output_dir_temp, S3_BUCKET_NAME, s3_report_prefix, S3_BUCKET_REGION)
-                final_message.append(f"Upload S3: {upload_msg}")
-                if upload_ok:
-                    report_details_msg = upload_msg  # A mensagem de sucesso do upload já contém o link
+                upload_ok, upload_msg_s3 = upload_directory_to_s3(
+                    report_dir_temp, S3_BUCKET_NAME, s3_prefix_report, S3_BUCKET_REGION)
+                msg_parts.append(f"Upload S3: {upload_msg_s3}")
+                if upload_ok and "Relatório: " in upload_msg_s3:
+                    report_url = upload_msg_s3.split("Relatório: ")[-1]
             else:
-                final_message.append(
-                    "Upload S3: Não realizado. Nome do bucket ou região não configurados.")
+                msg_parts.append(
+                    "Upload S3: Não realizado (bucket/região S3 não configurados).")
 
-            # Limpeza da pasta temporária do relatório HTML
-            try:
-                shutil.rmtree(report_output_dir_temp)
-                print(
-                    f"INFO stop_test: Pasta temporária do relatório '{report_output_dir_temp}' removida.")
-            except Exception as e_clean_dir:
-                final_message.append(
-                    f"Aviso: Falha ao remover pasta temporária do relatório '{report_output_dir_temp}': {str(e_clean_dir)}")
+            if os.path.isdir(report_dir_temp):
+                try:
+                    shutil.rmtree(report_dir_temp)
+                    msg_parts.append(
+                        f"Diretório temporário do relatório '{report_dir_temp}' removido.")
+                except Exception as e_clean:
+                    msg_parts.append(
+                        f"Aviso: Falha ao limpar diretório temporário do relatório '{report_dir_temp}': {e_clean}")
     elif current_results_file_path:
-        final_message.append(
-            f"Geração de Relatório: Arquivo de resultados '{current_results_file_path}' não encontrado. Relatório não gerado.")
+        msg_parts.append(
+            f"Relatório não gerado: Arquivo JTL '{current_results_file_path}' não encontrado, vazio ou inválido.")
     else:
-        final_message.append(
-            "Geração de Relatório: Nenhum arquivo de resultados JTL associado ao teste atual.")
+        msg_parts.append(
+            "Relatório não gerado: Nenhum arquivo JTL de resultados anterior disponível.")
 
-    current_log_file_path = None
-    current_results_file_path = None
-
-    final_response_status = 200
-    if any("erro" in msg.lower() or "falha" in msg.lower() for msg in final_message if isinstance(msg, str)):
-        final_response_status = 200
-
-    return jsonify({"message": "\n".join(final_message), "report_details": report_details_msg}), final_response_status
+    return jsonify({"message": "\n".join(msg_parts), "report_details": report_url, "results_file_processed": results_processed}), 200
 
 
 @app.route('/get_current_log', methods=['GET'])
 def get_current_log():
-    # ... (código existente, sem alterações aqui)
-    global jmeter_process_pid, current_log_file_path
+    global current_log_file_path
+    if not current_log_file_path or not os.path.exists(current_log_file_path):
+        return "Log não encontrado.", 404, {'Content-Type': 'text/plain; charset=utf-8'}
+    try:
+        return send_file(current_log_file_path, mimetype='text/plain', as_attachment=False)
+    except Exception as e:
+        return f"Erro ao ler log: {str(e)}", 500, {'Content-Type': 'text/plain; charset=utf-8'}
 
-    if not jmeter_process_pid or not current_log_file_path:
-        return jsonify({"message": "Nenhum teste JMeter em execução ou caminho do log não definido."}), 404
 
-    if not os.path.exists(current_log_file_path):
-        return jsonify({"message": f"Arquivo de log esperado ({current_log_file_path}) não encontrado no servidor."}), 404
-
+@app.route('/get_latest_summary_metrics', methods=['GET'])
+def get_latest_summary_metrics_route():
+    global current_log_file_path
+    if not current_log_file_path or not os.path.exists(current_log_file_path):
+        return jsonify({"error": "Log não encontrado.", "status_code": 404, "log_exists": False}), 404
     try:
         with open(current_log_file_path, 'r', encoding='utf-8', errors='replace') as f:
             log_content = f.read()
-        return log_content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        summary_data = parse_jmeter_log_summary(log_content)
+        if summary_data.get("raw_line") is None:
+            return jsonify({"message": "Aguardando 1º resumo do JMeter...", "status_code": 202, "log_exists": True, "log_length_lines": len(log_content.splitlines()), "active_threads": None}), 202
+        if summary_data.get("type") == "incremental" and summary_data.get("active_threads") is None:
+            print(
+                f"WARN: parse_jmeter_log_summary retornou 'incremental' mas active_threads é None. Linha RAW: {summary_data.get('raw_line')}")
+        return jsonify(summary_data), 200
     except Exception as e:
-        print(
-            f"ERRO get_current_log: Erro ao ler o arquivo de log '{current_log_file_path}': {str(e)}")
-        return jsonify({"message": f"Erro ao ler o arquivo de log: {str(e)}"}), 500
+        print(f"ERRO get_latest_summary_metrics_route: {str(e)}")
+        return jsonify({"error": f"Erro ao processar log: {str(e)}", "status_code": 500, "log_exists": True}), 500
 
 
 if __name__ == '__main__':
-    print("INFO: Iniciando servidor Flask para JMeter Backend.")
-    # Mantenha debug=True para desenvolvimento
+    app_version = "1.3.11"
+    print(f"INFO: Iniciando JMeter Backend (JmeterServer.py v{app_version}).")
+    print(
+        f"INFO: JMETER_EXECUTABLE: {JMETER_EXECUTABLE or 'NÃO ENCONTRADO - VERIFICAR CONFIGURAÇÃO!'}")
+    print(
+        f"INFO: S3 Bucket para Relatórios: {S3_BUCKET_NAME or 'NÃO CONFIGURADO'}")
+    print(
+        f"INFO: S3 Região para Relatórios: {S3_BUCKET_REGION or 'NÃO CONFIGURADO'}")
+    print(f"INFO: Diretório de Uploads: {os.path.abspath(UPLOAD_FOLDER)}")
+    print(
+        f"INFO: Diretório de Resultados (JTL): {os.path.abspath(RESULTS_FOLDER)}")
+    print(f"INFO: Diretório de Logs (JMeter): {os.path.abspath(LOGS_FOLDER)}")
+    print(
+        f"INFO: Timeout para SIGTERM (parada graciosa): {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS}s")
+    # debug=True ajuda a ver logs e recarrega automaticamente
     app.run(host='0.0.0.0', port=5001, debug=True)
