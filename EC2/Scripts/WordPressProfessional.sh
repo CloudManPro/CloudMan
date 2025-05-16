@@ -32,6 +32,7 @@ echo "INFO: =================================================="
 
 # --- Verificação de Variáveis de Ambiente Essenciais ---
 echo "INFO: Verificando variáveis de ambiente essenciais..."
+AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
 essential_vars=(
     "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"                   # ID do EFS (fs-xxxxxxxx)
     "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"    # ARN completo do segredo no Secrets Manager
