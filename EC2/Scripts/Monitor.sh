@@ -3,7 +3,7 @@
 # DESCRIÇÃO: Monta EFS, instala Adminer para visualização de BD e FileBrowser.
 #            FileBrowser é configurado para ter permissões de escrita no EFS
 #            usando o UID/GID do usuário 'apache' do host.
-# Versão: 4.9.2 (Baseado na v4.9.1, com modificações para FileBrowser RW e UID/GID)
+# Versão: 4.9.3 (Baseado na v4.9.2, corrigido printf na função print_line)
 
 set -e # Sair imediatamente se um comando falhar
 # set -x # Descomente para depuração extrema (traça cada comando)
@@ -16,7 +16,8 @@ EFS_SETUP_LOG_FILE="/var/log/setup_efs_mount.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 # --- Funções Auxiliares de Impressão ---
-print_line() { printf -- "-%.0s" {1..70}; printf "\n"; } # Imprime uma linha de hífens
+# CORRIGIDO: print_line para maior portabilidade do printf
+print_line() { local i; for i in $(seq 1 70); do printf "%s" "-"; done; printf "\n"; } # Imprime uma linha de hífens
 print_header() {
     print_line
     printf "--- %s ---\n" "$1"
@@ -29,13 +30,13 @@ print_debug() { printf "DEBUG: %s\n" "$1"; }
 print_format() {
     local format_string="$1"
     shift
-    printf -- "$format_string\n" "$@"
+    printf -- "$format_string\n" "$@" # O duplo hífen aqui é geralmente seguro para printf quando seguido de um formato
 }
 
 
 # --- Cabeçalho do Script ---
 echo ""
-print_header "Iniciando Script Monitor Tools Setup Docker (v4.9.2)"
+print_header "Iniciando Script Monitor Tools Setup Docker (v4.9.3)"
 print_info "Usando Adminer e FileBrowser com permissões de escrita EFS ajustadas."
 print_format "Data: %s" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
 echo ""
@@ -194,6 +195,11 @@ fi
 print_info "Instalação de pré-requisitos concluída."
 echo ""
 
+# --- 2. Configurando e Montando EFS ---
+# ...(O restante do script permanece IDENTICO à versão 4.9.2 que você já tem e que eu forneci anteriormente) ...
+# Cole o restante do script a partir daqui, da seção:
+# print_header "2. Configurando e Montando EFS no Host"
+# até o final do script.
 # --- 2. Configurando e Montando EFS ---
 print_header "2. Configurando e Montando EFS no Host"
 # Esta subshell garante que logs específicos da montagem EFS vão para seu próprio arquivo
