@@ -1,9 +1,9 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.2 (Baseado na v1.9.1, Adiciona configuração automática de WP_HOME/WP_SITEURL dinâmicos para LB)
+# Versão: 1.9.3 (Baseado na v1.9.2, Ajusta WP_HOME/WP_SITEURL via WPDOMAIN)
 # DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2,
 # utilizando Apache, PHP 7.4, EFS para /var/www/html, e RDS via Secrets Manager.
-# Configura URLs dinâmicas (WP_HOME, WP_SITEURL) para funcionar com Load Balancers.
+# Configura WP_HOME, WP_SITEURL com base na variável de ambiente WPDOMAIN.
 # Inclui endpoint /healthcheck.php.
 # Destinado a ser executado por um script de user data que baixa este do S3.
 
@@ -23,10 +23,9 @@ MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"         
 MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*\/' # Padrão escapado para sed
 
 # --- Redirecionamento de Logs ---
-# Redireciona stdout e stderr para o arquivo de log E também para o console
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.2) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v1.9.3) ($(date)) ---"
 echo "INFO: Logging configurado para: ${LOG_FILE}"
 echo "INFO: =================================================="
 
@@ -39,10 +38,11 @@ essential_vars=(
     "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0" # Região do segredo (ex: us-east-1)
     "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"                 # Endpoint do RDS (cluster ou instância)
     "AWS_DB_INSTANCE_TARGET_NAME_0"                     # Nome do banco de dados WordPress
+    "WPDOMAIN"                                          # Domínio público do WordPress (ex: wp.meusite.com)
 )
 error_found=0
 for var_name in "${essential_vars[@]}"; do
-    if [ -z "${!var_name:-}" ]; then
+    if [ -z "${!var_name:-}" ]; then # O :- é para tratar var não definida vs. var definida como vazia
         echo "ERRO: Variável de ambiente essencial '$var_name' não definida ou vazia."
         error_found=1
     fi
@@ -52,7 +52,7 @@ if [ "$error_found" -eq 1 ]; then
     echo "ERRO: Uma ou mais variáveis essenciais estão faltando. Abortando."
     exit 1
 fi
-echo "INFO: Verificação de variáveis essenciais concluída com sucesso."
+echo "INFO: Verificação de variáveis essenciais concluída com sucesso (WPDOMAIN=${WPDOMAIN})."
 
 # --- Funções Auxiliares ---
 mount_efs() {
@@ -200,143 +200,133 @@ else
     SAFE_ENDPOINT_ADDRESS=$(echo "$ENDPOINT_ADDRESS" | sed -e 's/[&#\/\\\\]/\\&/g')
 
     echo "INFO: Substituindo placeholders de DB no $CONFIG_FILE (com escape)..."
-    if ! sudo sed -i "s#database_name_here#$SAFE_DBNAME#" "$CONFIG_FILE"; then
-        echo "ERRO: Falha ao substituir DB_NAME"
-        exit 1
-    fi
-    if ! sudo sed -i "s#username_here#$SAFE_DB_USER#" "$CONFIG_FILE"; then
-        echo "ERRO: Falha ao substituir DB_USER"
-        exit 1
-    fi
-    if ! sudo sed -i "s#password_here#$SAFE_DB_PASSWORD#" "$CONFIG_FILE"; then
-        echo "ERRO: Falha ao substituir DB_PASSWORD"
-        exit 1
-    fi
-    if ! sudo sed -i "s#localhost#$SAFE_ENDPOINT_ADDRESS#" "$CONFIG_FILE"; then
-        echo "ERRO: Falha ao substituir DB_HOST"
-        exit 1
-    fi
+    if ! sudo sed -i "s#database_name_here#$SAFE_DBNAME#" "$CONFIG_FILE"; then echo "ERRO: Falha ao substituir DB_NAME"; exit 1; fi
+    if ! sudo sed -i "s#username_here#$SAFE_DB_USER#" "$CONFIG_FILE"; then echo "ERRO: Falha ao substituir DB_USER"; exit 1; fi
+    if ! sudo sed -i "s#password_here#$SAFE_DB_PASSWORD#" "$CONFIG_FILE"; then echo "ERRO: Falha ao substituir DB_PASSWORD"; exit 1; fi
+    if ! sudo sed -i "s#localhost#$SAFE_ENDPOINT_ADDRESS#" "$CONFIG_FILE"; then echo "ERRO: Falha ao substituir DB_HOST"; exit 1; fi
     echo "INFO: Placeholders de DB substituídos."
 
     echo "INFO: Obtendo e configurando chaves de segurança (SALTS) no $CONFIG_FILE..."
     SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
     if [ -z "$SALT" ]; then
         echo "ERRO: Falha ao obter SALTS da API do WordPress."
-        # exit 1; # Descomente se SALTS forem críticos
     else
         echo "INFO: Removendo/Inserindo SALTS usando arquivo temporário..."
         sudo sed -i "/define( *'AUTH_KEY'/d;/define( *'SECURE_AUTH_KEY'/d;/define( *'LOGGED_IN_KEY'/d;/define( *'NONCE_KEY'/d;/define( *'AUTH_SALT'/d;/define( *'SECURE_AUTH_SALT'/d;/define( *'LOGGED_IN_SALT'/d;/define( *'NONCE_SALT'/d" "$CONFIG_FILE"
         TEMP_SALT_FILE=$(mktemp)
         echo "$SALT" >"$TEMP_SALT_FILE"
         DB_COLLATE_MARKER="/define( *'DB_COLLATE'/"
-        if ! sudo sed -i -e "$DB_COLLATE_MARKER r $TEMP_SALT_FILE" "$CONFIG_FILE"; then
-            echo "ERRO: Falha no sed ao inserir SALTS a partir do arquivo temporário."
-            rm -f "$TEMP_SALT_FILE"
-            exit 1
+        # Tenta inserir após DB_COLLATE, se falhar, insere antes do marcador final
+        if ! sudo sed -i -e "$DB_COLLATE_MARKER r $TEMP_SALT_FILE" "$CONFIG_FILE" 2>/dev/null; then
+            echo "WARN: Não foi possível inserir SALTS após DB_COLLATE. Tentando inserir antes do marcador final..."
+            if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE" "$CONFIG_FILE"; then #r (read file) coloca ANTES da linha que casa com o padrão
+                 echo "ERRO: Falha no sed ao inserir SALTS antes do marcador final."
+                 rm -f "$TEMP_SALT_FILE"; exit 1;
+            fi
         fi
         rm -f "$TEMP_SALT_FILE"
         echo "INFO: SALTS configurados com sucesso."
     fi
 fi # Fim do if [ -f "$CONFIG_FILE" ] (bloco de criação/configuração inicial)
 
-# --- INÍCIO: Inserir Definições Dinâmicas de URL (WP_HOME/WP_SITEURL) ---
-echo "INFO: Verificando/Adicionando definições dinâmicas WP_HOME/WP_SITEURL..."
-# Verifica se as definições dinâmicas (procurando por um comentário único) já existem para evitar duplicatas
-if sudo grep -q "// --- Dynamic URL definitions ---" "$CONFIG_FILE"; then
-    echo "INFO: Definições dinâmicas de URL já parecem existir em $CONFIG_FILE."
-else
-    echo "INFO: Inserindo definições dinâmicas de URL em $CONFIG_FILE antes de '$MARKER_LINE_SED_RAW'..."
-    TEMP_PHP_FILE=$(mktemp) # Arquivo temporário para o bloco PHP
+# --- INÍCIO: Inserir Definições WP_HOME/WP_SITEURL baseadas em WPDOMAIN ---
+echo "INFO: Configurando WP_HOME e WP_SITEURL com base na variável de ambiente WPDOMAIN ($WPDOMAIN)..."
 
-    # Cria o bloco PHP usando Here Document (com 'EOF' para não expandir $_SERVER)
-    cat <<'EOF' >"$TEMP_PHP_FILE"
+# Comentários marcadores para este bloco específico
+BEGIN_WPDOMAIN_MARKER="// --- BEGIN WPDOMAIN URL Config ---"
+END_WPDOMAIN_MARKER="// --- END WPDOMAIN URL Config ---"
 
-// --- Dynamic URL definitions ---
-// Define WP_HOME and WP_SITEURL dynamically based on the HTTP Host header.
-// This ensures WordPress uses the correct URL whether accessed directly or via Load Balancer.
-// It also checks for X-Forwarded-Proto header to handle HTTPS termination at the LB.
-if ( isset( $_SERVER['HTTP_HOST'] ) ) {
-    // Determine scheme (http or https)
-    $protocol = 'http://';
-    if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && strtolower( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) === 'https' ) {
-        $protocol = 'https://';
-        // Inform WordPress that SSL is used, essential for is_ssl() and other functions.
-        $_SERVER['HTTPS'] = 'on';
-    } elseif ( isset( $_SERVER['HTTPS'] ) && ( strtolower( $_SERVER['HTTPS'] ) == 'on' || $_SERVER['HTTPS'] == '1' ) ) {
-         // Also respect standard HTTPS variable if present (e.g., direct HTTPS connection)
-        $protocol = 'https://';
-    } elseif ( ! empty( $_SERVER['SERVER_PORT'] ) && ( $_SERVER['SERVER_PORT'] == '443' ) ) {
-        // Fallback for some configurations where only the port indicates HTTPS
-        $protocol = 'https://';
-    }
+# 1. Remover quaisquer definições explícitas anteriores de WP_HOME e WP_SITEURL
+# Isso é para limpar definições simples como define('WP_HOME', '...');
+# O -E para sed habilita expressões regulares estendidas (varia entre implementações de sed)
+# Usaremos padrão básico para maior portabilidade, mas pode ser menos preciso
+# sudo sed -i "/^define( *'WP_HOME'/d" "$CONFIG_FILE" # Comentado pois o bloco abaixo é mais robusto
+# sudo sed -i "/^define( *'WP_SITEURL'/d" "$CONFIG_FILE" # Comentado
 
-    // Construct the URLs
-    $_wp_home_url = $protocol . $_SERVER['HTTP_HOST'];
-    $_wp_site_url = $protocol . $_SERVER['HTTP_HOST'];
+# 2. Remover o bloco antigo de definições dinâmicas de URL se ele existir
+OLD_DYNAMIC_BEGIN_MARKER_SED_PATTERN='\/\/ --- Dynamic URL definitions ---'
+OLD_DYNAMIC_END_MARKER_SED_PATTERN='\/\/ --- End Dynamic URL definitions ---'
+# Usar awk para deletar o bloco entre os marcadores antigos é mais seguro que sed para multilinhas
+if sudo grep -q "$OLD_DYNAMIC_BEGIN_MARKER_SED_PATTERN" "$CONFIG_FILE"; then
+    echo "INFO: Removendo bloco antigo de 'Dynamic URL definitions'..."
+    sudo awk -v b="$OLD_DYNAMIC_BEGIN_MARKER_SED_PATTERN" -v e="$OLD_DYNAMIC_END_MARKER_SED_PATTERN" '
+        $0 ~ b {p=1; next}
+        $0 ~ e {p=0; next}
+        !p
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && sudo mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+fi
 
-    // Define constants only if they are not already defined
-    if ( ! defined( 'WP_HOME' ) ) {
-        define( 'WP_HOME', $_wp_home_url );
-    }
-    if ( ! defined( 'WP_SITEURL' ) ) {
-        define( 'WP_SITEURL', $_wp_site_url );
-    }
+# 3. Remover o bloco atual (WPDOMAIN) se ele já existir, para tornar o script idempotente
+if sudo grep -qF "$BEGIN_WPDOMAIN_MARKER" "$CONFIG_FILE"; then
+    echo "INFO: Removendo bloco existente de 'WPDOMAIN URL Config' para recriá-lo..."
+    # Usar awk para deletar o bloco entre os marcadores é mais seguro que sed para multilinhas
+    sudo awk -v b="${BEGIN_WPDOMAIN_MARKER//\//\\/}" -v e="${END_WPDOMAIN_MARKER//\//\\/}" '
+        $0 ~ b {p=1; next}
+        $0 ~ e {p=0; next}
+        !p
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && sudo mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+fi
 
-    // Optional: Force SSL for login and admin pages if behind HTTPS proxy
-    // Uncomment the following lines if you always want admin access via HTTPS
-    // if ( $protocol === 'https://' ) {
-    //    if ( ! defined( 'FORCE_SSL_ADMIN' ) ) {
-    //        define( 'FORCE_SSL_ADMIN', true );
-    //    }
-    //    // If site uses CloudFront/Proxy, set this to handle redirects correctly
-    //    if ( strpos( $_SERVER['HTTP_X_FORWARDED_PROTO'], 'https' ) !== false ) {
-    //        $_SERVER['HTTPS'] = 'on';
-    //    }
-    // }
+# 4. Preparar o novo bloco de configuração
+# A variável WPDOMAIN já foi verificada no início do script.
+# Usar printf para construir o bloco de forma segura, especialmente se WPDOMAIN puder ter chars especiais
+# No entanto, para define(), as aspas simples em PHP são importantes.
+# Aqui, ${WPDOMAIN} será expandido pelo shell.
+PHP_WPDOMAIN_CONFIG_BLOCK=$(cat <<EOF
 
-} // end if ( isset( $_SERVER['HTTP_HOST'] ) )
-// --- End Dynamic URL definitions ---
+${BEGIN_WPDOMAIN_MARKER}
+define( 'WP_HOME', 'https://${WPDOMAIN}' );
+define( 'WP_SITEURL', 'https://${WPDOMAIN}' );
+
+// Inform WordPress that SSL is used, essential for is_ssl() and other functions,
+// especially when behind a reverse proxy (like CloudFront/ALB) terminating SSL.
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
+    \$_SERVER['HTTPS'] = 'on';
+}
+// Se o seu ALB/CloudFront sempre encaminha para a instância como HTTP,
+// mas a conexão original do cliente era HTTPS, o bloco acima é essencial.
+// Você também pode considerar forçar SSL para o admin, mas a CloudFront Function já fará o bloqueio.
+// if ( ! defined( 'FORCE_SSL_ADMIN' ) ) {
+//    define( 'FORCE_SSL_ADMIN', true );
+// }
+${END_WPDOMAIN_MARKER}
 
 EOF
+)
 
-    # Usa sed para inserir o conteúdo do arquivo temporário ANTES da linha marcador final
-    # Abordagem mais segura: Inserir placeholder, depois ler arquivo e deletar placeholder
-    PLACEHOLDER="__WP_DYNAMIC_URL_INSERT_POINT_$(date +%s)__" # Placeholder único
-    # 1. Inserir placeholder
-    if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i $PLACEHOLDER" "$CONFIG_FILE"; then
-        echo "ERRO: Falha ao inserir placeholder para URLs dinâmicas em $CONFIG_FILE."
-        rm -f "$TEMP_PHP_FILE" # Limpeza
-        # Considerar saída ou continuar com aviso dependendo da criticidade
-        # exit 1;
+# 5. Inserir o novo bloco antes da linha marcador final
+echo "INFO: Inserindo configuração de WP_HOME/WP_SITEURL baseada em WPDOMAIN em $CONFIG_FILE..."
+TEMP_CONFIG_INSERT_FILE=$(mktemp)
+echo "$PHP_WPDOMAIN_CONFIG_BLOCK" > "$TEMP_CONFIG_INSERT_FILE"
+
+# Usa sed para inserir o conteúdo do arquivo temporário ANTES da linha marcador final
+# Abordagem mais segura: Inserir placeholder, depois ler arquivo e deletar placeholder
+PLACEHOLDER_WPDOMAIN="__WPDOMAIN_CONFIG_INSERT_POINT_$(date +%s)__"
+if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i $PLACEHOLDER_WPDOMAIN" "$CONFIG_FILE"; then
+    echo "ERRO: Falha ao inserir placeholder para WPDOMAIN config em $CONFIG_FILE."
+    rm -f "$TEMP_CONFIG_INSERT_FILE"
+    exit 1;
+else
+    if ! sudo sed -i -e "\#$PLACEHOLDER_WPDOMAIN#r $TEMP_CONFIG_INSERT_FILE" -e "\#$PLACEHOLDER_WPDOMAIN#d" "$CONFIG_FILE"; then
+        echo "ERRO: Falha ao substituir placeholder com WPDOMAIN config em $CONFIG_FILE."
+        sudo sed -i "\#$PLACEHOLDER_WPDOMAIN#d" "$CONFIG_FILE" || echo "WARN: Não foi possível remover placeholder órfão de WPDOMAIN."
     else
-        # 2. Substituir placeholder pelo conteúdo do arquivo e remover linha do placeholder
-        # Usar delimitador '#' para sed para evitar conflitos com '/'
-        if ! sudo sed -i -e "\#$PLACEHOLDER#r $TEMP_PHP_FILE" -e "\#$PLACEHOLDER#d" "$CONFIG_FILE"; then
-            echo "ERRO: Falha ao substituir placeholder com URLs dinâmicas em $CONFIG_FILE."
-            # Tenta limpar o placeholder se a substituição falhou
-            sudo sed -i "\#$PLACEHOLDER#d" "$CONFIG_FILE" || echo "WARN: Não foi possível remover placeholder órfão de URL dinâmica."
-        else
-            echo "INFO: Definições dinâmicas WP_HOME/WP_SITEURL inseridas com sucesso em $CONFIG_FILE."
-        fi
+        echo "INFO: Configuração de WP_HOME/WP_SITEURL baseada em WPDOMAIN inserida com sucesso."
     fi
-    # Limpar o arquivo temporário
-    rm -f "$TEMP_PHP_FILE"
 fi
-# --- FIM: Inserir Definições Dinâmicas de URL ---
+rm -f "$TEMP_CONFIG_INSERT_FILE"
+# --- FIM: Inserir Definições WP_HOME/WP_SITEURL baseadas em WPDOMAIN ---
 
 # --- Forçar Método de Escrita Direto ---
 echo "INFO: Verificando/Adicionando FS_METHOD 'direct' ao $CONFIG_FILE..."
 FS_METHOD_LINE="define( 'FS_METHOD', 'direct' );"
 if [ -f "$CONFIG_FILE" ]; then
-    # Verifica se a linha já existe
     if sudo grep -q "define( *'FS_METHOD' *, *'direct' *);" "$CONFIG_FILE"; then
         echo "INFO: FS_METHOD 'direct' já está definido em $CONFIG_FILE."
     else
         echo "INFO: Inserindo FS_METHOD 'direct' em $CONFIG_FILE..."
-        # Usa sed para inserir ANTES da linha marcador final
         if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i\\$FS_METHOD_LINE" "$CONFIG_FILE"; then
             echo "ERRO: Falha ao inserir FS_METHOD 'direct' no $CONFIG_FILE."
-            # Não sair necessariamente, pode não ser crítico, mas registrar o erro.
         else
             echo "INFO: FS_METHOD 'direct' inserido com sucesso."
         fi
@@ -348,36 +338,21 @@ echo "INFO: Configuração final do wp-config.php concluída."
 
 # <<<--- INÍCIO: Adicionar Arquivo de Health Check (v1.9.1 / v1.9.2) --->>>
 echo "INFO: Criando/Verificando arquivo de health check em '$HEALTH_CHECK_FILE_PATH'..."
-# Usar sudo com bash -c e here-document para criar/sobrescrever o arquivo como root
-# Garante que o conteúdo esteja sempre atualizado com o script
 sudo bash -c "cat > '$HEALTH_CHECK_FILE_PATH'" <<EOF
 <?php
 // Simple health check endpoint for AWS Target Group or other monitors
 // Returns HTTP 200 OK status code if PHP processing is working.
-// Version: 1.9.2
-
-// Set the HTTP status code to 200 OK
+// Version: 1.9.3
 http_response_code(200);
-
-// Set the content type to plain text
 header("Content-Type: text/plain; charset=utf-8");
-
-// Output a simple success message
 echo "OK";
-
-// Exit cleanly
 exit;
 ?>
 EOF
-
-# Verifica se o arquivo foi criado/atualizado com sucesso
 if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then
     echo "INFO: Arquivo de health check '$HEALTH_CHECK_FILE_PATH' criado/atualizado com sucesso."
-    # Permissões serão definidas na próxima seção
 else
     echo "ERRO: Falha ao criar/atualizar o arquivo de health check '$HEALTH_CHECK_FILE_PATH'."
-    # Considerar sair se o health check for crítico
-    # exit 1;
 fi
 # <<<--- FIM: Adicionar Arquivo de Health Check --->>>
 
@@ -390,13 +365,10 @@ fi
 echo "INFO: Definindo permissões base (755 dirs, 644 files)..."
 sudo find "$MOUNT_POINT" -type d -exec chmod 755 {} \; || echo "WARN: Erros menores ao definir permissões de diretório (755)."
 sudo find "$MOUNT_POINT" -type f -exec chmod 644 {} \; || echo "WARN: Erros menores ao definir permissões de arquivo (644)."
-
-# Ajusta wp-config.php (mais restrito)
 if [ -f "$CONFIG_FILE" ]; then
     sudo chown apache:apache "$CONFIG_FILE" || echo "WARN: Não foi possível ajustar propriedade em $CONFIG_FILE"
     sudo chmod 640 "$CONFIG_FILE" || echo "WARN: Não foi possível ajustar permissões em $CONFIG_FILE (640)"
 fi
-# Ajusta healthcheck.php (precisa ser legível pelo Apache)
 if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then
     sudo chown apache:apache "$HEALTH_CHECK_FILE_PATH" || echo "WARN: Não foi possível ajustar propriedade de $HEALTH_CHECK_FILE_PATH"
     sudo chmod 644 "$HEALTH_CHECK_FILE_PATH" || echo "WARN: Não foi possível ajustar permissões em $HEALTH_CHECK_FILE_PATH (644)"
@@ -406,10 +378,8 @@ echo "INFO: Permissões e propriedade ajustadas."
 # --- Configuração e Inicialização do Apache ---
 echo "INFO: Configurando Apache para servir de '$MOUNT_POINT'..."
 HTTPD_CONF="/etc/httpd/conf/httpd.conf"
-# Garante AllowOverride All para .htaccess funcionar (essencial para permalinks WP)
 if grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF" && ! grep -A5 "<Directory \"/var/www/html\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
     echo "INFO: Modificando $HTTPD_CONF para definir AllowOverride All para /var/www/html..."
-    # Substitui 'AllowOverride None' ou outro por 'AllowOverride All' dentro do bloco <Directory "/var/www/html">
     if ! sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF"; then
         echo "WARN: Falha ao tentar definir AllowOverride All automaticamente. Verifique $HTTPD_CONF manualmente se os permalinks não funcionarem."
     else
@@ -423,32 +393,29 @@ fi
 
 echo "INFO: Habilitando e reiniciando o serviço httpd..."
 sudo systemctl enable httpd
-# Usar 'restart' garante que a configuração seja recarregada
 if ! sudo systemctl restart httpd; then
     echo "ERRO CRÍTICO: Falha ao reiniciar o serviço httpd. Verifique a configuração do Apache e os logs."
     echo "DEBUG: Verificando configuração do Apache: "
     sudo apachectl configtest || echo "WARN: apachectl configtest falhou ou não está disponível."
     echo "DEBUG: Últimas linhas do log de erro do Apache (/var/log/httpd/error_log):"
     sudo tail -n 20 /var/log/httpd/error_log || echo "WARN: Não foi possível ler o log de erro do Apache."
-    exit 1 # Sair se o Apache não iniciar é crítico
+    exit 1
 fi
-
-# Verifica o status do serviço Apache após tentativa de restart
-sleep 5 # Dá um tempo para o serviço iniciar/falhar
+sleep 5
 if systemctl is-active --quiet httpd; then
     echo "INFO: Serviço httpd está ativo."
 else
     echo "ERRO CRÍTICO: Serviço httpd não está ativo após a tentativa de restart. Verifique os logs."
     echo "DEBUG: Últimas linhas do log de erro do Apache (/var/log/httpd/error_log):"
     sudo tail -n 20 /var/log/httpd/error_log || echo "WARN: Não foi possível ler o log de erro do Apache."
-    exit 1 # Sair se o Apache não está rodando
+    exit 1
 fi
 
 # --- Conclusão ---
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.2) concluído com sucesso! ($(date)) ---"
-echo "INFO: WordPress configurado para usar URLs dinâmicas (adequado para Load Balancer)."
-echo "INFO: Acesse o IP/DNS da instância ou o DNS do Load Balancer para finalizar a instalação via navegador (se for a primeira vez) ou usar o site."
+echo "INFO: --- Script WordPress Setup (v1.9.3) concluído com sucesso! ($(date)) ---"
+echo "INFO: WordPress configurado para usar WP_HOME/WP_SITEURL de WPDOMAIN: https://${WPDOMAIN}"
+echo "INFO: Acesse https://${WPDOMAIN} para finalizar a instalação via navegador (se for a primeira vez) ou usar o site."
 echo "INFO: O Health Check está disponível em /healthcheck.php"
 echo "INFO: Log completo em: ${LOG_FILE}"
 echo "INFO: =================================================="
