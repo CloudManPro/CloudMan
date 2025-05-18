@@ -1,11 +1,70 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.4 (Baseado na v1.9.3, Lógica condicional WP_HOME/WP_SITEURL)
+# Versão: 1.9.5 (Baseado na v1.9.4, com lógica de espera para AMI/yum e logs de yum visíveis)
 # DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2,
 # utilizando Apache, PHP 7.4, EFS para /var/www/html, e RDS via Secrets Manager.
 # Configura WP_HOME, WP_SITEURL condicionalmente: usa WPDOMAIN para acesso público
 # e o host/IP atual para acesso direto (admin).
 # Inclui endpoint /healthcheck.php.
+# Adicionada lógica de espera para cloud-init e yum, e logs de yum/amazon-linux-extras visíveis.
+
+# --- BEGIN WAIT LOGIC FOR AMI INITIALIZATION ---
+echo "INFO: Waiting for cloud-init to complete initial setup (/var/lib/cloud/instance/boot-finished)..."
+MAX_CLOUD_INIT_WAIT_ITERATIONS=40 # Aprox. 10 minutos (40 * 15 segundos)
+CURRENT_CLOUD_INIT_WAIT_ITERATION=0
+while [ ! -f /var/lib/cloud/instance/boot-finished ]; do
+  if [ "$CURRENT_CLOUD_INIT_WAIT_ITERATION" -ge "$MAX_CLOUD_INIT_WAIT_ITERATIONS" ]; then
+    echo "WARN: Timeout waiting for /var/lib/cloud/instance/boot-finished. Proceeding cautiously, but AMI setup might not be fully complete."
+    break
+  fi
+  echo "INFO: Still waiting for /var/lib/cloud/instance/boot-finished... (attempt $((CURRENT_CLOUD_INIT_WAIT_ITERATION+1))/$MAX_CLOUD_INIT_WAIT_ITERATIONS, $(date))"
+  sleep 15
+  CURRENT_CLOUD_INIT_WAIT_ITERATION=$((CURRENT_CLOUD_INIT_WAIT_ITERATION + 1))
+done
+if [ -f /var/lib/cloud/instance/boot-finished ]; then
+  echo "INFO: Signal /var/lib/cloud/instance/boot-finished found. Cloud-init initial setup appears complete. ($(date))"
+else
+  echo "WARN: Proceeding without /var/lib/cloud/instance/boot-finished signal (timeout reached). ($(date))"
+fi
+# --- END WAIT LOGIC FOR AMI INITIALIZATION ---
+
+# --- BEGIN ADDITIONAL YUM WAIT LOGIC (Safety Net) ---
+echo "INFO: Performing additional check and wait for yum to be free... ($(date))"
+MAX_YUM_WAIT_ITERATIONS=60 # Aprox. 10 minutos (60 * 10 segundos)
+CURRENT_YUM_WAIT_ITERATION=0
+while [ -f /var/run/yum.pid ]; do
+  if [ "$CURRENT_YUM_WAIT_ITERATION" -ge "$MAX_YUM_WAIT_ITERATIONS" ]; then
+    YUM_PID_CONTENT=$(cat /var/run/yum.pid 2>/dev/null || echo 'unknown')
+    echo "ERROR: Yum still locked (PID file /var/run/yum.pid exists, content: $YUM_PID_CONTENT) after extended waiting. Aborting script to prevent further issues. ($(date))"
+    # Para depuração, você pode tentar ver qual processo é esse:
+    # if [ "$YUM_PID_CONTENT" != "unknown" ]; then ps aux | grep "$YUM_PID_CONTENT"; fi
+    exit 1 # Sair se o yum estiver bloqueado por muito tempo
+  fi
+  YUM_PID_CONTENT=$(cat /var/run/yum.pid 2>/dev/null || echo 'unknown')
+  echo "INFO: Yum is busy (PID file /var/run/yum.pid exists, content: $YUM_PID_CONTENT). Waiting for it to finish... (attempt $((CURRENT_YUM_WAIT_ITERATION+1))/$MAX_YUM_WAIT_ITERATIONS, $(date))"
+  sleep 10
+  CURRENT_YUM_WAIT_ITERATION=$((CURRENT_YUM_WAIT_ITERATION + 1))
+done
+
+# Adicionalmente, verificar se algum processo 'yum' está rodando, mesmo sem o PID file.
+PGREP_YUM_CHECKS=12 # Checa por até 2 minutos (12 * 10 segundos)
+for i in $(seq 1 "$PGREP_YUM_CHECKS"); do
+    if ! pgrep -x yum > /dev/null; then
+        echo "INFO: No 'yum' process found by pgrep. ($(date))"
+        break
+    else
+        echo "INFO: 'yum' process still detected by pgrep. Waiting (pgrep check $i/$PGREP_YUM_CHECKS, $(date))..."
+        sleep 10
+    fi
+    if [ "$i" -eq "$PGREP_YUM_CHECKS" ]; then
+        echo "ERROR: 'yum' process still running after pgrep checks. Aborting. ($(date))"
+        # Para depuração:
+        # ps aux | grep yum
+        exit 1 # Sair se o yum ainda estiver rodando
+    fi
+done
+echo "INFO: Yum lock is free, and no yum process detected by pgrep. Proceeding with script operations. ($(date))"
+# --- END ADDITIONAL YUM WAIT LOGIC ---
 
 # --- Configuração Inicial e Logging ---
 set -e # Sair imediatamente se um comando falhar
@@ -25,7 +84,7 @@ MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*
 # --- Redirecionamento de Logs ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.4) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v1.9.5) ($(date)) ---"
 echo "INFO: Logging configurado para: ${LOG_FILE}"
 echo "INFO: =================================================="
 
@@ -71,16 +130,36 @@ mount_efs() {
         echo "INFO: EFS já está montado em '$mount_point'."
     else
         echo "INFO: Montando EFS '$efs_id' em '$mount_point' com TLS..."
-        if ! sudo mount -t efs -o tls "$efs_id:/" "$mount_point"; then
-            echo "ERRO: Falha ao montar EFS '$efs_id' em '$mount_point'."
-            echo "INFO: Verifique ID EFS, Security Group (NFS 2049), e instalação 'amazon-efs-utils'."
-            exit 1
-        fi
-        echo "INFO: EFS montado com sucesso em '$mount_point'."
+        # Adicionando tentativas de montagem com espera
+        local mount_attempts=3
+        local mount_timeout=15 # segundos por tentativa
+        local attempt_num=1
+        while [ "$attempt_num" -le "$mount_attempts" ]; do
+            echo "INFO: Tentativa de montagem $attempt_num/$mount_attempts para EFS '$efs_id' em '$mount_point'..."
+            # A opção -v (verbose) pode ajudar no debug, mas pode ser ruidosa.
+            # Adicionando timeout ao comando mount se suportado ou uma espera manual
+            # O comando 'timeout' pode ser usado para limitar o tempo de execução de 'mount'
+            if sudo timeout "${mount_timeout}" mount -t efs -o tls "$efs_id:/" "$mount_point"; then
+                echo "INFO: EFS montado com sucesso em '$mount_point'."
+                break
+            else
+                echo "ERRO: Tentativa $attempt_num/$mount_attempts de montar EFS '$efs_id' em '$mount_point' falhou (timeout: ${mount_timeout}s)."
+                if [ "$attempt_num" -eq "$mount_attempts" ]; then
+                    echo "ERRO: Falha ao montar EFS '$efs_id' em '$mount_point' após $mount_attempts tentativas."
+                    echo "INFO: Verifique ID EFS, Security Group (NFS 2049), e instalação 'amazon-efs-utils'."
+                    echo "INFO: Verifique também se os Mount Targets do EFS estão ativos e nas subnets corretas."
+                    exit 1
+                fi
+                sleep 5 # Espera antes da próxima tentativa
+            fi
+            attempt_num=$((attempt_num + 1))
+        done
 
         echo "INFO: Adicionando montagem do EFS ao /etc/fstab para persistência..."
         if ! grep -q "$efs_id:/ $mount_point efs" /etc/fstab; then
-            echo "$efs_id:/ $mount_point efs _netdev,tls 0 0" | sudo tee -a /etc/fstab >/dev/null
+            echo "$efs_id:/ $mount_point efs _netdev,tls,iam,アクセスポイントID (se aplicável) 0 0" | sudo tee -a /etc/fstab >/dev/null
+            # Nota: 'iam' e 'accesspointid' são opções se você estiver usando autenticação IAM ou pontos de acesso EFS.
+            # Para montagem TLS simples, `_netdev,tls` é suficiente.
             echo "INFO: Entrada adicionada ao /etc/fstab."
         else
             echo "INFO: Entrada para EFS já existe no /etc/fstab."
@@ -89,13 +168,14 @@ mount_efs() {
 }
 
 # --- Instalação de Pré-requisitos ---
-echo "INFO: Iniciando instalação de pacotes via YUM (modo extra silencioso)..."
-sudo yum update -y -q >/dev/null
-sudo yum install -y -q httpd jq epel-release aws-cli mysql amazon-efs-utils >/dev/null
-echo "INFO: Habilitando amazon-linux-extras para PHP 7.4 (modo extra silencioso)..."
-sudo amazon-linux-extras enable php7.4 -y &>/dev/null
-echo "INFO: Instalando PHP 7.4 e módulos (modo extra silencioso)..."
-sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap >/dev/null
+echo "INFO: Iniciando instalação de pacotes via YUM (modo extra silencioso, mas erros serão visíveis)..."
+sudo yum update -y -q # Mantendo -q para update, mas erros aparecerão
+echo "INFO: Instalando httpd, jq, epel-release, aws-cli, mysql, amazon-efs-utils..."
+sudo yum install -y -q httpd jq epel-release aws-cli mysql amazon-efs-utils # -q para reduzir output, erros ainda aparecem
+echo "INFO: Habilitando amazon-linux-extras para PHP 7.4..."
+sudo amazon-linux-extras enable php7.4 -y # Sem &>/dev/null
+echo "INFO: Instalando PHP 7.4 e módulos..."
+sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap # -q, erros aparecem
 echo "INFO: Instalação de pacotes concluída."
 
 # --- Montagem do EFS ---
@@ -175,9 +255,17 @@ else
         sudo sed -i "/define( *'AUTH_KEY'/d;/define( *'SECURE_AUTH_KEY'/d;/define( *'LOGGED_IN_KEY'/d;/define( *'NONCE_KEY'/d;/define( *'AUTH_SALT'/d;/define( *'SECURE_AUTH_SALT'/d;/define( *'LOGGED_IN_SALT'/d;/define( *'NONCE_SALT'/d" "$CONFIG_FILE"
         TEMP_SALT_FILE=$(mktemp); echo "$SALT" >"$TEMP_SALT_FILE"
         DB_COLLATE_MARKER="/define( *'DB_COLLATE'/"
-        if ! sudo sed -i -e "$DB_COLLATE_MARKER r $TEMP_SALT_FILE" "$CONFIG_FILE" 2>/dev/null; then
+        # Tenta inserir após DB_COLLATE, senão antes do marcador "That's all"
+        if sudo grep -q "$DB_COLLATE_MARKER" "$CONFIG_FILE"; then
+            if ! sudo sed -i -e "$DB_COLLATE_MARKER r $TEMP_SALT_FILE" "$CONFIG_FILE"; then
+                echo "WARN: Falha ao inserir SALTS após DB_COLLATE. Tentando antes de '$MARKER_LINE_SED_RAW'..."
+                if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE" "$CONFIG_FILE"; then
+                    echo "ERRO: Falha ao inserir SALTS antes de '$MARKER_LINE_SED_RAW'."; rm -f "$TEMP_SALT_FILE"; exit 1;
+                fi
+            fi
+        else
             if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE" "$CONFIG_FILE"; then
-                 echo "ERRO: Falha ao inserir SALTS."; rm -f "$TEMP_SALT_FILE"; exit 1;
+                 echo "ERRO: Falha ao inserir SALTS antes de '$MARKER_LINE_SED_RAW' (DB_COLLATE não encontrado)."; rm -f "$TEMP_SALT_FILE"; exit 1;
             fi
         fi
         rm -f "$TEMP_SALT_FILE"; echo "INFO: SALTS configurados."
@@ -199,24 +287,20 @@ if sudo grep -qF "$BEGIN_URL_CONFIG_MARKER" "$CONFIG_FILE"; then
     ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && sudo mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 fi
 
-# Preparar o novo bloco de configuração PHP
-# A variável de shell $WPDOMAIN será expandida aqui.
-# As variáveis PHP como $_SERVER são escapadas com \ para serem literais no here-document.
 PHP_URL_CONFIG_BLOCK=$(cat <<EOF
 
 ${BEGIN_URL_CONFIG_MARKER}
 \$wp_public_domain_from_env = getenv('WPDOMAIN');
 
 if (empty(\$wp_public_domain_from_env)) {
-    // Este é um fallback crítico. O script bash já verifica WPDOMAIN,
-    // mas se por algum motivo o PHP não a vir, logue ou use um padrão MUITO CUIDADOSO.
-    // Para este script, WPDOMAIN é esperado ser '${WPDOMAIN}'.
+    // Fallback, embora o script bash já verifique WPDOMAIN.
     \$wp_public_domain_from_env = '${WPDOMAIN}';
 }
 
 \$public_site_url_with_protocol = 'https://' . \$wp_public_domain_from_env;
 
-\$current_protocol = 'http://'; // Padrão para acesso direto por IP
+\$current_protocol = 'http://'; // Padrão para acesso direto por IP/hostname interno
+
 // Verifica se o acesso atual é HTTPS (direto ou via proxy que NÃO usa X-Forwarded-Proto)
 if (isset(\$_SERVER['HTTPS']) && (\$_SERVER['HTTPS'] == 'on' || \$_SERVER['HTTPS'] == 1)) {
     \$current_protocol = 'https://';
@@ -234,7 +318,7 @@ if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_F
 \$current_site_url_with_protocol = \$current_protocol . \$current_host;
 
 // Se o host atual NÃO for o domínio público, significa que é um acesso direto (ex: IP para admin)
-if (\$current_host !== \$wp_public_domain_from_env) {
+if (strcasecmp(\$current_host, \$wp_public_domain_from_env) !== 0) {
     if (!defined('WP_HOME')) {
         define('WP_HOME', \$current_site_url_with_protocol);
     }
@@ -242,7 +326,7 @@ if (\$current_host !== \$wp_public_domain_from_env) {
         define('WP_SITEURL', \$current_site_url_with_protocol);
     }
 } else {
-    // Acesso via domínio público (CloudFront)
+    // Acesso via domínio público (CloudFront/ALB)
     if (!defined('WP_HOME')) {
         define('WP_HOME', \$public_site_url_with_protocol);
     }
@@ -252,7 +336,6 @@ if (\$current_host !== \$wp_public_domain_from_env) {
 }
 
 // Se por algum motivo WP_HOME acabou sendo HTTPS, certifique-se que WordPress sabe disso.
-// Isso é uma dupla checagem, já coberto em parte pelo HTTP_X_FORWARDED_PROTO.
 if (defined('WP_HOME') && strpos(WP_HOME, 'https://') === 0 && !isset(\$_SERVER['HTTPS'])) {
     \$_SERVER['HTTPS'] = 'on';
 }
@@ -261,21 +344,29 @@ ${END_URL_CONFIG_MARKER}
 EOF
 )
 
-# Inserir o novo bloco
 echo "INFO: Inserindo configuração condicional de URL em $CONFIG_FILE..."
 TEMP_URL_CONFIG_INSERT_FILE=$(mktemp)
 echo "$PHP_URL_CONFIG_BLOCK" > "$TEMP_URL_CONFIG_INSERT_FILE"
 PLACEHOLDER_URL_CONFIG="__WP_CONDITIONAL_URL_INSERT_POINT_$(date +%s)__"
-if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i $PLACEHOLDER_URL_CONFIG" "$CONFIG_FILE"; then
-    echo "ERRO: Falha ao inserir placeholder para config de URL em $CONFIG_FILE."
-    rm -f "$TEMP_URL_CONFIG_INSERT_FILE"; exit 1;
-else
+
+# Tenta inserir antes de "/* That's all... */"
+if sudo grep -q "$MARKER_LINE_SED_PATTERN" "$CONFIG_FILE"; then
+    # Criar um placeholder ANTES do marcador
+    if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i $PLACEHOLDER_URL_CONFIG" "$CONFIG_FILE"; then
+        echo "ERRO: Falha ao inserir placeholder para config de URL antes de '$MARKER_LINE_SED_RAW' em $CONFIG_FILE."
+        rm -f "$TEMP_URL_CONFIG_INSERT_FILE"; exit 1;
+    fi
+    # Substituir o placeholder com o conteúdo do arquivo
     if ! sudo sed -i -e "\#$PLACEHOLDER_URL_CONFIG#r $TEMP_URL_CONFIG_INSERT_FILE" -e "\#$PLACEHOLDER_URL_CONFIG#d" "$CONFIG_FILE"; then
         echo "ERRO: Falha ao substituir placeholder com config de URL em $CONFIG_FILE."
-        sudo sed -i "\#$PLACEHOLDER_URL_CONFIG#d" "$CONFIG_FILE" || echo "WARN: Não foi possível remover placeholder órfão."
+        sudo sed -i "\#$PLACEHOLDER_URL_CONFIG#d" "$CONFIG_FILE" 2>/dev/null || echo "WARN: Não foi possível remover placeholder órfão."
+        rm -f "$TEMP_URL_CONFIG_INSERT_FILE"; exit 1;
     else
-        echo "INFO: Configuração condicional de URL inserida com sucesso."
+        echo "INFO: Configuração condicional de URL inserida com sucesso antes de '$MARKER_LINE_SED_RAW'."
     fi
+else
+    echo "ERRO: Marcador '$MARKER_LINE_SED_RAW' não encontrado em $CONFIG_FILE. Não foi possível inserir configuração de URL."
+    rm -f "$TEMP_URL_CONFIG_INSERT_FILE"; exit 1;
 fi
 rm -f "$TEMP_URL_CONFIG_INSERT_FILE"
 # --- FIM: Inserir Definições Condicionais WP_HOME/WP_SITEURL ---
@@ -287,10 +378,20 @@ if [ -f "$CONFIG_FILE" ]; then
     if sudo grep -q "define( *'FS_METHOD' *, *'direct' *);" "$CONFIG_FILE"; then
         echo "INFO: FS_METHOD 'direct' já está definido."
     else
-        if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i\\$FS_METHOD_LINE" "$CONFIG_FILE"; then
-            echo "ERRO: Falha ao inserir FS_METHOD 'direct'."
+        # Tenta inserir antes de "/* That's all... */"
+        if sudo grep -q "$MARKER_LINE_SED_PATTERN" "$CONFIG_FILE"; then
+            if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i\\$FS_METHOD_LINE" "$CONFIG_FILE"; then
+                echo "ERRO: Falha ao inserir FS_METHOD 'direct' antes de '$MARKER_LINE_SED_RAW'."
+            else
+                echo "INFO: FS_METHOD 'direct' inserido antes de '$MARKER_LINE_SED_RAW'."
+            fi
         else
-            echo "INFO: FS_METHOD 'direct' inserido."
+            echo "WARN: Marcador '$MARKER_LINE_SED_RAW' não encontrado. Tentando adicionar FS_METHOD no final do arquivo."
+            if ! echo "$FS_METHOD_LINE" | sudo tee -a "$CONFIG_FILE" > /dev/null; then
+                echo "ERRO: Falha ao adicionar FS_METHOD 'direct' no final do arquivo."
+            else
+                echo "INFO: FS_METHOD 'direct' adicionado no final do arquivo."
+            fi
         fi
     fi
 else
@@ -303,10 +404,10 @@ echo "INFO: Criando/Verificando arquivo de health check em '$HEALTH_CHECK_FILE_P
 sudo bash -c "cat > '$HEALTH_CHECK_FILE_PATH'" <<EOF
 <?php
 // Simple health check endpoint
-// Version: 1.9.4
+// Version: 1.9.5
 http_response_code(200);
 header("Content-Type: text/plain; charset=utf-8");
-echo "OK";
+echo "OK - WordPress Health Check Endpoint - $(date -u +"%Y-%m-%dT%H:%M:%SZ")";
 exit;
 ?>
 EOF
@@ -336,18 +437,25 @@ elif ! grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF"; then echo "WARN: B
 echo "INFO: Habilitando e reiniciando httpd..."
 sudo systemctl enable httpd
 if ! sudo systemctl restart httpd; then
-    echo "ERRO CRÍTICO: Falha ao reiniciar httpd."; sudo apachectl configtest; sudo tail -n 30 /var/log/httpd/error_log; exit 1;
+    echo "ERRO CRÍTICO: Falha ao reiniciar httpd. Verificando configuração..."
+    sudo apachectl configtest
+    echo "INFO: Últimas linhas do log de erro do httpd (/var/log/httpd/error_log):"
+    sudo tail -n 30 /var/log/httpd/error_log
+    exit 1;
 fi
 sleep 5
 if systemctl is-active --quiet httpd; then echo "INFO: Serviço httpd está ativo."; else
-    echo "ERRO CRÍTICO: httpd não está ativo pós-restart."; sudo tail -n 30 /var/log/httpd/error_log; exit 1;
+    echo "ERRO CRÍTICO: httpd não está ativo pós-restart."
+    echo "INFO: Últimas linhas do log de erro do httpd (/var/log/httpd/error_log):"
+    sudo tail -n 30 /var/log/httpd/error_log
+    exit 1;
 fi
 
 # --- Conclusão ---
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.4) concluído com sucesso! ($(date)) ---"
-echo "INFO: WordPress configurado para: URL pública https://${WPDOMAIN} e acesso admin via IP direto."
-echo "INFO: Acesse https://${WPDOMAIN} (ou IP da instância para admin) para usar o site."
+echo "INFO: --- Script WordPress Setup (v1.9.5) concluído com sucesso! ($(date)) ---"
+echo "INFO: WordPress configurado para: URL pública https://${WPDOMAIN} e acesso admin via IP direto ou hostname interno."
+echo "INFO: Acesse https://${WPDOMAIN} (ou IP/hostname da instância para admin) para usar o site."
 echo "INFO: Health Check: /healthcheck.php"
 echo "INFO: Log completo: ${LOG_FILE}"
 echo "INFO: =================================================="
