@@ -1,134 +1,50 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.7 (Baseado na v1.9.6, com templates wp-config-production e wp-config-management)
-# DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2.
-# Cria templates wp-config-production.php e wp-config-management.php no EFS.
-# Ativa wp-config-production.php como o wp-config.php padrão.
-# A troca para o modo de gerenciamento deve ser feita externamente (ex: Run Command).
-
-# --- BEGIN WAIT LOGIC FOR AMI INITIALIZATION ---
-echo "INFO: Waiting for cloud-init to complete initial setup (/var/lib/cloud/instance/boot-finished)..."
-MAX_CLOUD_INIT_WAIT_ITERATIONS=40
-CURRENT_CLOUD_INIT_WAIT_ITERATION=0
-while [ ! -f /var/lib/cloud/instance/boot-finished ]; do
-  if [ "$CURRENT_CLOUD_INIT_WAIT_ITERATION" -ge "$MAX_CLOUD_INIT_WAIT_ITERATIONS" ]; then
-    echo "WARN: Timeout waiting for /var/lib/cloud/instance/boot-finished. Proceeding cautiously."
-    break
-  fi
-  echo "INFO: Still waiting for /var/lib/cloud/instance/boot-finished... (attempt $((CURRENT_CLOUD_INIT_WAIT_ITERATION+1))/$MAX_CLOUD_INIT_WAIT_ITERATIONS, $(date))"
-  sleep 15
-  CURRENT_CLOUD_INIT_WAIT_ITERATION=$((CURRENT_CLOUD_INIT_WAIT_ITERATION + 1))
-done
-if [ -f /var/lib/cloud/instance/boot-finished ]; then
-  echo "INFO: Signal /var/lib/cloud/instance/boot-finished found. ($(date))"
-else
-  echo "WARN: Proceeding without /var/lib/cloud/instance/boot-finished signal. ($(date))"
-fi
-# --- END WAIT LOGIC ---
-
-# --- BEGIN YUM WAIT LOGIC ---
-echo "INFO: Performing check and wait for yum to be free... ($(date))"
-MAX_YUM_WAIT_ITERATIONS=60
-CURRENT_YUM_WAIT_ITERATION=0
-while [ -f /var/run/yum.pid ]; do
-  if [ "$CURRENT_YUM_WAIT_ITERATION" -ge "$MAX_YUM_WAIT_ITERATIONS" ]; then
-    YUM_PID_CONTENT=$(cat /var/run/yum.pid 2>/dev/null || echo 'unknown')
-    echo "ERROR: Yum still locked (PID: $YUM_PID_CONTENT) after extended waiting. Aborting. ($(date))"
-    exit 1
-  fi
-  YUM_PID_CONTENT=$(cat /var/run/yum.pid 2>/dev/null || echo 'unknown')
-  echo "INFO: Yum is busy (PID: $YUM_PID_CONTENT). Waiting... (attempt $((CURRENT_YUM_WAIT_ITERATION+1))/$MAX_YUM_WAIT_ITERATIONS, $(date))"
-  sleep 10
-  CURRENT_YUM_WAIT_ITERATION=$((CURRENT_YUM_WAIT_ITERATION + 1))
-done
-PGREP_YUM_CHECKS=12
-for i in $(seq 1 "$PGREP_YUM_CHECKS"); do
-    if ! pgrep -x yum > /dev/null; then
-        echo "INFO: No 'yum' process found by pgrep. ($(date))"
-        break
-    else
-        echo "INFO: 'yum' process still detected by pgrep. Waiting (pgrep check $i/$PGREP_YUM_CHECKS, $(date))..."
-        sleep 10
-    fi
-    if [ "$i" -eq "$PGREP_YUM_CHECKS" ]; then
-        echo "ERROR: 'yum' process still running after pgrep checks. Aborting. ($(date))"
-        exit 1
-    fi
-done
-echo "INFO: Yum lock is free. Proceeding. ($(date))"
-# --- END YUM WAIT LOGIC ---
+# Versão: 1.9.3 (Baseado na v1.9.2, Modifica origem do wp-config.php para wp-config-management.php)
+# DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2,
+# utilizando Apache, PHP 7.4, EFS para /var/www/html, e RDS via Secrets Manager.
+# Configura URLs dinâmicas (WP_HOME, WP_SITEURL) para funcionar com Load Balancers.
+# Usa wp-config-management.php como base para wp-config.php, se wp-config.php não existir.
+# Inclui endpoint /healthcheck.php.
+# Destinado a ser executado por um script de user data que baixa este do S3.
 
 # --- Configuração Inicial e Logging ---
-set -e
-# set -x
+set -e # Sair imediatamente se um comando falhar
+# set -x # Descomente para debug detalhado de comandos
 
-# --- Variáveis ---
+# --- Variáveis (podem ser substituídas por variáveis de ambiente) ---
 LOG_FILE="/var/log/wordpress_setup.log"
-MOUNT_POINT="/var/www/html"
-WP_DIR_TEMP="/tmp/wordpress-temp"
+MOUNT_POINT="/var/www/html"                           # Diretório raiz do Apache e ponto de montagem do EFS
+WP_DIR_TEMP="/tmp/wordpress-temp"                     # Diretório temporário para download do WP
+CONFIG_FILE="$MOUNT_POINT/wp-config.php"              # Caminho para o arquivo wp-config.php final
+HEALTH_CHECK_FILE_PATH="$MOUNT_POINT/healthcheck.php" # Caminho para o health check
 
-# Nomes dos arquivos de configuração
-ACTIVE_CONFIG_FILE="$MOUNT_POINT/wp-config.php"
-CONFIG_FILE_PROD_TEMPLATE="$MOUNT_POINT/wp-config-production.php"
-CONFIG_FILE_MGMT_TEMPLATE="$MOUNT_POINT/wp-config-management.php"
-CONFIG_SAMPLE_ORIGINAL="$MOUNT_POINT/wp-config-sample.php" # WordPress original
-
-HEALTH_CHECK_FILE_PATH="$MOUNT_POINT/healthcheck.php"
-
-MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"
-MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
+# Marcadores para inserção no wp-config.php
+MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"             # Texto para grep/logs
+MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*\/' # Padrão escapado para sed
 
 # --- Redirecionamento de Logs ---
+# Redireciona stdout e stderr para o arquivo de log E também para o console
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v1.9.3) ($(date)) ---"
 echo "INFO: Logging configurado para: ${LOG_FILE}"
 echo "INFO: =================================================="
 
 # --- Verificação de Variáveis de Ambiente Essenciais ---
 echo "INFO: Verificando variáveis de ambiente essenciais..."
-if [ -z "${ACCOUNT:-}" ]; then
-    echo "INFO: ACCOUNT ID não fornecido, tentando obter via AWS STS..."
-    ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
-    if [ -z "$ACCOUNT" ]; then
-        echo "WARN: Falha ao obter ACCOUNT ID. Se o ARN do Secret não for construído corretamente, o script pode falhar."
-    else
-        echo "INFO: ACCOUNT ID obtido: $ACCOUNT"
-    fi
-fi
-
-if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ] && \
-   [ -n "${ACCOUNT:-}" ] && \
-   [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then
-    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
-else
-    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT=""
-fi
-
+AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
 essential_vars=(
-    "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"
-    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"
-    "AWS_DB_INSTANCE_TARGET_NAME_0"
-    "WPDOMAIN"
-    "ACCOUNT"
-    "MANAGEMENT_WPDOMAIN"
+    "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"                   # ID do EFS (fs-xxxxxxxx)
+    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"    # ARN completo do segredo no Secrets Manager
+    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0" # Região do segredo (ex: us-east-1)
+    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"                 # Endpoint do RDS (cluster ou instância)
+    "AWS_DB_INSTANCE_TARGET_NAME_0"                     # Nome do banco de dados WordPress
 )
 error_found=0
 for var_name in "${essential_vars[@]}"; do
-    current_var_value="${!var_name:-}"
-    var_to_check_name="$var_name"
-    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT" ]; then
-        var_to_check_name="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (ou seus componentes REGION, ACCOUNT, NAME)"
-        if [ -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT" ] && [ -z "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-}" ]; then
-             echo "ERRO: Variável de ambiente essencial '$var_to_check_name' não definida ou vazia."
-             error_found=1
-        elif [ -n "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT" ]; then
-            export AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT"
-        fi
-    elif [ -z "$current_var_value" ]; then
-        echo "ERRO: Variável de ambiente essencial '$var_to_check_name' não definida ou vazia."
+    if [ -z "${!var_name:-}" ]; then
+        echo "ERRO: Variável de ambiente essencial '$var_name' não definida ou vazia."
         error_found=1
     fi
 done
@@ -137,296 +53,448 @@ if [ "$error_found" -eq 1 ]; then
     echo "ERRO: Uma ou mais variáveis essenciais estão faltando. Abortando."
     exit 1
 fi
-
-# Tratar MANAGEMENT_WPDOMAIN
-if [ -z "${MANAGEMENT_WPDOMAIN:-}" ]; then
-    echo "WARN: MANAGEMENT_WPDOMAIN não definido. O template wp-config-management.php usará um placeholder 'management.example.com'."
-    # Você pode tentar construir um a partir de WPDOMAIN se houver um padrão, ex:
-    # management_domain_part="management."
-    # base_domain_part="${WPDOMAIN#wp.}" # Remove "wp." do início, se existir
-    # export MANAGEMENT_WPDOMAIN_EFFECTIVE="${management_domain_part}${base_domain_part}"
-    export MANAGEMENT_WPDOMAIN_EFFECTIVE="management.example.com" # Placeholder
-else
-    export MANAGEMENT_WPDOMAIN_EFFECTIVE="${MANAGEMENT_WPDOMAIN}"
-fi
-echo "INFO: Domínio de Produção (WPDOMAIN): ${WPDOMAIN}"
-echo "INFO: Domínio de Gerenciamento (MANAGEMENT_WPDOMAIN_EFFECTIVE): ${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
-echo "INFO: Verificação de variáveis essenciais concluída."
-
+echo "INFO: Verificação de variáveis essenciais concluída com sucesso."
 
 # --- Funções Auxiliares ---
 mount_efs() {
     local efs_id=$1
     local mount_point=$2
-    local efs_ap_id="${EFS_ACCESS_POINT_ID:-}"
-
     echo "INFO: Verificando se o ponto de montagem '$mount_point' existe..."
-    sudo mkdir -p "$mount_point" # Garante que o diretório exista
-    
+    if [ ! -d "$mount_point" ]; then
+        echo "INFO: Criando diretório '$mount_point'..."
+        sudo mkdir -p "$mount_point"
+    else
+        echo "INFO: Diretório '$mount_point' já existe."
+    fi
+
     echo "INFO: Verificando se '$mount_point' já está montado..."
     if mount | grep -q "on ${mount_point} type efs"; then
         echo "INFO: EFS já está montado em '$mount_point'."
     else
-        echo "INFO: Montando EFS '$efs_id' em '$mount_point'..."
-        local mount_options="tls"
-        local mount_source="$efs_id:/"
-
-        if [ -n "$efs_ap_id" ]; then
-            echo "INFO: Usando Ponto de Acesso EFS: $efs_ap_id"
-            mount_source="$efs_id" # Sem ":/" para AP
-            mount_options="tls,accesspoint=$efs_ap_id"
-        else
-            echo "INFO: Montando raiz do EFS File System (sem Ponto de Acesso específico)."
+        echo "INFO: Montando EFS '$efs_id' em '$mount_point' com TLS..."
+        if ! sudo mount -t efs -o tls "$efs_id:/" "$mount_point"; then
+            echo "ERRO: Falha ao montar EFS '$efs_id' em '$mount_point'."
+            echo "INFO: Verifique ID EFS, Security Group (NFS 2049), e instalação 'amazon-efs-utils'."
+            exit 1
         fi
-
-        local mount_attempts=3; local mount_timeout=20; local attempt_num=1
-        while [ "$attempt_num" -le "$mount_attempts" ]; do
-            echo "INFO: Tentativa de montagem $attempt_num/$mount_attempts para EFS ($mount_source) em '$mount_point' com opções '$mount_options'..."
-            if sudo timeout "${mount_timeout}" mount -t efs -o "$mount_options" "$mount_source" "$mount_point"; then
-                echo "INFO: EFS montado com sucesso em '$mount_point'."
-                break
-            else
-                echo "ERRO: Tentativa $attempt_num/$mount_attempts de montar EFS falhou."
-                if [ "$attempt_num" -eq "$mount_attempts" ]; then echo "ERRO CRÍTICO: Falha ao montar EFS."; exit 1; fi
-                sleep 5
-            fi
-            attempt_num=$((attempt_num + 1))
-        done
+        echo "INFO: EFS montado com sucesso em '$mount_point'."
 
         echo "INFO: Adicionando montagem do EFS ao /etc/fstab para persistência..."
-        if grep -q " ${mount_point} efs" /etc/fstab; then
-            echo "INFO: Entrada EFS existente para ${mount_point} encontrada no /etc/fstab. Removendo para atualizar..."
-            sudo sed -i "\# ${mount_point} efs#d" /etc/fstab
-        fi
-        local fstab_mount_options="_netdev,${mount_options}"
-        local fstab_entry="$mount_source $mount_point efs $fstab_mount_options 0 0"
-        echo "$fstab_entry" | sudo tee -a /etc/fstab >/dev/null
-        echo "INFO: Entrada adicionada ao /etc/fstab: '$fstab_entry'"
-    fi
-}
-
-# Função para criar um template wp-config.php
-create_wp_config_template() {
-    local target_file="$1"
-    local wp_home_url="$2"
-    local wp_site_url="$3"
-    local db_name="$4"
-    local db_user="$5"
-    local db_password="$6"
-    local db_host="$7"
-
-    echo "INFO: Criando template de configuração em '$target_file' para URL: $wp_home_url"
-    if [ ! -f "$CONFIG_SAMPLE_ORIGINAL" ]; then
-        echo "ERRO: Arquivo original '$CONFIG_SAMPLE_ORIGINAL' não encontrado. O WordPress foi baixado corretamente?"
-        exit 1
-    fi
-    sudo cp "$CONFIG_SAMPLE_ORIGINAL" "$target_file"
-
-    # Sanitize inputs for sed
-    SAFE_DB_NAME=$(echo "$db_name" | sed -e 's/[&\\/]/\\&/g')
-    SAFE_DB_USER=$(echo "$db_user" | sed -e 's/[&\\/]/\\&/g')
-    SAFE_DB_PASSWORD=$(echo "$db_password" | sed -e 's/[&\\/]/\\&/g')
-    SAFE_DB_HOST=$(echo "$db_host" | sed -e 's/[&\\/]/\\&/g')
-
-    sudo sed -i "s/database_name_here/$SAFE_DB_NAME/g" "$target_file"
-    sudo sed -i "s/username_here/$SAFE_DB_USER/g" "$target_file"
-    sudo sed -i "s/password_here/$SAFE_DB_PASSWORD/g" "$target_file"
-    sudo sed -i "s/localhost/$SAFE_DB_HOST/g" "$target_file"
-
-    echo "INFO: Obtendo e configurando SALTS em $target_file..."
-    SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
-    if [ -z "$SALT" ]; then echo "ERRO: Falha ao obter SALTS para $target_file."; else
-        # Remove existing salt definitions more robustly
-        sudo sed -i "/^define( *'AUTH_KEY'/d" "$target_file"
-        sudo sed -i "/^define( *'SECURE_AUTH_KEY'/d" "$target_file"
-        sudo sed -i "/^define( *'LOGGED_IN_KEY'/d" "$target_file"
-        sudo sed -i "/^define( *'NONCE_KEY'/d" "$target_file"
-        sudo sed -i "/^define( *'AUTH_SALT'/d" "$target_file"
-        sudo sed -i "/^define( *'SECURE_AUTH_SALT'/d" "$target_file"
-        sudo sed -i "/^define( *'LOGGED_IN_SALT'/d" "$target_file"
-        sudo sed -i "/^define( *'NONCE_SALT'/d" "$target_file"
-        
-        TEMP_SALT_FILE=$(mktemp)
-        echo "$SALT" > "$TEMP_SALT_FILE"
-        # Insert salts before the "That's all" marker
-        if sudo grep -q "$MARKER_LINE_SED_PATTERN" "$target_file"; then
-            sudo sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE" "$target_file"
+        if ! grep -q "$efs_id:/ $mount_point efs" /etc/fstab; then
+            echo "$efs_id:/ $mount_point efs _netdev,tls 0 0" | sudo tee -a /etc/fstab >/dev/null
+            echo "INFO: Entrada adicionada ao /etc/fstab."
         else
-            echo "WARN: Marcador final não encontrado em $target_file. Adicionando SALTS no final."
-            cat "$TEMP_SALT_FILE" | sudo tee -a "$target_file" > /dev/null
+            echo "INFO: Entrada para EFS já existe no /etc/fstab."
         fi
-        rm -f "$TEMP_SALT_FILE"
-        echo "INFO: SALTS configurados em $target_file."
     fi
-    
-    # Adicionar WP_HOME, WP_SITEURL e FS_METHOD
-    PHP_DEFINES_BLOCK=$(cat <<EOF
-
-define('WP_HOME', '$wp_home_url');
-define('WP_SITEURL', '$wp_site_url');
-define('FS_METHOD', 'direct');
-
-// Garantir HTTPS se X-Forwarded-Proto estiver presente (importante para CloudFront)
-if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
-    \$_SERVER['HTTPS'] = 'on';
 }
-EOF
-)
-    TEMP_DEFINES_FILE=$(mktemp)
-    echo "$PHP_DEFINES_BLOCK" > "$TEMP_DEFINES_FILE"
-    # Inserir defines antes do marcador "That's all"
-    if sudo grep -q "$MARKER_LINE_SED_PATTERN" "$target_file"; then
-        sudo sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE" "$target_file"
-    else
-        echo "WARN: Marcador final não encontrado em $target_file. Adicionando DEFINES no final."
-        cat "$TEMP_DEFINES_FILE" | sudo tee -a "$target_file" > /dev/null
-    fi
-    rm -f "$TEMP_DEFINES_FILE"
-    echo "INFO: WP_HOME, WP_SITEURL, FS_METHOD configurados em $target_file."
-}
-
 
 # --- Instalação de Pré-requisitos ---
-echo "INFO: Iniciando instalação de pacotes via YUM..."
-sudo yum update -y -q
-echo "INFO: Habilitando repositório EPEL..."
-sudo amazon-linux-extras install -y epel
-echo "INFO: Instalando pacotes base..."
-sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils
-echo "INFO: Habilitando PHP 7.4..."
-sudo amazon-linux-extras enable php7.4 -y
-echo "INFO: Instalando PHP 7.4 e módulos..."
-sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap
+echo "INFO: Iniciando instalação de pacotes via YUM (modo extra silencioso)..."
+sudo yum update -y -q >/dev/null
+sudo yum install -y -q httpd jq epel-release aws-cli mysql amazon-efs-utils >/dev/null
+echo "INFO: Habilitando amazon-linux-extras para PHP 7.4 (modo extra silencioso)..."
+sudo amazon-linux-extras enable php7.4 -y &>/dev/null
+echo "INFO: Instalando PHP 7.4 e módulos (modo extra silencioso)..."
+sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap >/dev/null
 echo "INFO: Instalação de pacotes concluída."
 
 # --- Montagem do EFS ---
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
 
-# --- Obtenção de Credenciais do RDS ---
-echo "INFO: Obtendo credenciais do RDS via Secrets Manager (ARN: $AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0)..."
-SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" --query 'SecretString' --output text --region "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0")
-if [ -z "$SECRET_STRING_VALUE" ]; then echo "ERRO: Falha ao obter segredo."; exit 1; fi
+# --- Obtenção de Credenciais do RDS via Secrets Manager ---
+echo "INFO: Verificando disponibilidade de AWS CLI e JQ..."
+if ! command -v aws &>/dev/null || ! command -v jq &>/dev/null; then
+    echo "ERRO: AWS CLI ou JQ não encontrados. Instalação falhou?"
+    exit 1
+fi
+
+echo "INFO: Tentando obter segredo do Secrets Manager..."
+if ! SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" --query 'SecretString' --output text --region "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"); then
+    echo "ERRO: Falha ao executar 'aws secretsmanager get-secret-value'. Verifique ARN, região e permissões IAM."
+    exit 1
+fi
+if [ -z "$SECRET_STRING_VALUE" ]; then
+    echo "ERRO: AWS CLI retornou valor vazio do segredo."
+    exit 1
+fi
+echo "INFO: Segredo bruto obtido com sucesso."
+
+echo "INFO: Extraindo username e password do JSON do segredo..."
 DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username)
 DB_PASSWORD=$(echo "$SECRET_STRING_VALUE" | jq -r .password)
+
 if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" == "null" ]; then
-    echo "ERRO: Falha ao extrair credenciais do JSON do segredo."; exit 1;
+    echo "ERRO: Falha ao extrair 'username' ou 'password' do JSON do segredo."
+    echo "DEBUG: Segredo parcial (se extração falhar): $(echo "$SECRET_STRING_VALUE" | cut -c 1-50)..."
+    exit 1
 fi
-DB_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1)
-echo "INFO: Credenciais do banco de dados extraídas (Usuário: $DB_USER)."
+echo "INFO: Credenciais do banco de dados extraídas com sucesso (Usuário: $DB_USER)."
 
 # --- Download e Extração do WordPress ---
+# Esta seção baixa o core do WordPress. Não inclui wp-config-management.php ou wp-config-production.php.
+# Esses arquivos devem ser pré-provisionados no EFS ou de outra forma.
 echo "INFO: Verificando se o WordPress já existe em '$MOUNT_POINT'..."
-# Verifica se wp-includes existe, que é mais fundamental que wp-config.php para uma instalação.
-if [ -d "$MOUNT_POINT/wp-includes" ]; then
-    echo "WARN: Diretório 'wp-includes' já encontrado em '$MOUNT_POINT'. Pulando download e extração do WordPress."
+if [ -f "$MOUNT_POINT/wp-config.php" ] || [ -f "$MOUNT_POINT/index.php" ]; then # wp-config.php é o principal indicador
+    echo "WARN: Arquivos do WordPress (wp-config.php ou index.php) já encontrados em '$MOUNT_POINT'. Pulando download e extração."
+    echo "INFO: Se esta é uma nova instância anexando a um EFS existente, isso é esperado."
 else
     echo "INFO: WordPress não encontrado. Iniciando download e extração..."
-    mkdir -p "$WP_DIR_TEMP" && cd "$WP_DIR_TEMP"
-    echo "INFO: Baixando WordPress..."
-    curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha ao baixar WordPress."; cd /tmp && rm -rf "$WP_DIR_TEMP"; exit 1; }
+    echo "INFO: Criando diretório temporário '$WP_DIR_TEMP'..."
+    mkdir -p "$WP_DIR_TEMP"
+    cd "$WP_DIR_TEMP"
+
+    echo "INFO: Baixando WordPress (versão mais recente)..."
+    if ! curl -sLO https://wordpress.org/latest.tar.gz; then
+        echo "ERRO: Falha ao baixar WordPress. Verifique conectividade/firewall para wordpress.org."
+        cd /tmp
+        rm -rf "$WP_DIR_TEMP"
+        exit 1
+    fi
+
     echo "INFO: Extraindo WordPress..."
-    tar -xzf latest.tar.gz || { echo "ERRO: Falha ao extrair 'latest.tar.gz'."; cd /tmp && rm -rf "$WP_DIR_TEMP"; exit 1; }
+    if ! tar -xzf latest.tar.gz; then
+        echo "ERRO: Falha ao extrair 'latest.tar.gz'."
+        cd /tmp
+        rm -rf "$WP_DIR_TEMP"
+        exit 1
+    fi
     rm latest.tar.gz
-    if [ ! -d "wordpress" ]; then echo "ERRO: Diretório 'wordpress' não encontrado pós extração."; cd /tmp && rm -rf "$WP_DIR_TEMP"; exit 1; fi
-    echo "INFO: Movendo arquivos do WordPress para '$MOUNT_POINT'..."
-    sudo rsync -a --remove-source-files wordpress/ "$MOUNT_POINT/" || { echo "ERRO: Falha ao mover arquivos para $MOUNT_POINT."; cd /tmp && rm -rf "$WP_DIR_TEMP"; exit 1; }
-    cd /tmp && rm -rf "$WP_DIR_TEMP"
-    echo "INFO: Arquivos do WordPress movidos."
+
+    if [ ! -d "wordpress" ]; then
+        echo "ERRO: Diretório 'wordpress' não encontrado após extração."
+        cd /tmp
+        rm -rf "$WP_DIR_TEMP"
+        exit 1
+    fi
+
+    echo "INFO: Movendo arquivos do WordPress para '$MOUNT_POINT' (EFS) (modo menos verboso)..."
+    # Cuidado: rsync aqui pode sobrescrever arquivos se existirem no EFS, mas não wp-config.php (que não vem no .tar.gz)
+    # nem wp-config-management.php ou wp-config-production.php.
+    if ! sudo rsync -a --remove-source-files wordpress/ "$MOUNT_POINT/"; then
+        echo "ERRO: Falha ao mover arquivos do WordPress para $MOUNT_POINT via rsync."
+        cd /tmp
+        rm -rf "$WP_DIR_TEMP"
+        exit 1
+    fi
+    cd /tmp
+    rm -rf "$WP_DIR_TEMP"
+    echo "INFO: Arquivos do WordPress movidos e diretório temporário limpo."
 fi
 
-# --- Configuração dos Templates wp-config ---
-# Só criar os templates se o wp-config-sample.php existir E os templates ainda não existirem
-if [ -f "$CONFIG_SAMPLE_ORIGINAL" ]; then
-    if [ ! -f "$CONFIG_FILE_PROD_TEMPLATE" ]; then
-        PRODUCTION_URL="https://${WPDOMAIN}"
-        create_wp_config_template "$CONFIG_FILE_PROD_TEMPLATE" "$PRODUCTION_URL" "$PRODUCTION_URL" \
-            "$AWS_DB_INSTANCE_TARGET_NAME_0" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
-    else
-        echo "WARN: Template $CONFIG_FILE_PROD_TEMPLATE já existe. Pulando criação."
-    fi
+# --- Configuração do wp-config.php ---
+echo "INFO: Verificando se '$CONFIG_FILE' já existe..."
+if [ -f "$CONFIG_FILE" ]; then
+    echo "WARN: '$CONFIG_FILE' já existe. Pulando criação e configuração inicial de DB/SALTS."
+    echo "INFO: Assumindo que a configuração foi feita anteriormente ou manualmente."
+else
+    # <<< MODIFICADO AQUI >>>
+    WP_CONFIG_MANAGEMENT_SOURCE="$MOUNT_POINT/wp-config-management.php"
+    WP_CONFIG_SAMPLE_SOURCE="$MOUNT_POINT/wp-config-sample.php"
 
-    if [ ! -f "$CONFIG_FILE_MGMT_TEMPLATE" ]; then
-        MANAGEMENT_URL="https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
-        create_wp_config_template "$CONFIG_FILE_MGMT_TEMPLATE" "$MANAGEMENT_URL" "$MANAGEMENT_URL" \
-            "$AWS_DB_INSTANCE_TARGET_NAME_0" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
+    echo "INFO: '$CONFIG_FILE' não encontrado. Tentando criar a partir de '$WP_CONFIG_MANAGEMENT_SOURCE'..."
+    if [ -f "$WP_CONFIG_MANAGEMENT_SOURCE" ]; then
+        sudo cp "$WP_CONFIG_MANAGEMENT_SOURCE" "$CONFIG_FILE"
+        echo "INFO: '$CONFIG_FILE' criado com sucesso a partir de '$WP_CONFIG_MANAGEMENT_SOURCE'."
     else
-        echo "WARN: Template $CONFIG_FILE_MGMT_TEMPLATE já existe. Pulando criação."
+        echo "ERRO: Arquivo de configuração base '$WP_CONFIG_MANAGEMENT_SOURCE' não encontrado."
+        echo "INFO: Verifique se '$WP_CONFIG_MANAGEMENT_SOURCE' existe no EFS em '$MOUNT_POINT'."
+        echo "INFO: Se '$WP_CONFIG_MANAGEMENT_SOURCE' não estiver disponível, este script não pode prosseguir com a configuração automática de '$CONFIG_FILE'."
+        # Opcional: Fallback para wp-config-sample.php se wp-config-management.php não existir
+        # echo "INFO: Tentando usar '$WP_CONFIG_SAMPLE_SOURCE' como fallback..."
+        # if [ -f "$WP_CONFIG_SAMPLE_SOURCE" ]; then
+        #     sudo cp "$WP_CONFIG_SAMPLE_SOURCE" "$CONFIG_FILE"
+        #     echo "INFO: '$CONFIG_FILE' criado a partir de '$WP_CONFIG_SAMPLE_SOURCE' (fallback)."
+        # else
+        #     echo "ERRO: '$WP_CONFIG_SAMPLE_SOURCE' também não encontrado. A instalação do WordPress falhou ou está incompleta?"
+        #     exit 1
+        # fi
+        exit 1 # Falha se wp-config-management.php não for encontrado
     fi
+    # <<< FIM DA MODIFICAÇÃO >>>
 
-    # Ativar o config de produção por padrão, se o wp-config.php ativo não existir
-    if [ ! -f "$ACTIVE_CONFIG_FILE" ] && [ -f "$CONFIG_FILE_PROD_TEMPLATE" ]; then
-        echo "INFO: Ativando $CONFIG_FILE_PROD_TEMPLATE como o $ACTIVE_CONFIG_FILE padrão."
-        sudo cp "$CONFIG_FILE_PROD_TEMPLATE" "$ACTIVE_CONFIG_FILE"
-        # Ou link simbólico: sudo ln -sf "$CONFIG_FILE_PROD_TEMPLATE" "$ACTIVE_CONFIG_FILE"
-    elif [ -f "$ACTIVE_CONFIG_FILE" ]; then
-        echo "WARN: $ACTIVE_CONFIG_FILE já existe. Nenhuma alteração no arquivo ativo será feita por este script."
+    RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
+    ENDPOINT_ADDRESS=$(echo "$RDS_ENDPOINT" | cut -d: -f1)
+
+    echo "INFO: Preparando variáveis para substituição segura no $CONFIG_FILE..."
+    SAFE_DBNAME=$(echo "$AWS_DB_INSTANCE_TARGET_NAME_0" | sed -e 's/[&#\/\\\\]/\\&/g')
+    SAFE_DB_USER=$(echo "$DB_USER" | sed -e 's/[&#\/\\\\]/\\&/g')
+    SAFE_DB_PASSWORD=$(echo "$DB_PASSWORD" | sed -e 's/[&#\/\\\\]/\\&/g')
+    SAFE_ENDPOINT_ADDRESS=$(echo "$ENDPOINT_ADDRESS" | sed -e 's/[&#\/\\\\]/\\&/g')
+
+    echo "INFO: Substituindo placeholders de DB no $CONFIG_FILE (com escape)..."
+    # Estes sed assumem que os placeholders 'database_name_here', etc. existem no wp-config-management.php
+    # ou que você adaptou o wp-config-management.php para que estes 'sed' funcionem corretamente.
+    if ! sudo sed -i "s#database_name_here#$SAFE_DBNAME#" "$CONFIG_FILE"; then
+        echo "ERRO: Falha ao substituir DB_NAME"
+        exit 1
+    fi
+    if ! sudo sed -i "s#username_here#$SAFE_DB_USER#" "$CONFIG_FILE"; then
+        echo "ERRO: Falha ao substituir DB_USER"
+        exit 1
+    fi
+    if ! sudo sed -i "s#password_here#$SAFE_DB_PASSWORD#" "$CONFIG_FILE"; then
+        echo "ERRO: Falha ao substituir DB_PASSWORD"
+        exit 1
+    fi
+    if ! sudo sed -i "s#localhost#$SAFE_ENDPOINT_ADDRESS#" "$CONFIG_FILE"; then
+        echo "ERRO: Falha ao substituir DB_HOST"
+        exit 1
+    fi
+    echo "INFO: Placeholders de DB substituídos."
+
+    echo "INFO: Obtendo e configurando chaves de segurança (SALTS) no $CONFIG_FILE..."
+    SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
+    if [ -z "$SALT" ]; then
+        echo "ERRO: Falha ao obter SALTS da API do WordPress."
+        # exit 1; # Descomente se SALTS forem críticos
     else
-        echo "ERRO: $CONFIG_FILE_PROD_TEMPLATE não pôde ser criado/encontrado para ativar como padrão."
+        echo "INFO: Removendo/Inserindo SALTS usando arquivo temporário..."
+        # Remove quaisquer linhas de SALTS existentes e insere as novas.
+        # Isto é mais robusto se o wp-config-management.php já tiver SALTS de placeholder.
+        sudo sed -i "/define( *'AUTH_KEY'/d;/define( *'SECURE_AUTH_KEY'/d;/define( *'LOGGED_IN_KEY'/d;/define( *'NONCE_KEY'/d;/define( *'AUTH_SALT'/d;/define( *'SECURE_AUTH_SALT'/d;/define( *'LOGGED_IN_SALT'/d;/define( *'NONCE_SALT'/d" "$CONFIG_FILE"
+        TEMP_SALT_FILE=$(mktemp)
+        echo "$SALT" >"$TEMP_SALT_FILE"
+        
+        # Tenta inserir após DB_COLLATE ou, como fallback, antes do marcador final
+        DB_COLLATE_MARKER="/define( *'DB_COLLATE'/"
+        if sudo grep -q "$DB_COLLATE_MARKER" "$CONFIG_FILE"; then
+            if ! sudo sed -i -e "$DB_COLLATE_MARKER r $TEMP_SALT_FILE" "$CONFIG_FILE"; then
+                echo "ERRO: Falha no sed ao inserir SALTS após DB_COLLATE."
+                rm -f "$TEMP_SALT_FILE"
+                exit 1
+            fi
+        else
+            echo "WARN: DB_COLLATE não encontrado. Tentando inserir SALTS antes de '$MARKER_LINE_SED_RAW'."
+            if ! sudo sed -i -e "/$MARKER_LINE_SED_PATTERN/e cat $TEMP_SALT_FILE" -e "/$MARKER_LINE_SED_PATTERN/i\\" "$CONFIG_FILE"; then
+                 # A linha acima pode ser complexa. Uma alternativa mais simples se a anterior falhar:
+                 # sudo sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE" "$CONFIG_FILE"
+                 # e depois ajustar a posição se necessário, ou garantir que $MARKER_LINE_SED_PATTERN seja adequado.
+                 # A forma mais segura é usar um placeholder e substituir, como feito para as URLs dinâmicas.
+                 # Para simplificar e assumindo que o `wp-config-management.php` tem uma estrutura similar ao sample:
+                 # Inserir antes de $table_prefix
+                 TABLE_PREFIX_MARKER="/\\\$table_prefix/"
+                 if sudo grep -q "$TABLE_PREFIX_MARKER" "$CONFIG_FILE"; then
+                    if ! sudo sed -i "/$TABLE_PREFIX_MARKER/r $TEMP_SALT_FILE" "$CONFIG_FILE"; then
+                        echo "ERRO: Falha ao inserir SALTS antes de \$table_prefix."
+                        rm -f "$TEMP_SALT_FILE"
+                        exit 1
+                    fi
+                 else
+                    echo "ERRO: Não foi possível encontrar um local adequado para inserir SALTS (DB_COLLATE ou \$table_prefix). Insira manualmente."
+                    rm -f "$TEMP_SALT_FILE"
+                    exit 1
+                 fi
+            fi
+        fi
+        rm -f "$TEMP_SALT_FILE"
+        echo "INFO: SALTS configurados com sucesso."
+    fi
+fi # Fim do if [ -f "$CONFIG_FILE" ] (bloco de criação/configuração inicial)
+
+# --- INÍCIO: Inserir Definições Dinâmicas de URL (WP_HOME/WP_SITEURL) ---
+echo "INFO: Verificando/Adicionando definições dinâmicas WP_HOME/WP_SITEURL..."
+# Verifica se as definições dinâmicas (procurando por um comentário único) já existem para evitar duplicatas
+if sudo grep -q "// --- Dynamic URL definitions ---" "$CONFIG_FILE"; then
+    echo "INFO: Definições dinâmicas de URL já parecem existir em $CONFIG_FILE."
+else
+    echo "INFO: Inserindo definições dinâmicas de URL em $CONFIG_FILE antes de '$MARKER_LINE_SED_RAW'..."
+    TEMP_PHP_FILE=$(mktemp) # Arquivo temporário para o bloco PHP
+
+    # Cria o bloco PHP usando Here Document (com 'EOF' para não expandir $_SERVER)
+    cat <<'EOF' >"$TEMP_PHP_FILE"
+
+// --- Dynamic URL definitions ---
+// Define WP_HOME and WP_SITEURL dynamically based on the HTTP Host header.
+// This ensures WordPress uses the correct URL whether accessed directly or via Load Balancer.
+// It also checks for X-Forwarded-Proto header to handle HTTPS termination at the LB.
+if ( isset( $_SERVER['HTTP_HOST'] ) ) {
+    // Determine scheme (http or https)
+    $protocol = 'http://';
+    if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && strtolower( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) === 'https' ) {
+        $protocol = 'https://';
+        // Inform WordPress that SSL is used, essential for is_ssl() and other functions.
+        $_SERVER['HTTPS'] = 'on';
+    } elseif ( isset( $_SERVER['HTTPS'] ) && ( strtolower( $_SERVER['HTTPS'] ) == 'on' || $_SERVER['HTTPS'] == '1' ) ) {
+         // Also respect standard HTTPS variable if present (e.g., direct HTTPS connection)
+        $protocol = 'https://';
+    } elseif ( ! empty( $_SERVER['SERVER_PORT'] ) && ( $_SERVER['SERVER_PORT'] == '443' ) ) {
+        // Fallback for some configurations where only the port indicates HTTPS
+        $protocol = 'https://';
+    }
+
+    // Construct the URLs
+    $_wp_home_url = $protocol . $_SERVER['HTTP_HOST'];
+    $_wp_site_url = $protocol . $_SERVER['HTTP_HOST'];
+
+    // Define constants only if they are not already defined
+    if ( ! defined( 'WP_HOME' ) ) {
+        define( 'WP_HOME', $_wp_home_url );
+    }
+    if ( ! defined( 'WP_SITEURL' ) ) {
+        define( 'WP_SITEURL', $_wp_site_url );
+    }
+
+    // Optional: Force SSL for login and admin pages if behind HTTPS proxy
+    // Uncomment the following lines if you always want admin access via HTTPS
+    // if ( $protocol === 'https://' ) {
+    //    if ( ! defined( 'FORCE_SSL_ADMIN' ) ) {
+    //        define( 'FORCE_SSL_ADMIN', true );
+    //    }
+    //    // If site uses CloudFront/Proxy, set this to handle redirects correctly
+    //    if ( strpos( $_SERVER['HTTP_X_FORWARDED_PROTO'], 'https' ) !== false ) {
+    //        $_SERVER['HTTPS'] = 'on';
+    //    }
+    // }
+
+} // end if ( isset( $_SERVER['HTTP_HOST'] ) )
+// --- End Dynamic URL definitions ---
+
+EOF
+
+    # Usa sed para inserir o conteúdo do arquivo temporário ANTES da linha marcador final
+    # Abordagem mais segura: Inserir placeholder, depois ler arquivo e deletar placeholder
+    PLACEHOLDER="__WP_DYNAMIC_URL_INSERT_POINT_$(date +%s%N)__" # Placeholder único com nanossegundos
+    # 1. Inserir placeholder
+    if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i $PLACEHOLDER" "$CONFIG_FILE"; then
+        echo "ERRO: Falha ao inserir placeholder para URLs dinâmicas em $CONFIG_FILE."
+        rm -f "$TEMP_PHP_FILE" # Limpeza
+        # exit 1; # Considerar saída
+    else
+        # 2. Substituir placeholder pelo conteúdo do arquivo e remover linha do placeholder
+        if ! sudo sed -i -e "\#$PLACEHOLDER#r $TEMP_PHP_FILE" -e "\#$PLACEHOLDER#d" "$CONFIG_FILE"; then
+            echo "ERRO: Falha ao substituir placeholder com URLs dinâmicas em $CONFIG_FILE."
+            sudo sed -i "\#$PLACEHOLDER#d" "$CONFIG_FILE" || echo "WARN: Não foi possível remover placeholder órfão de URL dinâmica."
+        else
+            echo "INFO: Definições dinâmicas WP_HOME/WP_SITEURL inseridas com sucesso em $CONFIG_FILE."
+        fi
+    fi
+    rm -f "$TEMP_PHP_FILE"
+fi
+# --- FIM: Inserir Definições Dinâmicas de URL ---
+
+# --- Forçar Método de Escrita Direto ---
+echo "INFO: Verificando/Adicionando FS_METHOD 'direct' ao $CONFIG_FILE..."
+FS_METHOD_LINE="define( 'FS_METHOD', 'direct' );"
+if [ -f "$CONFIG_FILE" ]; then
+    if sudo grep -q "define( *'FS_METHOD' *, *'direct' *);" "$CONFIG_FILE"; then
+        echo "INFO: FS_METHOD 'direct' já está definido em $CONFIG_FILE."
+    else
+        echo "INFO: Inserindo FS_METHOD 'direct' em $CONFIG_FILE..."
+        if ! sudo sed -i "/$MARKER_LINE_SED_PATTERN/i\\$FS_METHOD_LINE" "$CONFIG_FILE"; then
+            echo "ERRO: Falha ao inserir FS_METHOD 'direct' no $CONFIG_FILE."
+        else
+            echo "INFO: FS_METHOD 'direct' inserido com sucesso."
+        fi
     fi
 else
-    echo "WARN: $CONFIG_SAMPLE_ORIGINAL não encontrado. Não é possível criar templates wp-config."
+    echo "WARN: $CONFIG_FILE não encontrado para adicionar FS_METHOD. Isso pode ser um problema se a configuração inicial foi pulada."
 fi
+echo "INFO: Configuração final do wp-config.php concluída."
 
-
-# <<<--- INÍCIO: Adicionar Arquivo de Health Check --->>>
+# <<<--- INÍCIO: Adicionar Arquivo de Health Check (v1.9.1 / v1.9.2 / v1.9.3) --->>>
 echo "INFO: Criando/Verificando arquivo de health check em '$HEALTH_CHECK_FILE_PATH'..."
 sudo bash -c "cat > '$HEALTH_CHECK_FILE_PATH'" <<EOF
 <?php
-// Simple health check endpoint
-// Version: 1.9.7
+// Simple health check endpoint for AWS Target Group or other monitors
+// Returns HTTP 200 OK status code if PHP processing is working.
+// Version: 1.9.3
+
+// Set the HTTP status code to 200 OK
 http_response_code(200);
+
+// Set the content type to plain text
 header("Content-Type: text/plain; charset=utf-8");
-echo "OK - WordPress Health Check Endpoint - Script v1.9.7 - Timestamp: " . date("Y-m-d\TH:i:s\Z");
+
+// Output a simple success message
+echo "OK";
+
+// Exit cleanly
 exit;
 ?>
 EOF
-if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then echo "INFO: Arquivo de health check criado/atualizado."; else echo "ERRO: Falha ao criar/atualizar health check."; fi
+
+if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then
+    echo "INFO: Arquivo de health check '$HEALTH_CHECK_FILE_PATH' criado/atualizado com sucesso."
+else
+    echo "ERRO: Falha ao criar/atualizar o arquivo de health check '$HEALTH_CHECK_FILE_PATH'."
+    # exit 1; # Considerar sair
+fi
 # <<<--- FIM: Adicionar Arquivo de Health Check --->>>
 
 # --- Ajustes de Permissões e Propriedade ---
-echo "INFO: Ajustando permissões e propriedade em '$MOUNT_POINT'..."
-sudo chown -R apache:apache "$MOUNT_POINT"
-sudo find "$MOUNT_POINT" -type d -exec chmod 755 {} \;
-sudo find "$MOUNT_POINT" -type f -exec chmod 644 {} \;
-# Permissões mais restritas para os arquivos de config
-if [ -f "$ACTIVE_CONFIG_FILE" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE"; fi
-if [ -f "$CONFIG_FILE_PROD_TEMPLATE" ]; then sudo chmod 640 "$CONFIG_FILE_PROD_TEMPLATE"; fi
-if [ -f "$CONFIG_FILE_MGMT_TEMPLATE" ]; then sudo chmod 640 "$CONFIG_FILE_MGMT_TEMPLATE"; fi
-if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH"; fi # Health check pode ser 644
-echo "INFO: Permissões e propriedade ajustadas."
+echo "INFO: Ajustando permissões de arquivos/diretórios em '$MOUNT_POINT'..."
+# Somente prosseguir se o MOUNT_POINT tiver conteúdo (ex: após rsync)
+if [ -n "$(ls -A $MOUNT_POINT)" ]; then
+    if ! sudo chown -R apache:apache "$MOUNT_POINT"; then
+        echo "ERRO: Falha ao definir propriedade apache:apache em $MOUNT_POINT."
+        exit 1
+    fi
+    echo "INFO: Definindo permissões base (755 dirs, 644 files)..."
+    sudo find "$MOUNT_POINT" -type d -exec chmod 755 {} \; || echo "WARN: Erros menores ao definir permissões de diretório (755)."
+    sudo find "$MOUNT_POINT" -type f -exec chmod 644 {} \; || echo "WARN: Erros menores ao definir permissões de arquivo (644)."
+
+    # Ajusta wp-config.php (mais restrito)
+    if [ -f "$CONFIG_FILE" ]; then
+        sudo chown apache:apache "$CONFIG_FILE" || echo "WARN: Não foi possível ajustar propriedade em $CONFIG_FILE"
+        sudo chmod 640 "$CONFIG_FILE" || echo "WARN: Não foi possível ajustar permissões em $CONFIG_FILE (640)"
+    fi
+    # Ajusta healthcheck.php (precisa ser legível pelo Apache)
+    if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then
+        sudo chown apache:apache "$HEALTH_CHECK_FILE_PATH" || echo "WARN: Não foi possível ajustar propriedade de $HEALTH_CHECK_FILE_PATH"
+        sudo chmod 644 "$HEALTH_CHECK_FILE_PATH" || echo "WARN: Não foi possível ajustar permissões em $HEALTH_CHECK_FILE_PATH (644)"
+    fi
+    echo "INFO: Permissões e propriedade ajustadas."
+else
+    echo "WARN: '$MOUNT_POINT' está vazio ou não contém arquivos. Pulando ajustes de permissões."
+fi
+
 
 # --- Configuração e Inicialização do Apache ---
-echo "INFO: Configurando Apache..."
+echo "INFO: Configurando Apache para servir de '$MOUNT_POINT'..."
 HTTPD_CONF="/etc/httpd/conf/httpd.conf"
 if grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF" && ! grep -A5 "<Directory \"/var/www/html\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
-    sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF" && echo "INFO: AllowOverride All definido." || echo "WARN: Falha ao definir AllowOverride All."
-elif ! grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF"; then echo "WARN: Bloco /var/www/html não encontrado em $HTTPD_CONF."; else echo "INFO: AllowOverride All já parece OK."; fi
+    echo "INFO: Modificando $HTTPD_CONF para definir AllowOverride All para /var/www/html..."
+    if ! sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF"; then
+        echo "WARN: Falha ao tentar definir AllowOverride All automaticamente. Verifique $HTTPD_CONF manualmente se os permalinks não funcionarem."
+    else
+        echo "INFO: AllowOverride All definido com sucesso."
+    fi
+elif ! grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF"; then
+    echo "WARN: Bloco de diretório /var/www/html não encontrado como esperado em $HTTPD_CONF. AllowOverride pode não estar correto."
+else
+    echo "INFO: AllowOverride All já parece estar definido para /var/www/html em $HTTPD_CONF."
+fi
 
-echo "INFO: Habilitando e reiniciando httpd..."
+echo "INFO: Habilitando e reiniciando o serviço httpd..."
 sudo systemctl enable httpd
 if ! sudo systemctl restart httpd; then
-    echo "ERRO CRÍTICO: Falha ao reiniciar httpd. Verificando config..."
-    sudo apachectl configtest
-    sudo tail -n 30 /var/log/httpd/error_log
-    exit 1;
+    echo "ERRO CRÍTICO: Falha ao reiniciar o serviço httpd. Verifique a configuração do Apache e os logs."
+    echo "DEBUG: Verificando configuração do Apache: "
+    sudo apachectl configtest || echo "WARN: apachectl configtest falhou ou não está disponível."
+    echo "DEBUG: Últimas linhas do log de erro do Apache (/var/log/httpd/error_log):"
+    sudo tail -n 20 /var/log/httpd/error_log || echo "WARN: Não foi possível ler o log de erro do Apache."
+    exit 1
 fi
-sleep 3 # Pequena pausa para o serviço estabilizar
-if systemctl is-active --quiet httpd; then echo "INFO: Serviço httpd está ativo."; else
-    echo "ERRO CRÍTICO: httpd não está ativo pós-restart."
-    sudo tail -n 30 /var/log/httpd/error_log
-    exit 1;
+
+sleep 5
+if systemctl is-active --quiet httpd; then
+    echo "INFO: Serviço httpd está ativo."
+else
+    echo "ERRO CRÍTICO: Serviço httpd não está ativo após a tentativa de restart. Verifique os logs."
+    echo "DEBUG: Últimas linhas do log de erro do Apache (/var/log/httpd/error_log):"
+    sudo tail -n 20 /var/log/httpd/error_log || echo "WARN: Não foi possível ler o log de erro do Apache."
+    exit 1
 fi
 
 # --- Conclusão ---
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.7) concluído com sucesso! ($(date)) ---"
-echo "INFO: WordPress configurado. Template de produção ativado por padrão."
-echo "INFO: Domínio de Produção: https://${WPDOMAIN}"
-echo "INFO: Domínio de Gerenciamento (template criado): https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
-echo "INFO: Para alternar para o modo de gerenciamento, use um Run Command para copiar/linkar"
-echo "INFO: $CONFIG_FILE_MGMT_TEMPLATE para $ACTIVE_CONFIG_FILE."
-echo "INFO: Health Check: /healthcheck.php"
-echo "INFO: Log completo: ${LOG_FILE}"
+echo "INFO: --- Script WordPress Setup (v1.9.3) concluído com sucesso! ($(date)) ---"
+echo "INFO: WordPress configurado para usar URLs dinâmicas (adequado para Load Balancer)."
+echo "INFO: wp-config.php foi baseado em wp-config-management.php (se encontrado)."
+echo "INFO: Acesse o IP/DNS da instância ou o DNS do Load Balancer para finalizar a instalação via navegador (se for a primeira vez) ou usar o site."
+echo "INFO: O Health Check está disponível em /healthcheck.php"
+echo "INFO: Log completo em: ${LOG_FILE}"
 echo "INFO: =================================================="
 
 exit 0
