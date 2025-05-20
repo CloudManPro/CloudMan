@@ -38,7 +38,7 @@ while [ -f /var/run/yum.pid ]; do
     fi
     YUM_PID_CONTENT=$(cat /var/run/yum.pid 2>/dev/null || echo 'unknown')
     echo "INFO: Yum is busy (PID: $YUM_PID_CONTENT). Waiting... (attempt $((CURRENT_YUM_WAIT_ITERATION + 1))/$MAX_YUM_WAIT_ITERATIONS, $(date))"
-    sleep 10
+    sleep 30
     CURRENT_YUM_WAIT_ITERATION=$((CURRENT_YUM_WAIT_ITERATION + 1))
 done
 PGREP_YUM_CHECKS=12
@@ -48,7 +48,7 @@ for i in $(seq 1 "$PGREP_YUM_CHECKS"); do
         break
     else
         echo "INFO: 'yum' process still detected by pgrep. Waiting (pgrep check $i/$PGREP_YUM_CHECKS, $(date))..."
-        sleep 10
+        sleep 30
     fi
     if [ "$i" -eq "$PGREP_YUM_CHECKS" ]; then
         echo "ERROR: 'yum' process still running after pgrep checks. Aborting. ($(date))"
