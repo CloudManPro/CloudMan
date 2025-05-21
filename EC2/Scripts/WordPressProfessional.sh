@@ -11,7 +11,7 @@
 # Esta seção foi removida/comentada porque este script é executado como user-data pelo cloud-init.
 # Esperar pelo boot-finished aqui causaria um timeout, pois o cloud-init só
 # criaria o boot-finished DEPOIS que este script (user-data) terminasse.
-echo "INFO: Script está rodando como parte do cloud-init user-data. Pulando espera explícita por /var/lib/cloud/instance/boot-finished."
+echo "INFO: Script vr 1.9.7-mod6-ipv4ipv6fix está rodando como parte do cloud-init user-data. Pulando espera explícita por /var/lib/cloud/instance/boot-finished."
 # --- END WAIT LOGIC ---
 
 # --- BEGIN YUM WAIT LOGIC ---
