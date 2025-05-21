@@ -175,6 +175,8 @@ essential_vars=(
     "ACCOUNT"
     # "MANAGEMENT_WPDOMAIN" # Removido da lista de essenciais, pois tem fallback
 )
+echo "Nomes das variáveis em essential_vars:"
+printf "%s\n" "${essential_vars[@]}"
 error_found=0
 for var_name in "${essential_vars[@]}"; do
     current_var_value="${!var_name:-}"
