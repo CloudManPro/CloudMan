@@ -1,13 +1,14 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.7-mod7-sedfix
+# Versão: 1.9.7-mod8-rsyncfix
 # DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2.
 # Cria templates wp-config-production.php e wp-config-management.php no EFS.
 # Ativa wp-config-management.php como o wp-config.php padrão.
 # Garante que o Apache escute em IPv4 e IPv6 na porta 80.
 # Corrige erro no comando sed para comentar Listen 80 genérico.
+# Corrige erro de 'chown' no rsync ao copiar para EFS.
 
-SCRIPT_VERSION="1.9.7-mod7-sedfix"
+SCRIPT_VERSION="1.9.7-mod8-rsyncfix"
 
 # --- Redirecionamento de Logs (Definido cedo para capturar tudo) ---
 LOG_FILE="/var/log/wordpress_setup.log"
@@ -153,7 +154,6 @@ echo "INFO: Yum lock is free. Proceeding. ($(date))"
 
 # --- Configuração Inicial ---
 set -e
-# set -x # Descomente para debugging detalhado do script
 
 # --- Variáveis ---
 MOUNT_POINT="/var/www/html"
@@ -240,7 +240,7 @@ echo "INFO: Verificação de variáveis essenciais concluída."
 mount_efs() {
     local efs_id=$1
     local mount_point=$2
-    local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}" # Usando a variável de ambiente correta
+    local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}"
 
     echo "INFO: Verificando se o ponto de montagem '$mount_point' existe..."
     sudo mkdir -p "$mount_point"
@@ -422,7 +422,8 @@ else
         exit 1
     fi
     echo "INFO: Movendo arquivos do WordPress para '$MOUNT_POINT'..."
-    sudo rsync -a --remove-source-files wordpress/ "$MOUNT_POINT/" || {
+    # CORREÇÃO RSYNC: Usar -rlptD em vez de -a para evitar problemas de chown no EFS
+    sudo rsync -rlptD --remove-source-files wordpress/ "$MOUNT_POINT/" || {
         echo "ERRO: Falha ao mover arquivos para $MOUNT_POINT."
         cd /tmp && rm -rf "$WP_DIR_TEMP"
         exit 1
@@ -495,7 +496,6 @@ LISTEN_IPV6_DIRECTIVE="Listen [::]:80"
 LISTEN_GENERIC_REGEX="^Listen +80$" # Usado para grep
 LISTEN_GENERIC_PATTERN_SED="^[[:space:]]*Listen[[:space:]]+80[[:space:]]*$" # Usado para sed (endereço)
 
-
 needs_ipv4_listen=true
 if grep -qF "$LISTEN_IPV4_DIRECTIVE" "$APACHE_CONF_FILE"; then
     needs_ipv4_listen=false
@@ -526,13 +526,12 @@ if grep -qF "$LISTEN_IPV4_DIRECTIVE" "$APACHE_CONF_FILE"; then needs_ipv4_listen
 if grep -qF "$LISTEN_IPV6_DIRECTIVE" "$APACHE_CONF_FILE"; then needs_ipv6_listen=false; fi
 
 if ! $needs_ipv4_listen && ! $needs_ipv6_listen ; then
-    # Verifica se 'Listen 80' genérico existe E não está já comentado
     if grep -qE "$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE" && \
        ! grep -qE "^[[:space:]]*#.*$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE"; then
         echo "INFO: Comentando diretiva genérica 'Listen 80' pois '$LISTEN_IPV4_DIRECTIVE' e '$LISTEN_IPV6_DIRECTIVE' estão presentes."
         
         COMMENT_PREFIX="# Script ${SCRIPT_VERSION} (auto-commented): "
-        # Aplica o comentário apenas nas linhas que casam com o padrão de Listen 80 genérico
+        # CORREÇÃO SED: Aplica o comentário apenas nas linhas que casam com o padrão de Listen 80 genérico
         sudo sed -i -E "/${LISTEN_GENERIC_PATTERN_SED}/s|^|${COMMENT_PREFIX}|" "$APACHE_CONF_FILE"
         
         config_changed_listen=true
@@ -546,7 +545,7 @@ else
 fi
 
 # Configuração AllowOverride
-HTTPD_CONF="/etc/httpd/conf/httpd.conf" # Reafirmando, embora já definido
+HTTPD_CONF="/etc/httpd/conf/httpd.conf" 
 if grep -q "<Directory \"${MOUNT_POINT}\">" "$HTTPD_CONF"; then
     if ! grep -A5 "<Directory \"${MOUNT_POINT}\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
         sudo sed -i "/<Directory \"${MOUNT_POINT//\//\\\/}\">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/" "$HTTPD_CONF" && echo "INFO: AllowOverride All definido para ${MOUNT_POINT}." || echo "WARN: Falha ao definir AllowOverride All para ${MOUNT_POINT}."
