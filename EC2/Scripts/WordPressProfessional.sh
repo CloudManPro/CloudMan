@@ -1,21 +1,27 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.7-mod6-ipv4ipv6fix (Baseado na v1.9.7-mod6, com correção de Listen Apache)
+# Versão: 1.9.7-mod7-sedfix
 # DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2.
 # Cria templates wp-config-production.php e wp-config-management.php no EFS.
 # Ativa wp-config-management.php como o wp-config.php padrão.
-# A troca para o modo de produção deve ser feita externamente (ex: Run Command).
 # Garante que o Apache escute em IPv4 e IPv6 na porta 80.
+# Corrige erro no comando sed para comentar Listen 80 genérico.
+
+SCRIPT_VERSION="1.9.7-mod7-sedfix"
+
+# --- Redirecionamento de Logs (Definido cedo para capturar tudo) ---
+LOG_FILE="/var/log/wordpress_setup.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo "INFO: =================================================="
+echo "INFO: --- Iniciando Script WordPress Setup (Versão: ${SCRIPT_VERSION}) ($(date)) ---"
+echo "INFO: Logging configurado para: ${LOG_FILE}"
+echo "INFO: =================================================="
 
 # --- BEGIN WAIT LOGIC FOR AMI INITIALIZATION ---
-# Esta seção foi removida/comentada porque este script é executado como user-data pelo cloud-init.
-# Esperar pelo boot-finished aqui causaria um timeout, pois o cloud-init só
-# criaria o boot-finished DEPOIS que este script (user-data) terminasse.
-echo "INFO: Script vr 1.9.7-mod6-ipv4ipv6fix está rodando como parte do cloud-init user-data. Pulando espera explícita por /var/lib/cloud/instance/boot-finished."
+echo "INFO: Script está rodando como parte do cloud-init user-data. Pulando espera explícita por /var/lib/cloud/instance/boot-finished."
 # --- END WAIT LOGIC ---
 
 # --- BEGIN YUM WAIT LOGIC ---
-# Tentar desabilitar e parar o yum-cron antes de prosseguir, para evitar locks.
 echo "INFO: Attempting to disable and stop yum-cron..."
 if systemctl list-unit-files | grep -q "yum-cron.service"; then
     sudo systemctl stop yum-cron || echo "WARN: Falha ao parar yum-cron (pode não estar rodando)."
@@ -26,10 +32,10 @@ else
 fi
 
 echo "INFO: Performing check and wait for yum to be free... ($(date))"
-MAX_YUM_WAIT_ITERATIONS=60 # 60 iterações (Total: 30 minutos com intervalo de 30s)
-YUM_WAIT_INTERVAL=30       # 30 segundos por iteração
+MAX_YUM_WAIT_ITERATIONS=60
+YUM_WAIT_INTERVAL=30
 CURRENT_YUM_WAIT_ITERATION=0
-STALE_PID_CONFIRMATIONS_NEEDED=2 # Número de vezes que precisamos confirmar que o PID é obsoleto antes de remover
+STALE_PID_CONFIRMATIONS_NEEDED=2
 STALE_PID_CURRENT_CONFIRMATIONS=0
 
 while [ -f /var/run/yum.pid ]; do
@@ -54,7 +60,7 @@ while [ -f /var/run/yum.pid ]; do
     echo "INFO: Yum is busy (PID from /var/run/yum.pid: $YUM_PID_CONTENT). Waiting... (attempt $((CURRENT_YUM_WAIT_ITERATION + 1))/$MAX_YUM_WAIT_ITERATIONS, $(date))"
 
     if [ "$YUM_PID_CONTENT" != "unknown" ] && [ -n "$YUM_PID_CONTENT" ]; then
-        if kill -0 "$YUM_PID_CONTENT" 2>/dev/null; then # Verifica se o PID de yum.pid existe e está rodando
+        if kill -0 "$YUM_PID_CONTENT" 2>/dev/null; then
             echo "INFO: Details for yum process $YUM_PID_CONTENT (from yum.pid) holding the lock:"
             ps -f -p "$YUM_PID_CONTENT" || echo "WARN: ps -f -p $YUM_PID_CONTENT failed during wait."
             PARENT_PID_OF_LOCKER=$(ps -o ppid= -p "$YUM_PID_CONTENT" 2>/dev/null)
@@ -64,9 +70,8 @@ while [ -f /var/run/yum.pid ]; do
             else
                 echo "WARN: Could not determine parent of $YUM_PID_CONTENT during wait."
             fi
-            STALE_PID_CURRENT_CONFIRMATIONS=0 # Resetar contador se o processo estiver rodando
+            STALE_PID_CURRENT_CONFIRMATIONS=0
         else
-            # PID não está rodando, pode ser um lock obsoleto
             echo "WARN: PID $YUM_PID_CONTENT from /var/run/yum.pid does not seem to be a running process. This might be a stale lock file."
             STALE_PID_CURRENT_CONFIRMATIONS=$((STALE_PID_CURRENT_CONFIRMATIONS + 1))
             echo "INFO: Stale PID confirmation count: $STALE_PID_CURRENT_CONFIRMATIONS/$STALE_PID_CONFIRMATIONS_NEEDED."
@@ -75,14 +80,13 @@ while [ -f /var/run/yum.pid ]; do
                 echo "WARN: Confirmed PID $YUM_PID_CONTENT is stale. Attempting to remove /var/run/yum.pid."
                 if sudo rm -f /var/run/yum.pid; then
                     echo "INFO: Successfully removed stale /var/run/yum.pid. Yum should be free now."
-                    STALE_PID_CURRENT_CONFIRMATIONS=0 # Resetar
+                    STALE_PID_CURRENT_CONFIRMATIONS=0
                 else
                     echo "ERROR: Failed to remove stale /var/run/yum.pid. Permissions issue? Continuing to wait, but this is problematic."
                 fi
             fi
         fi
     else
-        # yum.pid está vazio ou ilegível
         echo "WARN: PID from /var/run/yum.pid is '$YUM_PID_CONTENT' (empty or unreadable file). This might also be a stale lock file."
         STALE_PID_CURRENT_CONFIRMATIONS=$((STALE_PID_CURRENT_CONFIRMATIONS + 1))
         echo "INFO: Stale/Empty PID file confirmation count: $STALE_PID_CURRENT_CONFIRMATIONS/$STALE_PID_CONFIRMATIONS_NEEDED."
@@ -91,7 +95,7 @@ while [ -f /var/run/yum.pid ]; do
              echo "WARN: Confirmed /var/run/yum.pid is problematic (empty/unreadable). Attempting to remove."
              if sudo rm -f /var/run/yum.pid; then
                 echo "INFO: Successfully removed problematic /var/run/yum.pid."
-                STALE_PID_CURRENT_CONFIRMATIONS=0 # Resetar
+                STALE_PID_CURRENT_CONFIRMATIONS=0
              else
                 echo "ERROR: Failed to remove problematic /var/run/yum.pid. Continuing to wait, but this is problematic."
              fi
@@ -102,9 +106,8 @@ while [ -f /var/run/yum.pid ]; do
     CURRENT_YUM_WAIT_ITERATION=$((CURRENT_YUM_WAIT_ITERATION + 1))
 done
 
-# Adicionalmente, verificar com pgrep, pois yum.pid pode ter sido removido mas o processo ainda existir
 PGREP_YUM_CHECKS=12
-PGREP_YUM_INTERVAL=10 # Intervalo para verificações pgrep
+PGREP_YUM_INTERVAL=10
 for i in $(seq 1 "$PGREP_YUM_CHECKS"); do
     YUM_PIDS_PGREP=$(pgrep -x yum)
     if [ -z "$YUM_PIDS_PGREP" ]; then
@@ -148,32 +151,20 @@ done
 echo "INFO: Yum lock is free. Proceeding. ($(date))"
 # --- END YUM WAIT LOGIC ---
 
-# --- Configuração Inicial e Logging ---
+# --- Configuração Inicial ---
 set -e
-# set -x
+# set -x # Descomente para debugging detalhado do script
 
 # --- Variáveis ---
-LOG_FILE="/var/log/wordpress_setup.log"
 MOUNT_POINT="/var/www/html"
 WP_DIR_TEMP="/tmp/wordpress-temp"
-
-# Nomes dos arquivos de configuração
 ACTIVE_CONFIG_FILE="$MOUNT_POINT/wp-config.php"
 CONFIG_FILE_PROD_TEMPLATE="$MOUNT_POINT/wp-config-production.php"
 CONFIG_FILE_MGMT_TEMPLATE="$MOUNT_POINT/wp-config-management.php"
-CONFIG_SAMPLE_ORIGINAL="$MOUNT_POINT/wp-config-sample.php" # WordPress original
-
+CONFIG_SAMPLE_ORIGINAL="$MOUNT_POINT/wp-config-sample.php"
 HEALTH_CHECK_FILE_PATH="$MOUNT_POINT/healthcheck.php"
-
 MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"
 MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
-
-# --- Redirecionamento de Logs ---
-exec > >(tee -a "${LOG_FILE}") 2>&1
-echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7-mod6-ipv4ipv6fix) ($(date)) ---"
-echo "INFO: Logging configurado para: ${LOG_FILE}"
-echo "INFO: =================================================="
 
 # --- Verificação de Variáveis de Ambiente Essenciais ---
 essential_vars=(
@@ -214,7 +205,6 @@ else
     export AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
 fi
 
-
 error_found=0
 for var_name in "${essential_vars[@]}"; do
     current_var_value="${!var_name:-}"
@@ -250,7 +240,7 @@ echo "INFO: Verificação de variáveis essenciais concluída."
 mount_efs() {
     local efs_id=$1
     local mount_point=$2
-    local efs_ap_id="${EFS_ACCESS_POINT_ID:-}"
+    local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}" # Usando a variável de ambiente correta
 
     echo "INFO: Verificando se o ponto de montagem '$mount_point' existe..."
     sudo mkdir -p "$mount_point"
@@ -476,10 +466,10 @@ echo "INFO: Criando/Verificando arquivo de health check em '$HEALTH_CHECK_FILE_P
 sudo bash -c "cat > '$HEALTH_CHECK_FILE_PATH'" <<EOF
 <?php
 // Simple health check endpoint
-// Version: 1.9.7-mod6-ipv4ipv6fix
+// Version: ${SCRIPT_VERSION}
 http_response_code(200);
 header("Content-Type: text/plain; charset=utf-8");
-echo "OK - WordPress Health Check Endpoint - Script v1.9.7-mod6-ipv4ipv6fix - Timestamp: " . date("Y-m-d\TH:i:s\Z");
+echo "OK - WordPress Health Check Endpoint - Script v${SCRIPT_VERSION} - Timestamp: " . date("Y-m-d\TH:i:s\Z");
 exit;
 ?>
 EOF
@@ -499,11 +489,10 @@ echo "INFO: Permissões e propriedade ajustadas."
 # --- Configuração e Inicialização do Apache ---
 echo "INFO: Configurando Apache..."
 
-# <<<< INÍCIO DA MODIFICAÇÃO PARA LISTEN IPV4/IPV6 >>>>
 APACHE_CONF_FILE="/etc/httpd/conf/httpd.conf"
 LISTEN_IPV4_DIRECTIVE="Listen 0.0.0.0:80"
 LISTEN_IPV6_DIRECTIVE="Listen [::]:80"
-LISTEN_GENERIC_REGEX="^Listen +80$" # Regex para 'Listen 80' (com um ou mais espaços)
+LISTEN_GENERIC_REGEX="^Listen +80$"
 
 needs_ipv4_listen=true
 if grep -qF "$LISTEN_IPV4_DIRECTIVE" "$APACHE_CONF_FILE"; then
@@ -534,14 +523,14 @@ fi
 if grep -qF "$LISTEN_IPV4_DIRECTIVE" "$APACHE_CONF_FILE"; then needs_ipv4_listen=false; fi
 if grep -qF "$LISTEN_IPV6_DIRECTIVE" "$APACHE_CONF_FILE"; then needs_ipv6_listen=false; fi
 
-# Se ambas as diretivas específicas existem (ou foram adicionadas)
-# e a genérica 'Listen 80' ainda existe e não está comentada, comenta a genérica.
-if ! $needs_ipv4_listen && ! $needs_ipv6_listen ; then # Ambas específicas existem
-    if grep -qE "$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE" && ! grep -qE "^#.*$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE"; then
+if ! $needs_ipv4_listen && ! $needs_ipv6_listen ; then
+    # Usar -P para Perl-compatible regex se suportado, senão -E para extended.
+    # O objetivo é encontrar 'Listen 80' que não esteja comentado.
+    if grep -qE "$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE" && \
+       ! grep -qE "^[[:space:]]*#.*$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE"; then
         echo "INFO: Comentando diretiva genérica 'Listen 80' pois '$LISTEN_IPV4_DIRECTIVE' e '$LISTEN_IPV6_DIRECTIVE' estão presentes."
-        # Usar # como delimitador no sed para evitar problemas com /
-        # Comenta linhas que começam com "Listen" seguido por um ou mais espaços e "80"
-        sudo sed -i -E "s/^([ \t]*Listen[ \t]+80[ \t]*)$/#\1  # Comentado pois IPv4/IPv6 específicos foram adicionados\/verificados/" "$APACHE_CONF_FILE"
+        # CORREÇÃO APLICADA AQUI: Usando '|' como delimitador no sed.
+        sudo sed -i -E "s|^([[:space:]]*Listen[[:space:]]+80[[:space:]]*)$|#\1  # Script ${SCRIPT_VERSION}: Comentado pois IPv4/IPv6 específicos foram adicionados/verificados|" "$APACHE_CONF_FILE"
         config_changed_listen=true
     fi
 fi
@@ -551,9 +540,9 @@ if [ "$config_changed_listen" = true ]; then
 else
     echo "INFO: Nenhuma alteração necessária na configuração de Listen do Apache."
 fi
-# <<<< FIM DA MODIFICAÇÃO PARA LISTEN IPV4/IPV6 >>>>
 
-HTTPD_CONF="/etc/httpd/conf/httpd.conf" # Já definido acima, mas reafirmando para clareza da seção original
+# Configuração AllowOverride
+HTTPD_CONF="/etc/httpd/conf/httpd.conf" # Reafirmando, embora já definido
 if grep -q "<Directory \"${MOUNT_POINT}\">" "$HTTPD_CONF"; then
     if ! grep -A5 "<Directory \"${MOUNT_POINT}\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
         sudo sed -i "/<Directory \"${MOUNT_POINT//\//\\\/}\">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/" "$HTTPD_CONF" && echo "INFO: AllowOverride All definido para ${MOUNT_POINT}." || echo "WARN: Falha ao definir AllowOverride All para ${MOUNT_POINT}."
@@ -589,13 +578,13 @@ fi
 
 # --- Conclusão ---
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.7-mod6-ipv4ipv6fix) concluído com sucesso! ($(date)) ---"
+echo "INFO: --- Script WordPress Setup (Versão: ${SCRIPT_VERSION}) concluído com sucesso! ($(date)) ---"
 echo "INFO: WordPress configurado. Template de gerenciamento ativado por padrão."
 echo "INFO: Domínio de Produção (template criado): https://${WPDOMAIN}"
 echo "INFO: Domínio de Gerenciamento (ATIVO): https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
 echo "INFO: Para alternar para o modo de produção, use um Run Command para copiar/linkar"
 echo "INFO: $CONFIG_FILE_PROD_TEMPLATE para $ACTIVE_CONFIG_FILE e reiniciar o Apache (se necessário)."
-echo "INFO: Health Check: /healthcheck.php"
+echo "INFO: Health Check: ${MANAGEMENT_WPDOMAIN_EFFECTIVE}/healthcheck.php (ou ${WPDOMAIN}/healthcheck.php dependendo da config ativa)"
 echo "INFO: Log completo: ${LOG_FILE}"
 echo "INFO: =================================================="
 
