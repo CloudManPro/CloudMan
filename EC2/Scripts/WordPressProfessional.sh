@@ -492,7 +492,9 @@ echo "INFO: Configurando Apache..."
 APACHE_CONF_FILE="/etc/httpd/conf/httpd.conf"
 LISTEN_IPV4_DIRECTIVE="Listen 0.0.0.0:80"
 LISTEN_IPV6_DIRECTIVE="Listen [::]:80"
-LISTEN_GENERIC_REGEX="^Listen +80$"
+LISTEN_GENERIC_REGEX="^Listen +80$" # Usado para grep
+LISTEN_GENERIC_PATTERN_SED="^[[:space:]]*Listen[[:space:]]+80[[:space:]]*$" # Usado para sed (endereço)
+
 
 needs_ipv4_listen=true
 if grep -qF "$LISTEN_IPV4_DIRECTIVE" "$APACHE_CONF_FILE"; then
@@ -524,13 +526,15 @@ if grep -qF "$LISTEN_IPV4_DIRECTIVE" "$APACHE_CONF_FILE"; then needs_ipv4_listen
 if grep -qF "$LISTEN_IPV6_DIRECTIVE" "$APACHE_CONF_FILE"; then needs_ipv6_listen=false; fi
 
 if ! $needs_ipv4_listen && ! $needs_ipv6_listen ; then
-    # Usar -P para Perl-compatible regex se suportado, senão -E para extended.
-    # O objetivo é encontrar 'Listen 80' que não esteja comentado.
+    # Verifica se 'Listen 80' genérico existe E não está já comentado
     if grep -qE "$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE" && \
        ! grep -qE "^[[:space:]]*#.*$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE"; then
         echo "INFO: Comentando diretiva genérica 'Listen 80' pois '$LISTEN_IPV4_DIRECTIVE' e '$LISTEN_IPV6_DIRECTIVE' estão presentes."
-        # CORREÇÃO APLICADA AQUI: Usando '|' como delimitador no sed.
-        sudo sed -i -E "s|^([[:space:]]*Listen[[:space:]]+80[[:space:]]*)$|#\1  # Script ${SCRIPT_VERSION}: Comentado pois IPv4/IPv6 específicos foram adicionados/verificados|" "$APACHE_CONF_FILE"
+        
+        COMMENT_PREFIX="# Script ${SCRIPT_VERSION} (auto-commented): "
+        # Aplica o comentário apenas nas linhas que casam com o padrão de Listen 80 genérico
+        sudo sed -i -E "/${LISTEN_GENERIC_PATTERN_SED}/s|^|${COMMENT_PREFIX}|" "$APACHE_CONF_FILE"
+        
         config_changed_listen=true
     fi
 fi
