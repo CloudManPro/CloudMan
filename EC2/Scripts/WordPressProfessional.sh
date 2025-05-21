@@ -1,10 +1,11 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.7-mod6 (Baseado na v1.9.7-mod5, com wp-config-management.php como padrão)
+# Versão: 1.9.7-mod6-ipv4ipv6fix (Baseado na v1.9.7-mod6, com correção de Listen Apache)
 # DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2.
 # Cria templates wp-config-production.php e wp-config-management.php no EFS.
 # Ativa wp-config-management.php como o wp-config.php padrão.
 # A troca para o modo de produção deve ser feita externamente (ex: Run Command).
+# Garante que o Apache escute em IPv4 e IPv6 na porta 80.
 
 # --- BEGIN WAIT LOGIC FOR AMI INITIALIZATION ---
 # Esta seção foi removida/comentada porque este script é executado como user-data pelo cloud-init.
@@ -170,7 +171,7 @@ MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*
 # --- Redirecionamento de Logs ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7-mod6) ($(date)) ---" # MODIFICADO (versão)
+echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7-mod6-ipv4ipv6fix) ($(date)) ---"
 echo "INFO: Logging configurado para: ${LOG_FILE}"
 echo "INFO: =================================================="
 
@@ -264,14 +265,14 @@ mount_efs() {
 
         if [ -n "$efs_ap_id" ]; then
             echo "INFO: Usando Ponto de Acesso EFS: $efs_ap_id"
-            mount_source="$efs_id" 
+            mount_source="$efs_id"
             mount_options="tls,accesspoint=$efs_ap_id"
         else
             echo "INFO: Montando raiz do EFS File System (sem Ponto de Acesso específico)."
         fi
 
         local mount_attempts=3
-        local mount_timeout=20 
+        local mount_timeout=20
         local attempt_num=1
         while [ "$attempt_num" -le "$mount_attempts" ]; do
             echo "INFO: Tentativa de montagem $attempt_num/$mount_attempts para EFS ($mount_source) em '$mount_point' com opções '$mount_options'..."
@@ -294,7 +295,7 @@ mount_efs() {
             echo "INFO: Entrada EFS existente para ${mount_point} encontrada no /etc/fstab. Removendo para atualizar..."
             sudo sed -i "\# ${mount_point} efs#d" /etc/fstab
         fi
-        local fstab_mount_options="_netdev,${mount_options}" 
+        local fstab_mount_options="_netdev,${mount_options}"
         local fstab_entry="$mount_source $mount_point efs $fstab_mount_options 0 0"
         echo "$fstab_entry" | sudo tee -a /etc/fstab >/dev/null
         echo "INFO: Entrada adicionada ao /etc/fstab: '$fstab_entry'"
@@ -319,7 +320,7 @@ create_wp_config_template() {
 
     SAFE_DB_NAME=$(printf '%s\n' "$db_name" | sed -e 's/[\/&]/\\&/g' -e "s/'/\\'/g")
     SAFE_DB_USER=$(printf '%s\n' "$db_user" | sed -e 's/[\/&]/\\&/g' -e "s/'/\\'/g")
-    SAFE_DB_PASSWORD=$(printf '%s\n' "$db_password" | sed -e 's/[\/&]/\\&/g' -e "s/'/\\'/g") 
+    SAFE_DB_PASSWORD=$(printf '%s\n' "$db_password" | sed -e 's/[\/&]/\\&/g' -e "s/'/\\'/g")
     SAFE_DB_HOST=$(printf '%s\n' "$db_host" | sed -e 's/[\/&]/\\&/g' -e "s/'/\\'/g")
 
     sudo sed -i "s/database_name_here/$SAFE_DB_NAME/g" "$target_file"
@@ -402,12 +403,12 @@ if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || [ -z "$DB_PASSWORD" ] || [ "
     echo "ERRO: Falha ao extrair username ou password do JSON do segredo."
     exit 1
 fi
-DB_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1) 
+DB_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1)
 echo "INFO: Credenciais do banco de dados extraídas (Usuário: $DB_USER)."
 
 # --- Download e Extração do WordPress ---
 echo "INFO: Verificando se o WordPress já existe em '$MOUNT_POINT'..."
-if [ -d "$MOUNT_POINT/wp-includes" ] && [ -f "$MOUNT_POINT/wp-config-sample.php" ]; then 
+if [ -d "$MOUNT_POINT/wp-includes" ] && [ -f "$MOUNT_POINT/wp-config-sample.php" ]; then
     echo "WARN: Diretório 'wp-includes' e 'wp-config-sample.php' já encontrado em '$MOUNT_POINT'. Pulando download e extração do WordPress."
 else
     echo "INFO: WordPress não encontrado ou incompleto. Iniciando download e extração..."
@@ -442,7 +443,7 @@ fi
 
 # --- Configuração dos Templates wp-config ---
 if [ -f "$CONFIG_SAMPLE_ORIGINAL" ]; then
-    if [ ! -f "$CONFIG_FILE_PROD_TEMPLATE" ] || [ "$(sudo stat -c %s "$CONFIG_FILE_PROD_TEMPLATE")" -lt 100 ]; then 
+    if [ ! -f "$CONFIG_FILE_PROD_TEMPLATE" ] || [ "$(sudo stat -c %s "$CONFIG_FILE_PROD_TEMPLATE")" -lt 100 ]; then
         PRODUCTION_URL="https://${WPDOMAIN}"
         create_wp_config_template "$CONFIG_FILE_PROD_TEMPLATE" "$PRODUCTION_URL" "$PRODUCTION_URL" \
             "$AWS_DB_INSTANCE_TARGET_NAME_0" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
@@ -458,14 +459,13 @@ if [ -f "$CONFIG_SAMPLE_ORIGINAL" ]; then
         echo "WARN: Template $CONFIG_FILE_MGMT_TEMPLATE já existe e parece válido. Pulando criação."
     fi
 
-    # MODIFICADO: Agora tenta ativar o wp-config-management.php por padrão
     if [ ! -L "$ACTIVE_CONFIG_FILE" ] && [ ! -f "$ACTIVE_CONFIG_FILE" ] && [ -f "$CONFIG_FILE_MGMT_TEMPLATE" ]; then
-        echo "INFO: Ativando $CONFIG_FILE_MGMT_TEMPLATE como o $ACTIVE_CONFIG_FILE padrão." # MODIFICADO
-        sudo cp "$CONFIG_FILE_MGMT_TEMPLATE" "$ACTIVE_CONFIG_FILE" # MODIFICADO
+        echo "INFO: Ativando $CONFIG_FILE_MGMT_TEMPLATE como o $ACTIVE_CONFIG_FILE padrão."
+        sudo cp "$CONFIG_FILE_MGMT_TEMPLATE" "$ACTIVE_CONFIG_FILE"
     elif [ -f "$ACTIVE_CONFIG_FILE" ] || [ -L "$ACTIVE_CONFIG_FILE" ]; then
         echo "WARN: $ACTIVE_CONFIG_FILE já existe. Nenhuma alteração no arquivo ativo será feita por este script para manter o estado atual."
     else
-        echo "ERRO: $CONFIG_FILE_MGMT_TEMPLATE não pôde ser criado/encontrado para ativar como padrão." # MODIFICADO
+        echo "ERRO: $CONFIG_FILE_MGMT_TEMPLATE não pôde ser criado/encontrado para ativar como padrão."
     fi
 else
     echo "WARN: $CONFIG_SAMPLE_ORIGINAL não encontrado. Não é possível criar templates wp-config."
@@ -476,10 +476,10 @@ echo "INFO: Criando/Verificando arquivo de health check em '$HEALTH_CHECK_FILE_P
 sudo bash -c "cat > '$HEALTH_CHECK_FILE_PATH'" <<EOF
 <?php
 // Simple health check endpoint
-// Version: 1.9.7-mod6
+// Version: 1.9.7-mod6-ipv4ipv6fix
 http_response_code(200);
 header("Content-Type: text/plain; charset=utf-8");
-echo "OK - WordPress Health Check Endpoint - Script v1.9.7-mod6 - Timestamp: " . date("Y-m-d\TH:i:s\Z"); // MODIFICADO (versão)
+echo "OK - WordPress Health Check Endpoint - Script v1.9.7-mod6-ipv4ipv6fix - Timestamp: " . date("Y-m-d\TH:i:s\Z");
 exit;
 ?>
 EOF
@@ -498,14 +498,69 @@ echo "INFO: Permissões e propriedade ajustadas."
 
 # --- Configuração e Inicialização do Apache ---
 echo "INFO: Configurando Apache..."
-HTTPD_CONF="/etc/httpd/conf/httpd.conf"
+
+# <<<< INÍCIO DA MODIFICAÇÃO PARA LISTEN IPV4/IPV6 >>>>
+APACHE_CONF_FILE="/etc/httpd/conf/httpd.conf"
+LISTEN_IPV4_DIRECTIVE="Listen 0.0.0.0:80"
+LISTEN_IPV6_DIRECTIVE="Listen [::]:80"
+LISTEN_GENERIC_REGEX="^Listen +80$" # Regex para 'Listen 80' (com um ou mais espaços)
+
+needs_ipv4_listen=true
+if grep -qF "$LISTEN_IPV4_DIRECTIVE" "$APACHE_CONF_FILE"; then
+    needs_ipv4_listen=false
+    echo "INFO: Diretiva '$LISTEN_IPV4_DIRECTIVE' já existe no Apache."
+fi
+
+needs_ipv6_listen=true
+if grep -qF "$LISTEN_IPV6_DIRECTIVE" "$APACHE_CONF_FILE"; then
+    needs_ipv6_listen=false
+    echo "INFO: Diretiva '$LISTEN_IPV6_DIRECTIVE' já existe no Apache."
+fi
+
+config_changed_listen=false
+if [ "$needs_ipv4_listen" = true ]; then
+    echo "INFO: Adicionando '$LISTEN_IPV4_DIRECTIVE' ao Apache."
+    echo "$LISTEN_IPV4_DIRECTIVE" | sudo tee -a "$APACHE_CONF_FILE" > /dev/null
+    config_changed_listen=true
+fi
+
+if [ "$needs_ipv6_listen" = true ]; then
+    echo "INFO: Adicionando '$LISTEN_IPV6_DIRECTIVE' ao Apache."
+    echo "$LISTEN_IPV6_DIRECTIVE" | sudo tee -a "$APACHE_CONF_FILE" > /dev/null
+    config_changed_listen=true
+fi
+
+# Atualiza flags após possíveis adições
+if grep -qF "$LISTEN_IPV4_DIRECTIVE" "$APACHE_CONF_FILE"; then needs_ipv4_listen=false; fi
+if grep -qF "$LISTEN_IPV6_DIRECTIVE" "$APACHE_CONF_FILE"; then needs_ipv6_listen=false; fi
+
+# Se ambas as diretivas específicas existem (ou foram adicionadas)
+# e a genérica 'Listen 80' ainda existe e não está comentada, comenta a genérica.
+if ! $needs_ipv4_listen && ! $needs_ipv6_listen ; then # Ambas específicas existem
+    if grep -qE "$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE" && ! grep -qE "^#.*$LISTEN_GENERIC_REGEX" "$APACHE_CONF_FILE"; then
+        echo "INFO: Comentando diretiva genérica 'Listen 80' pois '$LISTEN_IPV4_DIRECTIVE' e '$LISTEN_IPV6_DIRECTIVE' estão presentes."
+        # Usar # como delimitador no sed para evitar problemas com /
+        # Comenta linhas que começam com "Listen" seguido por um ou mais espaços e "80"
+        sudo sed -i -E "s/^([ \t]*Listen[ \t]+80[ \t]*)$/#\1  # Comentado pois IPv4/IPv6 específicos foram adicionados\/verificados/" "$APACHE_CONF_FILE"
+        config_changed_listen=true
+    fi
+fi
+
+if [ "$config_changed_listen" = true ]; then
+    echo "INFO: Configuração de Listen do Apache modificada."
+else
+    echo "INFO: Nenhuma alteração necessária na configuração de Listen do Apache."
+fi
+# <<<< FIM DA MODIFICAÇÃO PARA LISTEN IPV4/IPV6 >>>>
+
+HTTPD_CONF="/etc/httpd/conf/httpd.conf" # Já definido acima, mas reafirmando para clareza da seção original
 if grep -q "<Directory \"${MOUNT_POINT}\">" "$HTTPD_CONF"; then
     if ! grep -A5 "<Directory \"${MOUNT_POINT}\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
         sudo sed -i "/<Directory \"${MOUNT_POINT//\//\\\/}\">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/" "$HTTPD_CONF" && echo "INFO: AllowOverride All definido para ${MOUNT_POINT}." || echo "WARN: Falha ao definir AllowOverride All para ${MOUNT_POINT}."
     else
         echo "INFO: AllowOverride All já parece OK para ${MOUNT_POINT}."
     fi
-elif grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF" && [ "$MOUNT_POINT" = "/var/www/html" ]; then 
+elif grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF" && [ "$MOUNT_POINT" = "/var/www/html" ]; then
      if ! grep -A5 "<Directory \"/var/www/html\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
         sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF" && echo "INFO: AllowOverride All definido para /var/www/html." || echo "WARN: Falha ao definir AllowOverride All para /var/www/html."
     else
@@ -524,7 +579,7 @@ if ! sudo systemctl restart httpd; then
     sudo tail -n 30 /var/log/httpd/error_log
     exit 1
 fi
-sleep 3 
+sleep 3
 if systemctl is-active --quiet httpd; then echo "INFO: Serviço httpd está ativo."; else
     echo "ERRO CRÍTICO: httpd não está ativo pós-restart."
     echo "Últimas linhas do log de erro do Apache:"
@@ -534,12 +589,12 @@ fi
 
 # --- Conclusão ---
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.7-mod6) concluído com sucesso! ($(date)) ---" # MODIFICADO (versão)
-echo "INFO: WordPress configurado. Template de gerenciamento ativado por padrão." # AJUSTADO
-echo "INFO: Domínio de Produção (template criado): https://${WPDOMAIN}" # AJUSTADO
-echo "INFO: Domínio de Gerenciamento (ATIVO): https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}" # AJUSTADO
-echo "INFO: Para alternar para o modo de produção, use um Run Command para copiar/linkar" # AJUSTADO
-echo "INFO: $CONFIG_FILE_PROD_TEMPLATE para $ACTIVE_CONFIG_FILE e reiniciar o Apache (se necessário)." # AJUSTADO
+echo "INFO: --- Script WordPress Setup (v1.9.7-mod6-ipv4ipv6fix) concluído com sucesso! ($(date)) ---"
+echo "INFO: WordPress configurado. Template de gerenciamento ativado por padrão."
+echo "INFO: Domínio de Produção (template criado): https://${WPDOMAIN}"
+echo "INFO: Domínio de Gerenciamento (ATIVO): https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
+echo "INFO: Para alternar para o modo de produção, use um Run Command para copiar/linkar"
+echo "INFO: $CONFIG_FILE_PROD_TEMPLATE para $ACTIVE_CONFIG_FILE e reiniciar o Apache (se necessário)."
 echo "INFO: Health Check: /healthcheck.php"
 echo "INFO: Log completo: ${LOG_FILE}"
 echo "INFO: =================================================="
