@@ -1,6 +1,6 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.7 (Baseado na v1.9.6, com templates wp-config-production e wp-config-management)
+# Versão: 1.9.7-mod1 (Baseado na v1.9.7, com logging de pai do yum e espera ajustada)
 # DESCRIÇÃO: Instala e configura WordPress em Amazon Linux 2.
 # Cria templates wp-config-production.php e wp-config-management.php no EFS.
 # Ativa wp-config-production.php como o wp-config.php padrão.
@@ -28,30 +28,90 @@ fi
 
 # --- BEGIN YUM WAIT LOGIC ---
 echo "INFO: Performing check and wait for yum to be free... ($(date))"
-MAX_YUM_WAIT_ITERATIONS=60
+MAX_YUM_WAIT_ITERATIONS=60 # 60 iterações
+YUM_WAIT_INTERVAL=30       # 30 segundos por iteração (Total: 30 minutos)
 CURRENT_YUM_WAIT_ITERATION=0
+
 while [ -f /var/run/yum.pid ]; do
   if [ "$CURRENT_YUM_WAIT_ITERATION" -ge "$MAX_YUM_WAIT_ITERATIONS" ]; then
     YUM_PID_CONTENT=$(cat /var/run/yum.pid 2>/dev/null || echo 'unknown')
-    echo "ERROR: Yum still locked (PID: $YUM_PID_CONTENT) after extended waiting. Aborting. ($(date))"
+    echo "ERROR: Yum still locked by /var/run/yum.pid (PID: $YUM_PID_CONTENT) after extended waiting. Aborting. ($(date))"
+    # Tenta logar informações sobre o processo bloqueador antes de sair
+    if [ "$YUM_PID_CONTENT" != "unknown" ] && kill -0 "$YUM_PID_CONTENT" 2>/dev/null; then
+        echo "INFO: Details for locking yum process $YUM_PID_CONTENT (from yum.pid) before aborting:"
+        ps -f -p "$YUM_PID_CONTENT" || echo "WARN: ps -f -p $YUM_PID_CONTENT failed."
+        PARENT_PID_OF_LOCKER=$(ps -o ppid= -p "$YUM_PID_CONTENT" 2>/dev/null)
+        if [ -n "$PARENT_PID_OF_LOCKER" ]; then
+            echo "INFO: Parent of locking process $YUM_PID_CONTENT is PPID: $PARENT_PID_OF_LOCKER. Details:"
+            ps -f -p "$PARENT_PID_OF_LOCKER" || echo "WARN: ps -f -p $PARENT_PID_OF_LOCKER failed."
+        else
+            echo "WARN: Could not determine parent of locking process $YUM_PID_CONTENT."
+        fi
+    fi
     exit 1
   fi
   YUM_PID_CONTENT=$(cat /var/run/yum.pid 2>/dev/null || echo 'unknown')
-  echo "INFO: Yum is busy (PID: $YUM_PID_CONTENT). Waiting... (attempt $((CURRENT_YUM_WAIT_ITERATION+1))/$MAX_YUM_WAIT_ITERATIONS, $(date))"
-  sleep 10
+  echo "INFO: Yum is busy (PID from /var/run/yum.pid: $YUM_PID_CONTENT). Waiting... (attempt $((CURRENT_YUM_WAIT_ITERATION+1))/$MAX_YUM_WAIT_ITERATIONS, $(date))"
+  
+  # Loga informações sobre o processo que detém o /var/run/yum.pid
+  if [ "$YUM_PID_CONTENT" != "unknown" ] && kill -0 "$YUM_PID_CONTENT" 2>/dev/null; then # Verifica se o PID de yum.pid existe
+      echo "INFO: Details for yum process $YUM_PID_CONTENT (from yum.pid) holding the lock:"
+      ps -f -p "$YUM_PID_CONTENT" || echo "WARN: ps -f -p $YUM_PID_CONTENT failed during wait."
+      PARENT_PID_OF_LOCKER=$(ps -o ppid= -p "$YUM_PID_CONTENT" 2>/dev/null)
+      if [ -n "$PARENT_PID_OF_LOCKER" ]; then
+          echo "INFO: Parent of $YUM_PID_CONTENT is PPID: $PARENT_PID_OF_LOCKER. Details:"
+          ps -f -p "$PARENT_PID_OF_LOCKER" || echo "WARN: ps -f -p $PARENT_PID_OF_LOCKER failed during wait."
+      else
+          echo "WARN: Could not determine parent of $YUM_PID_CONTENT during wait."
+      fi
+  else
+      echo "WARN: PID $YUM_PID_CONTENT from /var/run/yum.pid does not seem to be a running process, or yum.pid is empty/unreadable."
+  fi
+
+  sleep "$YUM_WAIT_INTERVAL"
   CURRENT_YUM_WAIT_ITERATION=$((CURRENT_YUM_WAIT_ITERATION + 1))
 done
-PGREP_YUM_CHECKS=12
+
+# Adicionalmente, verificar com pgrep, pois yum.pid pode ter sido removido mas o processo ainda existir
+PGREP_YUM_CHECKS=12 
+PGREP_YUM_INTERVAL=10 # Intervalo para verificações pgrep
 for i in $(seq 1 "$PGREP_YUM_CHECKS"); do
-    if ! pgrep -x yum > /dev/null; then
+    YUM_PIDS_PGREP=$(pgrep -x yum)
+    if [ -z "$YUM_PIDS_PGREP" ]; then 
         echo "INFO: No 'yum' process found by pgrep. ($(date))"
-        break
+        break 
     else
-        echo "INFO: 'yum' process still detected by pgrep. Waiting (pgrep check $i/$PGREP_YUM_CHECKS, $(date))..."
-        sleep 10
+        echo "INFO: 'yum' process(es) still detected by pgrep. PIDs: $YUM_PIDS_PGREP. Waiting (pgrep check $i/$PGREP_YUM_CHECKS, $(date))..."
+        for YUM_PID_SINGLE in $YUM_PIDS_PGREP; do
+            echo "INFO: Details for pgrep-found yum process $YUM_PID_SINGLE:"
+            ps -f -p "$YUM_PID_SINGLE" || echo "WARN: ps -f -p $YUM_PID_SINGLE (pgrep) failed."
+            PARENT_PID_OF_PGREP_YUM=$(ps -o ppid= -p "$YUM_PID_SINGLE" 2>/dev/null)
+            if [ -n "$PARENT_PID_OF_PGREP_YUM" ]; then
+                echo "INFO: Parent of pgrep-found $YUM_PID_SINGLE is PPID: $PARENT_PID_OF_PGREP_YUM. Details:"
+                ps -f -p "$PARENT_PID_OF_PGREP_YUM" || echo "WARN: ps -f -p $PARENT_PID_OF_PGREP_YUM (pgrep parent) failed."
+            else
+                echo "WARN: Could not determine parent of pgrep-found $YUM_PID_SINGLE."
+            fi
+        done
+        sleep "$PGREP_YUM_INTERVAL"
     fi
+
     if [ "$i" -eq "$PGREP_YUM_CHECKS" ]; then
-        echo "ERROR: 'yum' process still running after pgrep checks. Aborting. ($(date))"
+        YUM_PIDS_PGREP_FINAL=$(pgrep -x yum) 
+        echo "ERROR: 'yum' process(es) (PIDs: $YUM_PIDS_PGREP_FINAL) still running after pgrep checks. Aborting. ($(date))"
+        if [ -n "$YUM_PIDS_PGREP_FINAL" ]; then
+            for YUM_PID_FINAL_PGREP in $YUM_PIDS_PGREP_FINAL; do
+                 echo "INFO: Final details for pgrep-found yum process $YUM_PID_FINAL_PGREP before aborting:"
+                 ps -f -p "$YUM_PID_FINAL_PGREP" || echo "WARN: ps -f -p $YUM_PID_FINAL_PGREP (pgrep final) failed."
+                 PARENT_PID_OF_FINAL_PGREP=$(ps -o ppid= -p "$YUM_PID_FINAL_PGREP" 2>/dev/null)
+                 if [ -n "$PARENT_PID_OF_FINAL_PGREP" ]; then
+                    echo "INFO: Parent of final pgrep-found $YUM_PID_FINAL_PGREP is PPID: $PARENT_PID_OF_FINAL_PGREP. Details:"
+                    ps -f -p "$PARENT_PID_OF_FINAL_PGREP" || echo "WARN: ps -f -p $PARENT_PID_OF_FINAL_PGREP (pgrep final parent) failed."
+                 else
+                    echo "WARN: Could not determine parent of final pgrep-found $YUM_PID_FINAL_PGREP."
+                 fi
+            done
+        fi
         exit 1
     fi
 done
@@ -81,7 +141,7 @@ MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*
 # --- Redirecionamento de Logs ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7-mod1) ($(date)) ---"
 echo "INFO: Logging configurado para: ${LOG_FILE}"
 echo "INFO: =================================================="
 
@@ -108,24 +168,33 @@ fi
 essential_vars=(
     "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"
     "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"
+    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" # Modificado para verificar o NOME, já que o ARN é construído
     "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"
     "AWS_DB_INSTANCE_TARGET_NAME_0"
     "WPDOMAIN"
     "ACCOUNT"
-    "MANAGEMENT_WPDOMAIN"
+    # "MANAGEMENT_WPDOMAIN" # Removido da lista de essenciais, pois tem fallback
 )
 error_found=0
 for var_name in "${essential_vars[@]}"; do
     current_var_value="${!var_name:-}"
     var_to_check_name="$var_name"
-    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT" ]; then
-        var_to_check_name="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (ou seus componentes REGION, ACCOUNT, NAME)"
+    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then
+        # A verificação principal agora é se o ARN_0_BUILT foi bem sucedido
+        # e se o ARN_0 fornecido externamente (se houver) também é válido.
         if [ -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT" ] && [ -z "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-}" ]; then
-             echo "ERRO: Variável de ambiente essencial '$var_to_check_name' não definida ou vazia."
+             echo "ERRO: Variável de ambiente essencial AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (ou seus componentes REGION, ACCOUNT, NAME) não definida ou vazia."
              error_found=1
         elif [ -n "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT" ]; then
+            # Prioriza o ARN construído se os componentes foram fornecidos
             export AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0_BUILT"
+            echo "INFO: AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 construído e definido como: $AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"
+        elif [ -z "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-}" ]; then
+            # Caso raro: ARN_0_BUILT falhou E ARN_0 não foi fornecido
+            echo "ERRO: AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 não pôde ser construído e não foi fornecido diretamente."
+            error_found=1
+        else
+            echo "INFO: Usando AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 fornecido diretamente: ${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0}"
         fi
     elif [ -z "$current_var_value" ]; then
         echo "ERRO: Variável de ambiente essencial '$var_to_check_name' não definida ou vazia."
@@ -141,10 +210,6 @@ fi
 # Tratar MANAGEMENT_WPDOMAIN
 if [ -z "${MANAGEMENT_WPDOMAIN:-}" ]; then
     echo "WARN: MANAGEMENT_WPDOMAIN não definido. O template wp-config-management.php usará um placeholder 'management.example.com'."
-    # Você pode tentar construir um a partir de WPDOMAIN se houver um padrão, ex:
-    # management_domain_part="management."
-    # base_domain_part="${WPDOMAIN#wp.}" # Remove "wp." do início, se existir
-    # export MANAGEMENT_WPDOMAIN_EFFECTIVE="${management_domain_part}${base_domain_part}"
     export MANAGEMENT_WPDOMAIN_EFFECTIVE="management.example.com" # Placeholder
 else
     export MANAGEMENT_WPDOMAIN_EFFECTIVE="${MANAGEMENT_WPDOMAIN}"
@@ -158,10 +223,10 @@ echo "INFO: Verificação de variáveis essenciais concluída."
 mount_efs() {
     local efs_id=$1
     local mount_point=$2
-    local efs_ap_id="${EFS_ACCESS_POINT_ID:-}"
+    local efs_ap_id="${EFS_ACCESS_POINT_ID:-}" # Assume que EFS_ACCESS_POINT_ID pode ser uma variável de ambiente
 
     echo "INFO: Verificando se o ponto de montagem '$mount_point' existe..."
-    sudo mkdir -p "$mount_point" # Garante que o diretório exista
+    sudo mkdir -p "$mount_point"
     
     echo "INFO: Verificando se '$mount_point' já está montado..."
     if mount | grep -q "on ${mount_point} type efs"; then
@@ -173,7 +238,7 @@ mount_efs() {
 
         if [ -n "$efs_ap_id" ]; then
             echo "INFO: Usando Ponto de Acesso EFS: $efs_ap_id"
-            mount_source="$efs_id" # Sem ":/" para AP
+            mount_source="$efs_id" 
             mount_options="tls,accesspoint=$efs_ap_id"
         else
             echo "INFO: Montando raiz do EFS File System (sem Ponto de Acesso específico)."
@@ -205,7 +270,6 @@ mount_efs() {
     fi
 }
 
-# Função para criar um template wp-config.php
 create_wp_config_template() {
     local target_file="$1"
     local wp_home_url="$2"
@@ -222,11 +286,10 @@ create_wp_config_template() {
     fi
     sudo cp "$CONFIG_SAMPLE_ORIGINAL" "$target_file"
 
-    # Sanitize inputs for sed
-    SAFE_DB_NAME=$(echo "$db_name" | sed -e 's/[&\\/]/\\&/g')
-    SAFE_DB_USER=$(echo "$db_user" | sed -e 's/[&\\/]/\\&/g')
-    SAFE_DB_PASSWORD=$(echo "$db_password" | sed -e 's/[&\\/]/\\&/g')
-    SAFE_DB_HOST=$(echo "$db_host" | sed -e 's/[&\\/]/\\&/g')
+    SAFE_DB_NAME=$(echo "$db_name" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
+    SAFE_DB_USER=$(echo "$db_user" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
+    SAFE_DB_PASSWORD=$(echo "$db_password" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
+    SAFE_DB_HOST=$(echo "$db_host" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
 
     sudo sed -i "s/database_name_here/$SAFE_DB_NAME/g" "$target_file"
     sudo sed -i "s/username_here/$SAFE_DB_USER/g" "$target_file"
@@ -236,7 +299,6 @@ create_wp_config_template() {
     echo "INFO: Obtendo e configurando SALTS em $target_file..."
     SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
     if [ -z "$SALT" ]; then echo "ERRO: Falha ao obter SALTS para $target_file."; else
-        # Remove existing salt definitions more robustly
         sudo sed -i "/^define( *'AUTH_KEY'/d" "$target_file"
         sudo sed -i "/^define( *'SECURE_AUTH_KEY'/d" "$target_file"
         sudo sed -i "/^define( *'LOGGED_IN_KEY'/d" "$target_file"
@@ -248,7 +310,6 @@ create_wp_config_template() {
         
         TEMP_SALT_FILE=$(mktemp)
         echo "$SALT" > "$TEMP_SALT_FILE"
-        # Insert salts before the "That's all" marker
         if sudo grep -q "$MARKER_LINE_SED_PATTERN" "$target_file"; then
             sudo sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE" "$target_file"
         else
@@ -259,14 +320,13 @@ create_wp_config_template() {
         echo "INFO: SALTS configurados em $target_file."
     fi
     
-    # Adicionar WP_HOME, WP_SITEURL e FS_METHOD
     PHP_DEFINES_BLOCK=$(cat <<EOF
 
 define('WP_HOME', '$wp_home_url');
 define('WP_SITEURL', '$wp_site_url');
 define('FS_METHOD', 'direct');
 
-// Garantir HTTPS se X-Forwarded-Proto estiver presente (importante para CloudFront)
+// Garantir HTTPS se X-Forwarded-Proto estiver presente
 if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
     \$_SERVER['HTTPS'] = 'on';
 }
@@ -274,7 +334,6 @@ EOF
 )
     TEMP_DEFINES_FILE=$(mktemp)
     echo "$PHP_DEFINES_BLOCK" > "$TEMP_DEFINES_FILE"
-    # Inserir defines antes do marcador "That's all"
     if sudo grep -q "$MARKER_LINE_SED_PATTERN" "$target_file"; then
         sudo sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE" "$target_file"
     else
@@ -316,7 +375,6 @@ echo "INFO: Credenciais do banco de dados extraídas (Usuário: $DB_USER)."
 
 # --- Download e Extração do WordPress ---
 echo "INFO: Verificando se o WordPress já existe em '$MOUNT_POINT'..."
-# Verifica se wp-includes existe, que é mais fundamental que wp-config.php para uma instalação.
 if [ -d "$MOUNT_POINT/wp-includes" ]; then
     echo "WARN: Diretório 'wp-includes' já encontrado em '$MOUNT_POINT'. Pulando download e extração do WordPress."
 else
@@ -335,7 +393,6 @@ else
 fi
 
 # --- Configuração dos Templates wp-config ---
-# Só criar os templates se o wp-config-sample.php existir E os templates ainda não existirem
 if [ -f "$CONFIG_SAMPLE_ORIGINAL" ]; then
     if [ ! -f "$CONFIG_FILE_PROD_TEMPLATE" ]; then
         PRODUCTION_URL="https://${WPDOMAIN}"
@@ -353,11 +410,9 @@ if [ -f "$CONFIG_SAMPLE_ORIGINAL" ]; then
         echo "WARN: Template $CONFIG_FILE_MGMT_TEMPLATE já existe. Pulando criação."
     fi
 
-    # Ativar o config de produção por padrão, se o wp-config.php ativo não existir
     if [ ! -f "$ACTIVE_CONFIG_FILE" ] && [ -f "$CONFIG_FILE_PROD_TEMPLATE" ]; then
         echo "INFO: Ativando $CONFIG_FILE_PROD_TEMPLATE como o $ACTIVE_CONFIG_FILE padrão."
         sudo cp "$CONFIG_FILE_PROD_TEMPLATE" "$ACTIVE_CONFIG_FILE"
-        # Ou link simbólico: sudo ln -sf "$CONFIG_FILE_PROD_TEMPLATE" "$ACTIVE_CONFIG_FILE"
     elif [ -f "$ACTIVE_CONFIG_FILE" ]; then
         echo "WARN: $ACTIVE_CONFIG_FILE já existe. Nenhuma alteração no arquivo ativo será feita por este script."
     else
@@ -368,31 +423,29 @@ else
 fi
 
 
-# <<<--- INÍCIO: Adicionar Arquivo de Health Check --->>>
+# --- Adicionar Arquivo de Health Check ---
 echo "INFO: Criando/Verificando arquivo de health check em '$HEALTH_CHECK_FILE_PATH'..."
 sudo bash -c "cat > '$HEALTH_CHECK_FILE_PATH'" <<EOF
 <?php
 // Simple health check endpoint
-// Version: 1.9.7
+// Version: 1.9.7-mod1
 http_response_code(200);
 header("Content-Type: text/plain; charset=utf-8");
-echo "OK - WordPress Health Check Endpoint - Script v1.9.7 - Timestamp: " . date("Y-m-d\TH:i:s\Z");
+echo "OK - WordPress Health Check Endpoint - Script v1.9.7-mod1 - Timestamp: " . date("Y-m-d\TH:i:s\Z");
 exit;
 ?>
 EOF
 if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then echo "INFO: Arquivo de health check criado/atualizado."; else echo "ERRO: Falha ao criar/atualizar health check."; fi
-# <<<--- FIM: Adicionar Arquivo de Health Check --->>>
 
 # --- Ajustes de Permissões e Propriedade ---
 echo "INFO: Ajustando permissões e propriedade em '$MOUNT_POINT'..."
 sudo chown -R apache:apache "$MOUNT_POINT"
 sudo find "$MOUNT_POINT" -type d -exec chmod 755 {} \;
 sudo find "$MOUNT_POINT" -type f -exec chmod 644 {} \;
-# Permissões mais restritas para os arquivos de config
 if [ -f "$ACTIVE_CONFIG_FILE" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE"; fi
 if [ -f "$CONFIG_FILE_PROD_TEMPLATE" ]; then sudo chmod 640 "$CONFIG_FILE_PROD_TEMPLATE"; fi
 if [ -f "$CONFIG_FILE_MGMT_TEMPLATE" ]; then sudo chmod 640 "$CONFIG_FILE_MGMT_TEMPLATE"; fi
-if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH"; fi # Health check pode ser 644
+if [ -f "$HEALTH_CHECK_FILE_PATH" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH"; fi
 echo "INFO: Permissões e propriedade ajustadas."
 
 # --- Configuração e Inicialização do Apache ---
@@ -410,7 +463,7 @@ if ! sudo systemctl restart httpd; then
     sudo tail -n 30 /var/log/httpd/error_log
     exit 1;
 fi
-sleep 3 # Pequena pausa para o serviço estabilizar
+sleep 3 
 if systemctl is-active --quiet httpd; then echo "INFO: Serviço httpd está ativo."; else
     echo "ERRO CRÍTICO: httpd não está ativo pós-restart."
     sudo tail -n 30 /var/log/httpd/error_log
@@ -419,7 +472,7 @@ fi
 
 # --- Conclusão ---
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.7) concluído com sucesso! ($(date)) ---"
+echo "INFO: --- Script WordPress Setup (v1.9.7-mod1) concluído com sucesso! ($(date)) ---"
 echo "INFO: WordPress configurado. Template de produção ativado por padrão."
 echo "INFO: Domínio de Produção: https://${WPDOMAIN}"
 echo "INFO: Domínio de Gerenciamento (template criado): https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
