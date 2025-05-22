@@ -1,6 +1,6 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.7-mod6 (Foco na cópia para EFS com UID do AP e correção de temp files)
+# Versão: 1.9.7-mod7 (URLs dinâmicas com fallback para WPDOMAIN)
 
 # --- Variáveis Essenciais ---
 essential_vars=(
@@ -11,7 +11,7 @@ essential_vars=(
     "AWS_DB_INSTANCE_TARGET_NAME_0"
     "WPDOMAIN"
     "ACCOUNT"
-    "AWS_EFS_ACCESS_POINT_TARGET_ID_0" # Adicionado para clareza
+    "AWS_EFS_ACCESS_POINT_TARGET_ID_0"
 )
 echo "Nomes das variáveis em essential_vars:"
 printf "%s\n" "${essential_vars[@]}"
@@ -25,30 +25,28 @@ set -e
 # --- Variáveis ---
 LOG_FILE="/var/log/wordpress_setup.log"
 MOUNT_POINT="/var/www/html"
-WP_DOWNLOAD_DIR="/tmp/wp_download_temp"          # Diretório para download e extração inicial
-WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content" # Diretório para preparar conteúdo antes de copiar para EFS
+WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
+WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
 
 ACTIVE_CONFIG_FILE_EFS="$MOUNT_POINT/wp-config.php"
 CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
-# CONFIG_FILE_PROD_TEMPLATE_EFS e CONFIG_FILE_MGMT_TEMPLATE_EFS foram removidos conforme solicitado.
 
 HEALTH_CHECK_FILE_PATH_EFS="$MOUNT_POINT/healthcheck.php"
 
 MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"
 MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
 
-EFS_OWNER_UID=1000        # UID do posix_user e creation_info.owner_uid do AP
-EFS_OWNER_USER="ec2-user" # Usuário na instância que corresponde ao EFS_OWNER_UID
+EFS_OWNER_UID=1000
+EFS_OWNER_USER="ec2-user"
 
 # --- Redirecionamento de Logs ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7-mod6) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7-mod7) ($(date)) ---"
 echo "INFO: Logging configurado para: ${LOG_FILE}"
 echo "INFO: =================================================="
 
 # --- Verificação de Variáveis de Ambiente Essenciais ---
-# (Mantida como na v1.9.7-mod5)
 echo "INFO: Verificando variáveis de ambiente essenciais..."
 if [ -z "${ACCOUNT:-}" ]; then
     echo "INFO: ACCOUNT ID não fornecido, tentando obter via AWS STS..."
@@ -59,9 +57,9 @@ if [ -z "${ACCOUNT:-}" ]; then
         echo "INFO: ACCOUNT ID obtido: $ACCOUNT"
     fi
 fi
-if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ] &&
-    [ -n "${ACCOUNT:-}" ] &&
-    [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then
+if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ] && \
+   [ -n "${ACCOUNT:-}" ] && \
+   [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then
     AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
 else
     AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
@@ -71,7 +69,6 @@ for var_name in "${essential_vars[@]}"; do
     current_var_value="${!var_name:-}"
     if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then
         if [ -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" ] && [ -z "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-}" ]; then error_found=1; fi
-        # (Resto da lógica de verificação do ARN do Secret)
     elif [ -z "$current_var_value" ]; then
         echo "ERRO: Variável de ambiente essencial '$var_name' não definida ou vazia."
         error_found=1
@@ -81,9 +78,10 @@ if [ "$error_found" -eq 1 ]; then
     echo "ERRO: Uma ou mais variáveis essenciais estão faltando. Abortando."
     exit 1
 fi
+# MANAGEMENT_WPDOMAIN não é mais usado para wp-config, mas pode ser útil para outras coisas.
 if [ -z "${MANAGEMENT_WPDOMAIN:-}" ]; then export MANAGEMENT_WPDOMAIN_EFFECTIVE="management.example.com"; else export MANAGEMENT_WPDOMAIN_EFFECTIVE="${MANAGEMENT_WPDOMAIN}"; fi
 echo "INFO: Domínio de Produção (WPDOMAIN): ${WPDOMAIN}"
-echo "INFO: Domínio de Gerenciamento (MANAGEMENT_WPDOMAIN_EFFECTIVE): ${MANAGEMENT_WPDOMAIN_EFFECTIVE}" # Esta variável pode ser usada para outros fins (ex: DNS)
+echo "INFO: Domínio de Gerenciamento (informativo): ${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
 echo "INFO: Verificação de variáveis essenciais concluída."
 
 # --- Funções Auxiliares ---
@@ -96,18 +94,18 @@ mount_efs() {
     if mount | grep -q "on ${mount_point_arg} type efs"; then
         echo "INFO: EFS já está montado em '$mount_point_arg'."
     else
-        sudo mkdir -p "$mount_point_arg" # Criar o ponto de montagem local se não existir
+        sudo mkdir -p "$mount_point_arg"
         echo "INFO: Montando EFS '$efs_id' em '$mount_point_arg' via AP '$efs_ap_id'..."
         local mount_options="tls,accesspoint=$efs_ap_id"
-        local mount_source="$efs_id" # Para AP, não precisa do :/
+        local mount_source="$efs_id"
 
         if sudo timeout 30 mount -t efs -o "$mount_options" "$mount_source" "$mount_point_arg"; then
             echo "INFO: EFS montado com sucesso em '$mount_point_arg'."
         else
             echo "ERRO CRÍTICO: Falha ao montar EFS. Verifique logs do sistema, conectividade e config do AP."
+            # Adicionar mais debug se necessário aqui
             exit 1
         fi
-        # Adicionar ao fstab (opcional se a instância for efêmera, mas bom para robustez)
         if ! grep -q "${mount_point_arg} efs" /etc/fstab; then
             local fstab_mount_options="_netdev,${mount_options}"
             local fstab_entry="$mount_source $mount_point_arg efs $fstab_mount_options 0 0"
@@ -118,24 +116,24 @@ mount_efs() {
 }
 
 create_wp_config_template() {
-    local target_file_on_efs="$1" # Será $ACTIVE_CONFIG_FILE_EFS
-    local wp_home_url="$2"
-    local wp_site_url="$3"
-    local db_name="$4"
-    local db_user="$5"
-    local db_password="$6"
-    local db_host="$7"
+    local target_file_on_efs="$1"
+    local primary_wpdomain_for_fallback="$2" # Recebe o valor de WPDOMAIN
+    local db_name="$3"
+    local db_user="$4"
+    local db_password="$5"
+    local db_host="$6"
     local temp_config_file
     temp_config_file=$(mktemp /tmp/wp-config.XXXXXX.php)
     sudo chmod 644 "$temp_config_file"
     trap 'rm -f "$temp_config_file"' RETURN
-    echo "INFO: Criando configuração em '$temp_config_file' para EFS '$target_file_on_efs', URL: $wp_home_url"
+
+    echo "INFO: Criando configuração em '$temp_config_file' para EFS '$target_file_on_efs', com URLs dinâmicas (fallback para: $primary_wpdomain_for_fallback)"
     if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then
         echo "ERRO: '$CONFIG_SAMPLE_ON_EFS' não encontrado. WP foi copiado?"
         exit 1
     fi
     sudo cp "$CONFIG_SAMPLE_ON_EFS" "$temp_config_file"
-    # (Lógica de sed para DB e SALTS como na v1.9.7-mod5, com chmod 644 nos mktemps internos)
+
     SAFE_DB_NAME=$(echo "$db_name" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
     SAFE_DB_USER=$(echo "$db_user" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
     SAFE_DB_PASSWORD=$(echo "$db_password" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
@@ -144,6 +142,7 @@ create_wp_config_template() {
     sed -i "s/username_here/$SAFE_DB_USER/g" "$temp_config_file"
     sed -i "s/password_here/$SAFE_DB_PASSWORD/g" "$temp_config_file"
     sed -i "s/localhost/$SAFE_DB_HOST/g" "$temp_config_file"
+
     SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
     if [ -n "$SALT" ]; then
         TEMP_SALT_FILE_INNER=$(mktemp /tmp/salts.XXXXXX)
@@ -161,17 +160,59 @@ create_wp_config_template() {
         rm -f "$TEMP_SALT_FILE_INNER"
         echo "INFO: SALTS configurados."
     else echo "ERRO: Falha ao obter SALTS."; fi
-    PHP_DEFINES_BLOCK="define('WP_HOME', '$wp_home_url');\ndefine('WP_SITEURL', '$wp_site_url');\ndefine('FS_METHOD', 'direct');\nif (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {\n    \$_SERVER['HTTPS'] = 'on';\n}"
+
+    PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
+// --- Dynamic WordPress URL configuration ---
+// Determine Scheme
+if (!empty(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https') {
+    \$_SERVER['HTTPS'] = 'on';
+    \$site_scheme = 'https';
+} elseif (!empty(\$_SERVER['HTTPS']) && \$_SERVER['HTTPS'] !== 'off') {
+    \$site_scheme = 'https';
+} elseif (isset(\$_SERVER['SERVER_PORT']) && \$_SERVER['SERVER_PORT'] == 443) {
+    \$site_scheme = 'https';
+} else {
+    \$site_scheme = 'http';
+}
+
+// Determine Host
+// O valor da variável de shell WPDOMAIN (passado via primary_wpdomain_for_fallback) é injetado aqui pelo Bash.
+\$fallback_host = '$primary_wpdomain_for_fallback';
+
+if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) {
+    \$site_host = \$_SERVER['HTTP_X_FORWARDED_HOST'];
+    \$site_scheme = 'https'; // Assume https se X-Forwarded-Host está presente (CloudFront)
+    \$_SERVER['HTTPS'] = 'on';
+} elseif (!empty(\$_SERVER['HTTP_HOST'])) {
+    \$site_host = \$_SERVER['HTTP_HOST'];
+} else {
+    \$site_host = \$fallback_host;
+    \$site_scheme = 'https'; // Assume https para o fallback principal
+    \$_SERVER['HTTPS'] = 'on';
+}
+
+define('WP_HOME', \$site_scheme . '://' . \$site_host);
+define('WP_SITEURL', \$site_scheme . '://' . \$site_host);
+// --- End Dynamic WordPress URL configuration ---
+
+define('FS_METHOD', 'direct');
+
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
+    \$_SERVER['HTTPS'] = 'on';
+}
+EOPHP
+)
+
     TEMP_DEFINES_FILE_INNER=$(mktemp /tmp/defines.XXXXXX)
     sudo chmod 644 "$TEMP_DEFINES_FILE_INNER"
-    echo -e "\n$PHP_DEFINES_BLOCK" >"$TEMP_DEFINES_FILE_INNER" # Adiciona nova linha antes
+    echo -e "\n$PHP_DEFINES_BLOCK_CONTENT" >"$TEMP_DEFINES_FILE_INNER"
     if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then
         sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE_INNER" "$temp_config_file"
     else
         cat "$TEMP_DEFINES_FILE_INNER" >>"$temp_config_file"
     fi
     rm -f "$TEMP_DEFINES_FILE_INNER"
-    echo "INFO: Defines configurados."
+    echo "INFO: Defines (incluindo URLs dinâmicas) configurados."
 
     echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como 'apache'..."
     if sudo -u apache cp "$temp_config_file" "$target_file_on_efs"; then
@@ -183,7 +224,6 @@ create_wp_config_template() {
 }
 
 # --- Instalação de Pré-requisitos ---
-# (Mantida como na v1.9.7-mod5)
 echo "INFO: Instalando pacotes..."
 sudo yum update -y -q
 sudo amazon-linux-extras install -y epel -q
@@ -203,13 +243,11 @@ if sudo -u "$EFS_OWNER_USER" touch "$TEMP_EFS_TEST_FILE"; then
     sudo -u "$EFS_OWNER_USER" rm "$TEMP_EFS_TEST_FILE"
 else
     echo "ERRO CRÍTICO: Teste de escrita no EFS como '$EFS_OWNER_USER' FALHOU."
-    echo "Verifique permissões de '/mnt' no EFS e config do AP."
     ls -ld "$MOUNT_POINT"
     exit 1
 fi
 
 # --- Obtenção de Credenciais do RDS ---
-# (Mantida como na v1.9.7-mod5)
 echo "INFO: Obtendo credenciais do RDS..."
 SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" --query 'SecretString' --output text --region "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0")
 if [ -z "$SECRET_STRING_VALUE" ]; then
@@ -231,21 +269,15 @@ if [ -d "$MOUNT_POINT/wp-includes" ] && [ -f "$CONFIG_SAMPLE_ON_EFS" ]; then
     echo "WARN: WordPress já encontrado em '$MOUNT_POINT'. Pulando download."
 else
     echo "INFO: WordPress não encontrado. Iniciando download..."
-    sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR" # Limpa diretórios temporários
+    sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
 
     cd "$WP_DOWNLOAD_DIR"
     echo "INFO: Baixando WordPress para '$WP_DOWNLOAD_DIR'..."
-    curl -sLO https://wordpress.org/latest.tar.gz || {
-        echo "ERRO: Falha download WP."
-        exit 1
-    }
-    echo "INFO: Extraindo WordPress em '$WP_DOWNLOAD_DIR'..."
-    tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || {
-        echo "ERRO: Falha extração WP."
-        exit 1
-    }
+    curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha download WP."; exit 1; }
+    echo "INFO: Extraindo WordPress em '$WP_FINAL_CONTENT_DIR'..."
+    tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha extração WP."; exit 1; }
     rm latest.tar.gz
     echo "INFO: WordPress baixado e extraído para '$WP_FINAL_CONTENT_DIR'."
 
@@ -257,7 +289,7 @@ else
         ls -ld "$MOUNT_POINT"
         exit 1
     fi
-    sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR" # Limpa temporários
+    sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     echo "INFO: Limpeza dos diretórios de download/preparação concluída."
 fi
 
@@ -268,21 +300,16 @@ if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then
 fi
 
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then
-    echo "INFO: Arquivo '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando com configurações de produção..."
-    PRODUCTION_URL="https://${WPDOMAIN}"
-    # A função create_wp_config_template irá criar o arquivo diretamente no EFS ($ACTIVE_CONFIG_FILE_EFS)
-    # com o proprietário 'apache', usando um arquivo temporário localmente para preparação.
-    create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$PRODUCTION_URL" "$PRODUCTION_URL" \
+    echo "INFO: Arquivo '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando com configurações dinâmicas..."
+    create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" \
         "$AWS_DB_INSTANCE_TARGET_NAME_0" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
-    # A mensagem de sucesso ou erro já é tratada dentro de create_wp_config_template
 else
     echo "WARN: Arquivo de configuração ativo '$ACTIVE_CONFIG_FILE_EFS' já existe. Nenhuma alteração será feita no wp-config.php."
 fi
 
 # --- Adicionar Arquivo de Health Check ---
-# (Mantida como na v1.9.7-mod5, com chmod 644 no temp file e cp como apache)
 echo "INFO: Criando health check em '$HEALTH_CHECK_FILE_PATH_EFS' como 'apache'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header(\"Content-Type: text/plain; charset=utf-8\"); echo \"OK - WP Health Check - v1.9.7-mod6 - \" . date(\"Y-m-d\TH:i:s\Z\"); exit; ?>"
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header(\"Content-Type: text/plain; charset=utf-8\"); echo \"OK - WP Health Check - v1.9.7-mod7 - \" . date(\"Y-m-d\TH:i:s\Z\"); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php)
 sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"
 echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
@@ -296,29 +323,28 @@ echo "INFO: Ajustando permissões finais em '$MOUNT_POINT'..."
 if sudo chown -R apache:apache "$MOUNT_POINT"; then
     echo "INFO: Propriedade de '$MOUNT_POINT' definida para apache:apache."
 else
-    echo "WARN: Falha no chown -R apache:apache '$MOUNT_POINT'. Verificando se o GID 48 (apache) já é o grupo proprietário."
-    if ! stat -c "%g" "$MOUNT_POINT" | grep -q "48"; then # GID 48 é 'apache'
+    echo "WARN: Falha no chown -R apache:apache '$MOUNT_POINT'. Verificando GID."
+    if ! stat -c "%g" "$MOUNT_POINT" | grep -q "48"; then
         echo "ERRO CRÍTICO: GID do '$MOUNT_POINT' não é 48 (apache) E chown falhou."
         ls -ld "$MOUNT_POINT"
-        # exit 1 # Pode ser muito restritivo sair aqui se as permissões de grupo já forem suficientes
     else
-        echo "INFO: GID do '$MOUNT_POINT' é 48 (apache). As permissões de grupo devem ser suficientes."
+        echo "INFO: GID do '$MOUNT_POINT' é 48 (apache). Permissões de grupo devem ser suficientes."
     fi
 fi
-sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; # drwxrwxr-x
-sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \; # -rw-rw-r--
+sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \;
+sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
 
-# Configs mais restritas
 if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi
-# Permissões para wp-config-production.php e wp-config-management.php foram removidas daqui, pois os arquivos não são mais criados.
 if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi
 echo "INFO: Permissões ajustadas."
 
 # --- Configuração e Inicialização do Apache ---
-# (Mantida como na v1.9.7-mod5)
 echo "INFO: Configurando Apache..."
 HTTPD_CONF="/etc/httpd/conf/httpd.conf"
-if grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF" && ! grep -A5 "<Directory \"/var/www/html\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF" && echo "INFO: AllowOverride All definido."; else echo "INFO: AllowOverride All já parece OK ou bloco não encontrado."; fi
+if grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF" && ! grep -A5 "<Directory \"/var/www/html\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
+    sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF" && echo "INFO: AllowOverride All definido."
+else echo "INFO: AllowOverride All já parece OK ou bloco não encontrado."; fi
+
 echo "INFO: Habilitando e reiniciando httpd..."
 sudo systemctl enable httpd
 if ! sudo systemctl restart httpd; then
@@ -336,12 +362,10 @@ fi
 
 # --- Conclusão ---
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.7-mod6) concluído! ($(date)) ---"
-echo "INFO: WordPress configurado com URL principal: https://${WPDOMAIN}"
-# Apenas informa sobre o Domínio de Gerenciamento se a variável MANAGEMENT_WPDOMAIN foi explicitamente definida
-# e é diferente do WPDOMAIN. O WordPress em si usará WPDOMAIN para suas URLs.
+echo "INFO: --- Script WordPress Setup (v1.9.7-mod7) concluído! ($(date)) ---"
+echo "INFO: WordPress configurado com URLs dinâmicas. Fallback principal para: https://${WPDOMAIN}"
 if [ -n "${MANAGEMENT_WPDOMAIN:-}" ] && [ "${MANAGEMENT_WPDOMAIN_EFFECTIVE}" != "${WPDOMAIN}" ] && [ "${MANAGEMENT_WPDOMAIN_EFFECTIVE}" != "management.example.com" ]; then
-    echo "INFO: Domínio de Gerenciamento (se DNS aponta para esta instalação): https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
+    echo "INFO: Domínio de Gerenciamento (informativo, se DNS aponta para esta instalação): https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
 fi
 echo "INFO: Health Check: /healthcheck.php"
 echo "INFO: Log: ${LOG_FILE}"
