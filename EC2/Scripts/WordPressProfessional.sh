@@ -1,6 +1,6 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.7-mod7 (URLs dinâmicas com fallback para WPDOMAIN)
+# Versão: 1.9.8-cloudfront-optimized (URLs dinâmicas otimizadas para CloudFront e Apache HTTPS fix)
 
 # --- Variáveis Essenciais ---
 essential_vars=(
@@ -9,7 +9,7 @@ essential_vars=(
     "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0"
     "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"
     "AWS_DB_INSTANCE_TARGET_NAME_0"
-    "WPDOMAIN"
+    "WPDOMAIN" # Usado como fallback para o host e para logs
     "ACCOUNT"
     "AWS_EFS_ACCESS_POINT_TARGET_ID_0"
 )
@@ -42,7 +42,7 @@ EFS_OWNER_USER="ec2-user"
 # --- Redirecionamento de Logs ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.7-mod7) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v1.9.8-cloudfront-optimized) ($(date)) ---"
 echo "INFO: Logging configurado para: ${LOG_FILE}"
 echo "INFO: =================================================="
 
@@ -78,10 +78,7 @@ if [ "$error_found" -eq 1 ]; then
     echo "ERRO: Uma ou mais variáveis essenciais estão faltando. Abortando."
     exit 1
 fi
-# MANAGEMENT_WPDOMAIN não é mais usado para wp-config, mas pode ser útil para outras coisas.
-if [ -z "${MANAGEMENT_WPDOMAIN:-}" ]; then export MANAGEMENT_WPDOMAIN_EFFECTIVE="management.example.com"; else export MANAGEMENT_WPDOMAIN_EFFECTIVE="${MANAGEMENT_WPDOMAIN}"; fi
-echo "INFO: Domínio de Produção (WPDOMAIN): ${WPDOMAIN}"
-echo "INFO: Domínio de Gerenciamento (informativo): ${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
+echo "INFO: Domínio de Produção (WPDOMAIN - usado como fallback): ${WPDOMAIN}"
 echo "INFO: Verificação de variáveis essenciais concluída."
 
 # --- Funções Auxiliares ---
@@ -103,7 +100,6 @@ mount_efs() {
             echo "INFO: EFS montado com sucesso em '$mount_point_arg'."
         else
             echo "ERRO CRÍTICO: Falha ao montar EFS. Verifique logs do sistema, conectividade e config do AP."
-            # Adicionar mais debug se necessário aqui
             exit 1
         fi
         if ! grep -q "${mount_point_arg} efs" /etc/fstab; then
@@ -117,7 +113,7 @@ mount_efs() {
 
 create_wp_config_template() {
     local target_file_on_efs="$1"
-    local primary_wpdomain_for_fallback="$2" # Recebe o valor de WPDOMAIN
+    local primary_wpdomain_for_fallback="$2" # WPDOMAIN, usado como fallback para o host
     local db_name="$3"
     local db_user="$4"
     local db_password="$5"
@@ -127,7 +123,7 @@ create_wp_config_template() {
     sudo chmod 644 "$temp_config_file"
     trap 'rm -f "$temp_config_file"' RETURN
 
-    echo "INFO: Criando configuração em '$temp_config_file' para EFS '$target_file_on_efs', com URLs dinâmicas (fallback para: $primary_wpdomain_for_fallback)"
+    echo "INFO: Criando wp-config.php em '$temp_config_file' para EFS '$target_file_on_efs', otimizado para CloudFront (fallback host: $primary_wpdomain_for_fallback)"
     if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then
         echo "ERRO: '$CONFIG_SAMPLE_ON_EFS' não encontrado. WP foi copiado?"
         exit 1
@@ -162,41 +158,33 @@ create_wp_config_template() {
     else echo "ERRO: Falha ao obter SALTS."; fi
 
     PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// --- Dynamic WordPress URL configuration ---
-// Determine Scheme
-if (!empty(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https') {
-    \$_SERVER['HTTPS'] = 'on';
-    \$site_scheme = 'https';
-} elseif (!empty(\$_SERVER['HTTPS']) && \$_SERVER['HTTPS'] !== 'off') {
-    \$site_scheme = 'https';
-} elseif (isset(\$_SERVER['SERVER_PORT']) && \$_SERVER['SERVER_PORT'] == 443) {
-    \$site_scheme = 'https';
-} else {
-    \$site_scheme = 'http';
+// --- WordPress URL configuration for CloudFront ---
+// Default to https as CloudFront will handle SSL termination.
+\$site_scheme = 'https';
+
+// Use X-Forwarded-Host if available, otherwise fallback to WPDOMAIN.
+\$site_host = '$primary_wpdomain_for_fallback'; // Bash injects WPDOMAIN here
+if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) {
+    // HTTP_X_FORWARDED_HOST can contain multiple hosts, take the first one.
+    \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']);
+    \$site_host = trim(\$hosts[0]);
 }
 
-// Determine Host
-// O valor da variável de shell WPDOMAIN (passado via primary_wpdomain_for_fallback) é injetado aqui pelo Bash.
-\$fallback_host = '$primary_wpdomain_for_fallback';
-
-if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) {
-    \$site_host = \$_SERVER['HTTP_X_FORWARDED_HOST'];
-    \$site_scheme = 'https'; // Assume https se X-Forwarded-Host está presente (CloudFront)
-    \$_SERVER['HTTPS'] = 'on';
-} elseif (!empty(\$_SERVER['HTTP_HOST'])) {
-    \$site_host = \$_SERVER['HTTP_HOST'];
-} else {
-    \$site_host = \$fallback_host;
-    \$site_scheme = 'https'; // Assume https para o fallback principal
+// Inform WordPress that the connection is HTTPS if X-Forwarded-Proto is https.
+// This is crucial for WordPress to generate correct HTTPS URLs for assets.
+// Apache's SetEnvIf directive (configured elsewhere in this script) should already
+// set \$_SERVER['HTTPS'] = 'on', but this provides an additional layer in PHP.
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
     \$_SERVER['HTTPS'] = 'on';
 }
 
 define('WP_HOME', \$site_scheme . '://' . \$site_host);
 define('WP_SITEURL', \$site_scheme . '://' . \$site_host);
-// --- End Dynamic WordPress URL configuration ---
+// --- End WordPress URL configuration ---
 
 define('FS_METHOD', 'direct');
 
+// Redundant check for HTTPS, good for ensuring it's set if X-Forwarded-Proto is present.
 if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
     \$_SERVER['HTTPS'] = 'on';
 }
@@ -212,7 +200,7 @@ EOPHP
         cat "$TEMP_DEFINES_FILE_INNER" >>"$temp_config_file"
     fi
     rm -f "$TEMP_DEFINES_FILE_INNER"
-    echo "INFO: Defines (incluindo URLs dinâmicas) configurados."
+    echo "INFO: Defines (incluindo URLs otimizadas para CloudFront) configurados."
 
     echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como 'apache'..."
     if sudo -u apache cp "$temp_config_file" "$target_file_on_efs"; then
@@ -300,16 +288,16 @@ if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then
 fi
 
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then
-    echo "INFO: Arquivo '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando com configurações dinâmicas..."
+    echo "INFO: Arquivo '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando com configurações dinâmicas otimizadas para CloudFront..."
     create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" \
         "$AWS_DB_INSTANCE_TARGET_NAME_0" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
 else
-    echo "WARN: Arquivo de configuração ativo '$ACTIVE_CONFIG_FILE_EFS' já existe. Nenhuma alteração será feita no wp-config.php."
+    echo "WARN: Arquivo de configuração ativo '$ACTIVE_CONFIG_FILE_EFS' já existe. Verifique se as configurações de URL e SSL estão corretas para CloudFront."
 fi
 
 # --- Adicionar Arquivo de Health Check ---
 echo "INFO: Criando health check em '$HEALTH_CHECK_FILE_PATH_EFS' como 'apache'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header(\"Content-Type: text/plain; charset=utf-8\"); echo \"OK - WP Health Check - v1.9.7-mod7 - \" . date(\"Y-m-d\TH:i:s\Z\"); exit; ?>"
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header(\"Content-Type: text/plain; charset=utf-8\"); echo \"OK - WP Health Check - v1.9.8-cloudfront-optimized - \" . date(\"Y-m-d\TH:i:s\Z\"); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php)
 sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"
 echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
@@ -324,7 +312,7 @@ if sudo chown -R apache:apache "$MOUNT_POINT"; then
     echo "INFO: Propriedade de '$MOUNT_POINT' definida para apache:apache."
 else
     echo "WARN: Falha no chown -R apache:apache '$MOUNT_POINT'. Verificando GID."
-    if ! stat -c "%g" "$MOUNT_POINT" | grep -q "48"; then
+    if ! stat -c "%g" "$MOUNT_POINT" | grep -q "48"; then # 48 é geralmente o GID do apache
         echo "ERRO CRÍTICO: GID do '$MOUNT_POINT' não é 48 (apache) E chown falhou."
         ls -ld "$MOUNT_POINT"
     else
@@ -334,16 +322,35 @@ fi
 sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \;
 sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
 
-if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi
+if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi # Mais restritivo para wp-config
 if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi
 echo "INFO: Permissões ajustadas."
 
 # --- Configuração e Inicialização do Apache ---
 echo "INFO: Configurando Apache..."
 HTTPD_CONF="/etc/httpd/conf/httpd.conf"
+
+# 1. Configurar AllowOverride para .htaccess funcionar
 if grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF" && ! grep -A5 "<Directory \"/var/www/html\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
-    sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF" && echo "INFO: AllowOverride All definido."
-else echo "INFO: AllowOverride All já parece OK ou bloco não encontrado."; fi
+    sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF" && echo "INFO: AllowOverride All definido para /var/www/html."
+else echo "INFO: AllowOverride All já parece OK ou bloco não encontrado para /var/www/html."; fi
+
+# 2. Adicionar SetEnvIf para X-Forwarded-Proto (CRUCIAL PARA SSL ATRÁS DE PROXY)
+APACHE_HTTPS_FORWARD_CONF="<IfModule mod_setenvif.c>\n  SetEnvIf X-Forwarded-Proto \\\"^https$\\\" HTTPS=on\n</IfModule>"
+if ! grep -q "SetEnvIf X-Forwarded-Proto" "$HTTPD_CONF"; then
+    echo "INFO: Adicionando configuração 'SetEnvIf X-Forwarded-Proto https HTTPS=on' ao Apache."
+    # Tenta inserir antes de "IncludeOptional conf.d/*.conf", senão adiciona ao final.
+    if sudo grep -q "IncludeOptional conf.d/\*\.conf" "$HTTPD_CONF"; then
+        # Usando awk para uma inserção mais segura antes de uma linha específica
+        sudo awk -v insert="$APACHE_HTTPS_FORWARD_CONF" '/IncludeOptional conf\.d\/\*\.conf/ {print insert} {print}' "$HTTPD_CONF" > /tmp/httpd.conf.tmp && sudo mv /tmp/httpd.conf.tmp "$HTTPD_CONF"
+    else
+        echo -e "\n$APACHE_HTTPS_FORWARD_CONF" | sudo tee -a "$HTTPD_CONF" > /dev/null
+    fi
+    echo "INFO: Configuração 'SetEnvIf X-Forwarded-Proto' adicionada."
+else
+    echo "INFO: Configuração 'SetEnvIf X-Forwarded-Proto' já parece existir no Apache."
+fi
+
 
 echo "INFO: Habilitando e reiniciando httpd..."
 sudo systemctl enable httpd
@@ -353,20 +360,18 @@ if ! sudo systemctl restart httpd; then
     sudo tail -n 30 /var/log/httpd/error_log
     exit 1
 fi
-sleep 3
+sleep 3 # Pequena pausa para o serviço estabilizar
 if systemctl is-active --quiet httpd; then echo "INFO: httpd ativo."; else
-    echo "ERRO CRÍTICO: httpd não ativo."
+    echo "ERRO CRÍTICO: httpd não ativo após reinício."
     sudo tail -n 30 /var/log/httpd/error_log
     exit 1
 fi
 
 # --- Conclusão ---
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.7-mod7) concluído! ($(date)) ---"
-echo "INFO: WordPress configurado com URLs dinâmicas. Fallback principal para: https://${WPDOMAIN}"
-if [ -n "${MANAGEMENT_WPDOMAIN:-}" ] && [ "${MANAGEMENT_WPDOMAIN_EFFECTIVE}" != "${WPDOMAIN}" ] && [ "${MANAGEMENT_WPDOMAIN_EFFECTIVE}" != "management.example.com" ]; then
-    echo "INFO: Domínio de Gerenciamento (informativo, se DNS aponta para esta instalação): https://${MANAGEMENT_WPDOMAIN_EFFECTIVE}"
-fi
+echo "INFO: --- Script WordPress Setup (v1.9.8-cloudfront-optimized) concluído! ($(date)) ---"
+echo "INFO: WordPress configurado com URLs dinâmicas otimizadas para CloudFront."
+echo "INFO: Domínio primário esperado (via X-Forwarded-Host ou fallback WPDOMAIN): https://${WPDOMAIN}" # WPDOMAIN é o fallback
 echo "INFO: Health Check: /healthcheck.php"
 echo "INFO: Log: ${LOG_FILE}"
 echo "INFO: =================================================="
