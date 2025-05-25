@@ -1,6 +1,6 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.8-cloudfront-optimized (URLs dinâmicas otimizadas para CloudFront e Apache HTTPS fix)
+# Versão: 1.9.9-cloudfront-optimized (URLs dinâmicas otimizadas para CloudFront e Apache HTTPS fix)
 
 # --- Variáveis Essenciais ---
 essential_vars=(
@@ -87,28 +87,52 @@ mount_efs() {
     local mount_point_arg=$2
     local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}"
 
-    echo "INFO: Verificando se '$mount_point_arg' já está montado..."
-    if mount | grep -q "on ${mount_point_arg} type efs"; then
-        echo "INFO: EFS já está montado em '$mount_point_arg'."
-    else
+    local max_retries=5
+    local retry_delay_seconds=15 # Aumentar se necessário
+    local attempt_num=1
+
+    echo "INFO: Tentando montar EFS '$efs_id' em '$mount_point_arg' via AP '$efs_ap_id' (até $max_retries tentativas)..."
+
+    while [ $attempt_num -le $max_retries ]; do
+        echo "INFO: Tentativa de montagem EFS: $attempt_num de $max_retries..."
+        if mount | grep -q "on ${mount_point_arg} type efs"; then
+            echo "INFO: EFS já está montado em '$mount_point_arg'."
+            return 0 # Sucesso, sair da função
+        fi
+
         sudo mkdir -p "$mount_point_arg"
-        echo "INFO: Montando EFS '$efs_id' em '$mount_point_arg' via AP '$efs_ap_id'..."
         local mount_options="tls,accesspoint=$efs_ap_id"
         local mount_source="$efs_id"
 
-        if sudo timeout 30 mount -t efs -o "$mount_options" "$mount_source" "$mount_point_arg"; then
-            echo "INFO: EFS montado com sucesso em '$mount_point_arg'."
+        # Adicionar -v para verbosidade no comando mount para ajudar no debug
+        if sudo timeout 30 mount -t efs -o "$mount_options" "$mount_source" "$mount_point_arg" -v; then
+            echo "INFO: EFS montado com sucesso em '$mount_point_arg' na tentativa $attempt_num."
+
+            # Adicionar ao /etc/fstab APENAS SE BEM-SUCEDIDO e não existir
+            if ! grep -q "${mount_point_arg} efs" /etc/fstab; then
+                local fstab_mount_options="_netdev,${mount_options}" # Manter _netdev
+                local fstab_entry="$mount_source $mount_point_arg efs $fstab_mount_options 0 0"
+                echo "$fstab_entry" | sudo tee -a /etc/fstab >/dev/null
+                echo "INFO: Entrada adicionada ao /etc/fstab: '$fstab_entry'"
+            fi
+            return 0 # Sucesso, sair da função
         else
-            echo "ERRO CRÍTICO: Falha ao montar EFS. Verifique logs do sistema, conectividade e config do AP."
-            exit 1
+            echo "AVISO: Falha ao montar EFS na tentativa $attempt_num. Código de saída: $?"
+            if [ $attempt_num -lt $max_retries ]; then
+                echo "INFO: Aguardando $retry_delay_seconds segundos antes da próxima tentativa..."
+                sleep $retry_delay_seconds
+            fi
         fi
-        if ! grep -q "${mount_point_arg} efs" /etc/fstab; then
-            local fstab_mount_options="_netdev,${mount_options}"
-            local fstab_entry="$mount_source $mount_point_arg efs $fstab_mount_options 0 0"
-            echo "$fstab_entry" | sudo tee -a /etc/fstab >/dev/null
-            echo "INFO: Entrada adicionada ao /etc/fstab: '$fstab_entry'"
-        fi
-    fi
+        attempt_num=$((attempt_num + 1))
+    done
+
+    echo "ERRO CRÍTICO: Falha ao montar EFS após $max_retries tentativas. Verifique logs do sistema, conectividade e config do AP."
+    # Opcional: Coletar mais informações de diagnóstico aqui antes de sair
+    echo "DEBUG: Informações de rede (exemplo):"
+    ip addr
+    echo "DEBUG: Últimas mensagens do kernel (dmesg):"
+    dmesg | tail -n 20
+    exit 1 # Falha após todas as tentativas
 }
 
 create_wp_config_template() {
