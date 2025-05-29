@@ -1,9 +1,9 @@
 # Nome do arquivo: JmeterServer.py
-# Versão: 1.3.13 (Compatível com JMX v5.0.1 - TestAction para Pausa e CDATA)
+# Versão: 1.3.13 (Compatível com JMX v5.0.1/v5.0.2 - TestAction para Pausa e CDATA)
 # Changelog:
 # v1.3.13 (2025-05-29):
 #    - Rota /upload_and_start: Removida a lógica de envio das propriedades -JENABLE_TIMER_TYPE.
-#      O JMX v5.0.1 usa -JTIMER_TYPE diretamente nos IfControllers para ativar o bloco de pausa correto.
+#      O JMX v5.0.x usa -JTIMER_TYPE diretamente nos IfControllers para ativar o bloco de pausa correto.
 # v1.3.12 (2025-05-29):
 #    - Rota /upload_and_start: Ajustada para enviar propriedades -JENABLE_TIMER_TYPE
 #      para controlar qual timer é ativado no JMX v4.1.
@@ -54,7 +54,7 @@ else:
 UPLOAD_FOLDER = 'jmeter_uploads'
 RESULTS_FOLDER = 'jmeter_results'
 LOGS_FOLDER = 'jmeter_logs'
-REPORTS_TEMP_FOLDER = 'jmeter_html_reports_temp' # Para relatórios HTML antes do upload S3
+REPORTS_TEMP_FOLDER = 'jmeter_html_reports_temp' 
 for folder in [UPLOAD_FOLDER, RESULTS_FOLDER, LOGS_FOLDER, REPORTS_TEMP_FOLDER]:
     os.makedirs(folder, exist_ok=True)
 
@@ -75,7 +75,7 @@ def parse_jmeter_log_summary(log_content):
     summary["raw_line"] = last_summary_line
     try:
         summary["parsed_timestamp"] = last_summary_line.split(" INFO")[0]
-    except: # pylint: disable=bare-except
+    except: 
         pass
     patterns = {
         "final": r"summary\s*=\s*(\d+)\s*in\s*(\d{2}:\d{2}:\d{2})\s*=\s*([\d\.]+)/s\s*Avg:\s*(\d+)\s*Min:\s*(\d+)\s*Max:\s*(\d+)\s*Err:\s*(\d+)\s*\(([\d\.]+)%\)",
@@ -123,13 +123,11 @@ def generate_html_report(jtl_file, report_output_folder):
         return False, f"Erro ao criar dir. relatório: {e}"
     cmd = [JMETER_EXECUTABLE, '-g', jtl_file, '-o', report_output_folder]
     try:
-        # Use check=False para não levantar exceção em caso de erro, mas sim analisar o returncode
         p = subprocess.run(cmd, capture_output=True, text=True,
                            check=False, encoding='utf-8', errors='replace')
         if p.returncode == 0:
             return True, f"Relatório HTML gerado em '{report_output_folder}'."
         else:
-            # Incluir stdout e stderr na mensagem de erro para depuração
             return False, f"Falha relatório HTML (cód: {p.returncode}):\n{p.stdout}\n{p.stderr}"
     except Exception as e:
         return False, f"Exceção relatório HTML: {e}"
@@ -142,16 +140,15 @@ def upload_directory_to_s3(local_dir, bucket, s3_prefix, region):
     count, errors = 0, []
     if not os.path.isdir(local_dir):
         return False, f"Dir. local '{local_dir}' não encontrado."
-    if s3_prefix and not s3_prefix.endswith('/'): # Garante que o prefixo termine com /
+    if s3_prefix and not s3_prefix.endswith('/'): 
         s3_prefix += '/'
     for root, _, files in os.walk(local_dir):
         for filename in files:
             local_path = os.path.join(root, filename)
             rel_path = os.path.relpath(local_path, local_dir)
-            s3_key = os.path.join(s3_prefix, rel_path).replace("\\", "/") # S3 usa /
+            s3_key = os.path.join(s3_prefix, rel_path).replace("\\", "/") 
             ct, _ = mimetypes.guess_type(local_path)
-            ct = ct or 'application/octet-stream' # Default content type
-            # Especificar charset para tipos de texto comuns
+            ct = ct or 'application/octet-stream' 
             if filename.lower().endswith(('.html', '.htm')):
                 ct = 'text/html; charset=utf-8'
             elif filename.lower().endswith('.css'):
@@ -163,16 +160,13 @@ def upload_directory_to_s3(local_dir, bucket, s3_prefix, region):
                     s3.put_object(Bucket=bucket, Key=s3_key,
                                   Body=f, ContentType=ct)
                 count += 1
-            except Exception as e: # pylint: disable=broad-except
+            except Exception as e: 
                 if isinstance(e, (NoCredentialsError, PartialCredentialsError)):
                     return False, "Credenciais AWS não encontradas."
-                # if isinstance(e, ClientError) and e.response['Error']['Code'] == 'AccessDenied':
-                #     return False, "Acesso negado ao bucket S3."
                 errors.append(f"Erro S3/upload '{s3_key}': {str(e)}")
-                break # Interrompe em caso de erro para evitar muitos logs
+                break 
     if errors:
         return False, f"Upload S3: {len(errors)} erro(s). {count} arquivos. Erros: {'; '.join(errors)}"
-    # Assume que index.html é o arquivo principal do relatório
     s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{s3_prefix}index.html"
     return True, f"Upload {count} arquivos S3 OK. Relatório: {s3_url}"
 
@@ -193,10 +187,10 @@ def upload_and_start():
         return jsonify({"message": "Erro crítico: JMeter não configurado."}), 500
     if jmeter_process_pid:
         try:
-            os.kill(jmeter_process_pid, 0) # Checa se o processo existe
+            os.kill(jmeter_process_pid, 0) 
             return jsonify({"message": f"Teste já em execução (PID {jmeter_process_pid})."}), 409
-        except OSError: # Processo não existe mais
-            jmeter_process_pid = None # Limpa PID antigo
+        except OSError: 
+            jmeter_process_pid = None 
     if 'jmxFile' not in request.files:
         return jsonify({"message": "Nenhum arquivo .jmx enviado."}), 400
     file = request.files['jmxFile']
@@ -225,7 +219,7 @@ def upload_and_start():
     gr_deviation = form_data.get('GR_DEVIATION', '100')
     gr_offset = form_data.get('GR_OFFSET', '300')
 
-    safe_filename = os.path.basename(file.filename) # Segurança básica
+    safe_filename = os.path.basename(file.filename) 
     filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
     file.save(filepath)
     base_name = os.path.splitext(safe_filename)[0]
@@ -265,11 +259,9 @@ def upload_and_start():
     add_jmeter_prop("NUM_THREADS", num_threads, "1")
     add_jmeter_prop("RAMP_UP", ramp_up, "0")
 
-    # --- LÓGICA DE TIMER PARA JMX v5.0.1 (TestAction) ---
-    # Envia o tipo de timer que o JMX usará nos IfControllers
+    # --- LÓGICA DE TIMER PARA JMX v5.0.x (TestAction) ---
     add_jmeter_prop("TIMER_TYPE", timer_type_from_form, "constant") 
 
-    # Envia os parâmetros para o tipo de timer selecionado
     if timer_type_from_form == 'constant':
         add_jmeter_prop("C_DELAY", c_delay, "1000")
     elif timer_type_from_form == 'uniform_random':
@@ -278,13 +270,8 @@ def upload_and_start():
     elif timer_type_from_form == 'gaussian_random':
         add_jmeter_prop("GR_DEVIATION", gr_deviation, "100")
         add_jmeter_prop("GR_OFFSET", gr_offset, "300")
-    # Se timer_type_from_form == 'none', nenhuma propriedade de delay específica é crítica,
-    # pois os IfControllers não serão ativados para 'none'.
-    # Os fallbacks no JMX para os valores de delay/range são usados se as props não forem passadas,
-    # mas como o IfController não será ativo, não importa.
     # --- FIM DA LÓGICA DE TIMER ---
 
-    # Control Mode properties
     if control_mode == 'duration':
         add_jmeter_prop("USE_SCHEDULER", "true")
         add_jmeter_prop("DURATION", duration_from_form, "60")
@@ -300,13 +287,12 @@ def upload_and_start():
     try:
         print("\nINFO: Comando JMeter final a ser executado:")
         print(f"  {' '.join(jmeter_command)}\n")
-        # pylint: disable=consider-using-with
         process = subprocess.Popen(jmeter_command)
         jmeter_process_pid = process.pid
         print(
             f"INFO: JMeter ('{safe_filename}') iniciado PID {jmeter_process_pid}.")
         return jsonify({"message": f"Teste '{safe_filename}' iniciado.", "pid": jmeter_process_pid, "log_file": current_log_file_path, "results_file": current_results_file_path}), 200
-    except Exception as e: # pylint: disable=broad-except
+    except Exception as e: 
         print(f"ERRO: Falha ao iniciar JMeter: {e}")
         current_log_file_path = None
         current_results_file_path = None
@@ -321,48 +307,47 @@ def stop_test():
 
     if was_jmeter_running:
         try:
-            os.kill(pid_to_stop, signal.SIGTERM) # Envia SIGTERM primeiro
+            os.kill(pid_to_stop, signal.SIGTERM) 
             msg_parts.append(f"SIGTERM enviado para PID {pid_to_stop}.")
             stopped_graciously = False
-            # Espera um tempo para o JMeter finalizar graciosamente
             for _ in range(int(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS / POLL_INTERVAL_SECONDS)):
                 time.sleep(POLL_INTERVAL_SECONDS)
                 try:
-                    os.kill(pid_to_stop, 0) # Checa se o processo ainda existe
+                    os.kill(pid_to_stop, 0) 
                 except OSError as e:
-                    if e.errno == errno.ESRCH: # Processo não encontrado
+                    if e.errno == errno.ESRCH: 
                         msg_parts.append(
                             f"PID {pid_to_stop} parou graciosamente.")
                         stopped_graciously = True
                         break
-                    else: # Outro erro OSError
-                        raise # Re-levanta o erro se não for ESRCH
+                    else: 
+                        raise 
             
             if not stopped_graciously:
                 msg_parts.append(
                     f"PID {pid_to_stop} não parou com SIGTERM após {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS}s. Enviando SIGKILL.")
                 try:
-                    os.kill(pid_to_stop, signal.SIGKILL) # Força a parada
-                    time.sleep(POLL_INTERVAL_SECONDS) # Pequena pausa para o SO processar
+                    os.kill(pid_to_stop, signal.SIGKILL) 
+                    time.sleep(POLL_INTERVAL_SECONDS) 
                     msg_parts.append(
                         f"SIGKILL enviado para PID {pid_to_stop}.")
-                except OSError as e: # Pode já ter parado entre o SIGTERM e o SIGKILL
+                except OSError as e: 
                     if e.errno == errno.ESRCH:
                         msg_parts.append(
                             f"PID {pid_to_stop} já parado antes do SIGKILL (ou parou rapidamente).")
-                    else: # Outro erro OSError com SIGKILL
+                    else: 
                         msg_parts.append(
                             f"Erro ao enviar SIGKILL para PID {pid_to_stop}: {e}")
-            jmeter_process_pid = None # Limpa o PID global
-        except Exception as e: # pylint: disable=broad-except
+            jmeter_process_pid = None 
+        except Exception as e: 
             msg_parts.append(f"Erro ao tentar parar PID {pid_to_stop}: {e}")
-            jmeter_process_pid = None # Limpa o PID em caso de erro também
+            jmeter_process_pid = None 
     else:
         msg_parts.append(
             "Nenhum processo JMeter ativo para parar. Tentando gerar relatório do último JTL (se existir).")
 
     report_url = ""
-    results_file_that_was_processed = current_results_file_path # Salva antes de possivelmente ser limpo
+    results_file_that_was_processed = current_results_file_path 
 
     if current_results_file_path and os.path.exists(current_results_file_path) and os.path.getsize(current_results_file_path) > 0:
         print(
@@ -370,7 +355,6 @@ def stop_test():
         ts_report = time.strftime("%Y%m%d-%H%M%S")
         report_base_name = os.path.splitext(
             os.path.basename(current_results_file_path))[0]
-        # Cria um subdiretório único para os arquivos do relatório HTML
         report_dir_temp = os.path.join(
             REPORTS_TEMP_FOLDER, f"{report_base_name}_html_{ts_report}")
 
@@ -390,7 +374,6 @@ def stop_test():
                 msg_parts.append(
                     "Upload S3: Não realizado (bucket/região S3 não configurados).")
             
-            # Limpa o diretório temporário do relatório após o upload (ou tentativa)
             if os.path.isdir(report_dir_temp):
                 try:
                     shutil.rmtree(report_dir_temp)
@@ -406,8 +389,6 @@ def stop_test():
         msg_parts.append(
             "Relatório não gerado: Nenhum arquivo JTL de resultados anterior disponível.")
     
-    # Resetar paths globais para o próximo teste, APÓS processar o relatório do atual.
-    # Isso garante que um novo /upload_and_start comece do zero.
     current_results_file_path = None
     current_log_file_path = None
 
@@ -416,9 +397,6 @@ def stop_test():
 
 @app.route('/get_current_log', methods=['GET'])
 def get_current_log():
-    # Esta rota agora dependerá do frontend não limpar o current_log_file_path
-    # ou precisará de uma forma de buscar o log do último teste se current_log_file_path for None.
-    # Por simplicidade, assume que current_log_file_path ainda é válido se um teste está "ativo" na UI.
     global current_log_file_path
     if not current_log_file_path or not os.path.exists(current_log_file_path):
         return "Log não encontrado (ou o teste já terminou e foi limpo).", 404, {'Content-Type': 'text/plain; charset=utf-8'}
@@ -430,7 +408,7 @@ def get_current_log():
 
 @app.route('/get_latest_summary_metrics', methods=['GET'])
 def get_latest_summary_metrics_route():
-    global current_log_file_path # Similar ao /get_current_log
+    global current_log_file_path 
     if not current_log_file_path or not os.path.exists(current_log_file_path):
         return jsonify({"error": "Log não encontrado (ou o teste já terminou e foi limpo).", "status_code": 404, "log_exists": False}), 404
     try:
@@ -438,22 +416,21 @@ def get_latest_summary_metrics_route():
             log_content = f.read()
         summary_data = parse_jmeter_log_summary(log_content)
         if summary_data.get("raw_line") is None:
-            # Ainda não há linha de sumário no log
             return jsonify({"message": "Aguardando 1º resumo do JMeter...", "status_code": 202, "log_exists": True, "log_length_lines": len(log_content.splitlines()), "active_threads": None}), 202
         
-        # Debug adicional se necessário
         if summary_data.get("type") == "incremental" and summary_data.get("active_threads") is None:
             print(
                 f"WARN: parse_jmeter_log_summary retornou 'incremental' mas active_threads é None. Linha RAW: {summary_data.get('raw_line')}")
         return jsonify(summary_data), 200
-    except Exception as e: # pylint: disable=broad-except
+    except Exception as e: 
         print(f"ERRO get_latest_summary_metrics_route: {str(e)}")
         return jsonify({"error": f"Erro ao processar log: {str(e)}", "status_code": 500, "log_exists": True}), 500
 
 
 if __name__ == '__main__':
-    app_version = "1.3.13" # ATUALIZAR A VERSÃO AQUI
+    app_version = "1.3.13" 
     print(f"INFO: Iniciando JMeter Backend (JmeterServer.py v{app_version}).")
+    print(f"INFO: Script Python para JMeter Backend (versão {app_version})") # Adicionado para clareza no log do serviço
     print(
         f"INFO: JMETER_EXECUTABLE: {JMETER_EXECUTABLE or 'NÃO ENCONTRADO - VERIFICAR CONFIGURAÇÃO!'}")
     print(
@@ -466,4 +443,4 @@ if __name__ == '__main__':
     print(f"INFO: Diretório de Logs (JMeter): {os.path.abspath(LOGS_FOLDER)}")
     print(
         f"INFO: Timeout para SIGTERM (parada graciosa): {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS}s")
-    app.run(host='0.0.0.0', port=5001, debug=True) # debug=True para desenvolvimento
+    app.run(host='0.0.0.0', port=5001, debug=True)
