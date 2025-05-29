@@ -1,13 +1,13 @@
 # Nome do arquivo: JmeterServer.py
-# Versão: 1.3.11 (Debug Enhanced for Parameter Verification)
+# Versão: 1.3.12 (Compatível com JMX v4.1 - Timers Habilitáveis)
 # Changelog:
+# v1.3.12 (2025-05-29):
+#    - Rota /upload_and_start: Ajustada para enviar propriedades -JENABLE_TIMER_TYPE
+#      para controlar qual timer é ativado no JMX v4.1.
 # v1.3.11 (2025-05-12):
 #    - Rota /upload_and_start: Adicionados prints de depuração explícitos para
 #      verificar valores lidos do formulário e propriedades -J montadas.
-# v1.3.10 (2025-05-12):
-#    - Rota /upload_and_start: Ajustada a lógica de envio das propriedades
-#      para o modo Duração e modo Loops para alinhar com JMX v3.
-# ... (resto do changelog)
+# ... (resto do changelog anterior)
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -31,12 +31,11 @@ JMETER_EXECUTABLE = None
 S3_BUCKET_NAME = os.getenv('AWS_S3_BUCKET_TARGET_NAME_REPORT')
 S3_BUCKET_REGION = os.getenv('AWS_S3_BUCKET_TARGET_REGION_REPORT')
 
-# ... (código de inicialização do JMETER_EXECUTABLE e pastas - sem alterações) ...
 if JMETER_HOME_ENV and os.path.isdir(JMETER_HOME_ENV):
     temp_executable = os.path.join(JMETER_HOME_ENV, 'bin', 'jmeter')
     if os.path.isfile(temp_executable) and os.access(temp_executable, os.X_OK):
         JMETER_EXECUTABLE = temp_executable
-    if not JMETER_EXECUTABLE:  # Fallback
+    if not JMETER_EXECUTABLE:
         JMETER_EXECUTABLE = shutil.which("jmeter")
 else:
     JMETER_EXECUTABLE = shutil.which("jmeter")
@@ -60,9 +59,7 @@ jmeter_process_pid = None
 current_log_file_path = None
 current_results_file_path = None
 
-# ... (funções parse_jmeter_log_summary, generate_html_report, upload_directory_to_s3 - sem alterações) ...
-
-
+# ... (funções parse_jmeter_log_summary, generate_html_report, upload_directory_to_s3 - permanecem as mesmas) ...
 def parse_jmeter_log_summary(log_content):
     summary = {"type": None, "samples": None, "time_segment_seconds": None, "throughput_rps": None, "avg_response_time_ms": None, "min_response_time_ms": None, "max_response_time_ms": None,
                "errors_count": None, "errors_percentage": None, "active_threads": None, "started_threads": None, "finished_threads": None, "raw_line": None, "parsed_timestamp": None}
@@ -168,10 +165,8 @@ def upload_directory_to_s3(local_dir, bucket, s3_prefix, region):
     s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{s3_prefix}index.html"
     return True, f"Upload {count} arquivos S3 OK. Relatório: {s3_url}"
 
-
 @app.route('/health_check', methods=['GET'])
 def health_check():
-    # ... (código da rota health_check - sem alterações) ...
     j_ok = JMETER_EXECUTABLE and os.path.exists(JMETER_EXECUTABLE)
     j_msg = f"JMeter: {JMETER_EXECUTABLE}" if j_ok else f"JMeter N/D (EXE: {JMETER_EXECUTABLE or 'N/A'}, HOME: {JMETER_HOME_ENV or 'N/A'})"
     s3_ok = S3_BUCKET_NAME and S3_BUCKET_REGION
@@ -199,13 +194,10 @@ def upload_and_start():
         return jsonify({"message": ".jmx inválido."}), 400
 
     form_data = request.form
-
-    # --- DEBUG: Logar todos os dados recebidos do formulário ---
     print("\n" + "="*10 + " DEBUG: Dados Recebidos do Formulário " + "="*10)
     for key, value in form_data.items():
         print(f"  Form['{key}']: {value}")
     print("="*50 + "\n")
-    # --- FIM DEBUG ---
 
     target_host = form_data.get('TARGET_HOST')
     target_protocol = form_data.get('TARGET_PROTOCOL', 'https')
@@ -214,10 +206,10 @@ def upload_and_start():
     control_mode = form_data.get('CONTROL_MODE', 'duration')
     duration_from_form = form_data.get('DURATION')
     test_loops_from_form = form_data.get('TEST_LOOPS')
-    summariser_interval = form_data.get('SUMMARISER_INTERVAL', '10')
+    summariser_interval = form_data.get('SUMMARISER_INTERVAL', '30') # Mantido default de 30s
 
     timer_type = form_data.get('TIMER_TYPE', 'constant')
-    c_delay = form_data.get('C_DELAY', '100')
+    c_delay = form_data.get('C_DELAY', '1000') # Mantido default de 1000ms
     ur_range = form_data.get('UR_RANGE', '1000')
     ur_offset = form_data.get('UR_OFFSET', '0')
     gr_deviation = form_data.get('GR_DEVIATION', '100')
@@ -238,17 +230,15 @@ def upload_and_start():
         jmeter_command.append(
             f"-Jsummariser.interval={summariser_interval.strip()}")
 
-    # --- DEBUG: Logar propriedades -J que estão sendo adicionadas ---
     print("\n" + "="*10 + " DEBUG: Montando Comando JMeter (-J Props) " + "="*10)
 
     def add_jmeter_prop(prop_name, prop_value, default_value=None):
         value_to_use = None
-        original_value = prop_value  # Store original for logging
+        original_value = prop_value
         if prop_value is not None and str(prop_value).strip():
             value_to_use = str(prop_value).strip()
         elif default_value is not None:
             value_to_use = str(default_value).strip()
-            # Indicate default usage
             original_value = f"{original_value} (Usando Default: {default_value})"
 
         if value_to_use is not None:
@@ -265,44 +255,56 @@ def upload_and_start():
     add_jmeter_prop("NUM_THREADS", num_threads, "1")
     add_jmeter_prop("RAMP_UP", ramp_up, "0")
 
-    # Timer properties
-    add_jmeter_prop("TIMER_TYPE", timer_type, "constant")
+    # --- NOVA LÓGICA PARA HABILITAR TIMERS ---
+    # Define todos os enables como false por padrão (JMX v4.1 usa fallback 'false' se a prop não for passada)
+    # mas é mais seguro enviá-los explicitamente.
+    add_jmeter_prop("ENABLE_CONSTANT_TIMER", "false")
+    add_jmeter_prop("ENABLE_UNIFORM_TIMER", "false")
+    add_jmeter_prop("ENABLE_GAUSSIAN_TIMER", "false")
+
     if timer_type == 'constant':
-        add_jmeter_prop("C_DELAY", c_delay, "100")
+        add_jmeter_prop("ENABLE_CONSTANT_TIMER", "true")
+        add_jmeter_prop("C_DELAY", c_delay, "1000")
     elif timer_type == 'uniform_random':
+        add_jmeter_prop("ENABLE_UNIFORM_TIMER", "true")
         add_jmeter_prop("UR_RANGE", ur_range, "1000")
         add_jmeter_prop("UR_OFFSET", ur_offset, "0")
     elif timer_type == 'gaussian_random':
+        add_jmeter_prop("ENABLE_GAUSSIAN_TIMER", "true")
         add_jmeter_prop("GR_DEVIATION", gr_deviation, "100")
         add_jmeter_prop("GR_OFFSET", gr_offset, "300")
+    # Se timer_type == 'none', todos os enables permanecem false, e nenhum timer será ativado.
+    # O JMX v4.1 tem fallbacks para 'false' nos atributos 'enabled' dos timers,
+    # então não precisamos enviar explicitamente -JTIMER_TYPE=none, mas os enables = false garantem.
+    # --- FIM DA NOVA LÓGICA PARA HABILITAR TIMERS ---
 
-    # Control Mode properties - Logic for JMX v3
+
+    # Control Mode properties
     if control_mode == 'duration':
-        prop_string = "-JUSE_SCHEDULER=true"
-        jmeter_command.append(prop_string)
-        print(f"  Adicionando: {prop_string} (Modo Duração)")
+        prop_string_scheduler = "-JUSE_SCHEDULER=true" # Para JMX v4.1, o scheduler é no ThreadGroup
+        jmeter_command.append(prop_string_scheduler)
+        print(f"  Adicionando: {prop_string_scheduler} (Modo Duração)")
         add_jmeter_prop("DURATION", duration_from_form, "60")
-        # Não enviamos TEST_LOOPS no modo Duração para JMX v3
-
+        # TEST_LOOPS pode ser -1 ou um valor alto para modo duração, o JMX v4.1 usa __P(TEST_LOOPS,-1)
+        # Não é estritamente necessário enviar TEST_LOOPS aqui se o JMX já tem o fallback -1 para duração.
+        # Mas, para ser explícito e garantir, podemos enviar.
+        add_jmeter_prop("TEST_LOOPS", "-1") # Ou um valor alto se preferir, mas -1 é o padrão para duração.
     elif control_mode == 'loops':
-        prop_string = "-JUSE_SCHEDULER=false"
-        jmeter_command.append(prop_string)
-        print(f"  Adicionando: {prop_string} (Modo Loops)")
-        loops_val = test_loops_from_form.strip(
-        ) if test_loops_from_form and test_loops_from_form.strip() else "1"
-        add_jmeter_prop("TEST_LOOPS", loops_val, "1")
+        prop_string_scheduler = "-JUSE_SCHEDULER=false"
+        jmeter_command.append(prop_string_scheduler)
+        print(f"  Adicionando: {prop_string_scheduler} (Modo Loops)")
+        add_jmeter_prop("TEST_LOOPS", test_loops_from_form, "1")
+        # DURATION não é estritamente necessário enviar, pois USE_SCHEDULER=false ignora.
+        # Mas pode ser enviado com um valor padrão se o JMX tiver um fallback para ele.
+        # add_jmeter_prop("DURATION", "0") # Exemplo, se o JMX usar.
 
     print("="*55 + "\n")
-    # --- FIM DEBUG ---
 
     jmeter_command.extend(['-n', '-t', filepath, '-l',
                           current_results_file_path, '-j', current_log_file_path])
-
     try:
-        # --- DEBUG: Logar comando final ---
         print("\nINFO: Comando JMeter final a ser executado:")
         print(f"  {' '.join(jmeter_command)}\n")
-        # --- FIM DEBUG ---
         process = subprocess.Popen(jmeter_command)
         jmeter_process_pid = process.pid
         print(
@@ -314,8 +316,7 @@ def upload_and_start():
         current_results_file_path = None
         return jsonify({"message": f"Erro ao iniciar JMeter: {e}"}), 500
 
-
-# ... (rotas /stop_test, /get_current_log, /get_latest_summary_metrics - sem alterações) ...
+# ... (rotas /stop_test, /get_current_log, /get_latest_summary_metrics - permanecem as mesmas) ...
 @app.route('/stop_test', methods=['POST'])
 def stop_test():
     global jmeter_process_pid, current_results_file_path
@@ -364,7 +365,7 @@ def stop_test():
             "Nenhum processo JMeter ativo para parar. Tentando gerar relatório do último JTL (se existir).")
 
     report_url = ""
-    results_processed = current_results_file_path
+    results_processed = current_results_file_path # Salva o path antes de ser potencialmente limpo
 
     if current_results_file_path and os.path.exists(current_results_file_path) and os.path.getsize(current_results_file_path) > 0:
         print(
@@ -399,12 +400,17 @@ def stop_test():
                 except Exception as e_clean:
                     msg_parts.append(
                         f"Aviso: Falha ao limpar diretório temporário do relatório '{report_dir_temp}': {e_clean}")
-    elif current_results_file_path:
+    elif current_results_file_path: # JTL existia na memória, mas não no disco ou estava vazio
         msg_parts.append(
             f"Relatório não gerado: Arquivo JTL '{current_results_file_path}' não encontrado, vazio ou inválido.")
-    else:
+    else: # Nenhum JTL conhecido
         msg_parts.append(
             "Relatório não gerado: Nenhum arquivo JTL de resultados anterior disponível.")
+    
+    # Limpa current_results_file_path e current_log_file_path após o processamento,
+    # para que um novo teste não tente usar o JTL/log de um teste já finalizado e reportado.
+    # current_results_file_path = None # Comentado temporariamente para debug no frontend
+    # current_log_file_path = None   # Comentado temporariamente para debug no frontend
 
     return jsonify({"message": "\n".join(msg_parts), "report_details": report_url, "results_file_processed": results_processed}), 200
 
@@ -439,9 +445,8 @@ def get_latest_summary_metrics_route():
         print(f"ERRO get_latest_summary_metrics_route: {str(e)}")
         return jsonify({"error": f"Erro ao processar log: {str(e)}", "status_code": 500, "log_exists": True}), 500
 
-
 if __name__ == '__main__':
-    app_version = "1.3.11"
+    app_version = "1.3.12" # Atualizar versão
     print(f"INFO: Iniciando JMeter Backend (JmeterServer.py v{app_version}).")
     print(
         f"INFO: JMETER_EXECUTABLE: {JMETER_EXECUTABLE or 'NÃO ENCONTRADO - VERIFICAR CONFIGURAÇÃO!'}")
@@ -455,5 +460,4 @@ if __name__ == '__main__':
     print(f"INFO: Diretório de Logs (JMeter): {os.path.abspath(LOGS_FOLDER)}")
     print(
         f"INFO: Timeout para SIGTERM (parada graciosa): {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS}s")
-    # debug=True ajuda a ver logs e recarrega automaticamente
     app.run(host='0.0.0.0', port=5001, debug=True)
