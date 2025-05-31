@@ -1,22 +1,21 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.3.0-zero-touch-s3-python-watchdog (Python Watchdog for S3 Sync)
+# Versão: 2.3.1-zero-touch-s3-python-watchdog-external (Downloads Python script from S3)
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.0.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.1.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.0_env_vars.sh" # Para vars que o script Python pode precisar se não passadas via env do systemd
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.1_env_vars.sh"
 
 # Script de Monitoramento Python e Serviço
-readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.0.py"
+readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.1.py" # Nome do script Python na instância
 readonly PYTHON_MONITOR_SCRIPT_PATH="/usr/local/bin/$PYTHON_MONITOR_SCRIPT_NAME"
-readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.0"
-readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.0.log"
-readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.0.log"
+readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.1"
+readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.1.log"
+readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.1.log"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.3.0.log"
-
+LOG_FILE="/var/log/wordpress_setup_v2.3.1.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -38,13 +37,16 @@ essential_vars=(
     "WPDOMAIN"
     "ACCOUNT"
     "AWS_EFS_ACCESS_POINT_TARGET_ID_0"
-    "AWS_S3_BUCKET_TARGET_NAME_0"
+    "AWS_S3_BUCKET_TARGET_NAME_0"    # Bucket para offload de estáticos do WP
+    "AWS_S3_BUCKET_TARGET_NAME_SCRIPT" # Bucket onde os scripts (este e o Python) estão
+    "AWS_S3_BUCKET_TARGET_REGION_SCRIPT" # Região do bucket de scripts
+    "AWS_S3_PYTHON_SCRIPT_KEY"       # Chave/Caminho do script Python no bucket de scripts
     # "AWS_CLOUDFRONT_DISTRIBUTION_ID_0"
 )
 
 # --- Função de Auto-Instalação do Script Principal ---
 self_install_script() {
-    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.0)..."
+    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.1)..."
     local current_script_path; current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
     if ! cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then echo "ERRO CRÍTICO (self_install): Falha ao copiar script. Abortando."; exit 1; fi
@@ -95,7 +97,7 @@ create_wp_config_template() {
         rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
     else echo "ERRO: Falha ao obter SALTS."; fi
     PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.3.0.sh
+// Gerado por wordpress_setup_v2.3.1.sh
 \$site_scheme = 'https';
 \$site_host = '$primary_wpdomain_for_fallback';
 if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
@@ -113,201 +115,43 @@ EOPHP
     if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
 }
 
-# --- Função para Criar o Script de Monitoramento Python ---
-create_python_monitor_script() {
-    echo "INFO: Criando script de monitoramento Python em $PYTHON_MONITOR_SCRIPT_PATH (v2.3.0)..."
+# --- Função para Baixar e Configurar o Script de Monitoramento Python ---
+setup_python_monitor_script() {
+    echo "INFO: Baixando e configurando script de monitoramento Python (v2.3.1)..."
 
-    sudo tee "$PYTHON_MONITOR_SCRIPT_PATH" > /dev/null <<'EOF_PYTHON_SCRIPT'
-import time
-import logging
-import subprocess
-import os
-import fnmatch # For glob pattern matching
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+    # Verificar variáveis S3 para o script Python
+    if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] || \
+       [ -z "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}" ] || \
+       [ -z "${AWS_S3_PYTHON_SCRIPT_KEY:-}" ]; then
+        echo "ERRO CRÍTICO: Variáveis para download do script Python não definidas (BUCKET_SCRIPT, REGION_SCRIPT, PYTHON_SCRIPT_KEY)."
+        exit 1
+    fi
 
-# Configuration (Read from environment variables passed by systemd service)
-MONITOR_DIR_BASE = os.environ.get('WP_MONITOR_DIR_BASE', '/var/www/html') # Default if not set
-S3_BUCKET = os.environ.get('WP_S3_BUCKET')
-RELEVANT_PATTERNS_STR = os.environ.get('WP_RELEVANT_PATTERNS', '')
-LOG_FILE_MONITOR = os.environ.get('WP_PY_MONITOR_LOG_FILE', '/tmp/wp_py_monitor.log')
-S3_TRANSFER_LOG = os.environ.get('WP_PY_S3_TRANSFER_LOG', '/tmp/wp_py_s3_transferred.log')
-SYNC_DEBOUNCE_SECONDS = int(os.environ.get('WP_SYNC_DEBOUNCE_SECONDS', '5'))
-AWS_CLI_PATH = os.environ.get('WP_AWS_CLI_PATH', 'aws') # Allow overriding aws cli path if needed
+    local s3_python_script_uri="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_PYTHON_SCRIPT_KEY}"
+    echo "INFO: Tentando baixar script Python de '$s3_python_script_uri' para '$PYTHON_MONITOR_SCRIPT_PATH'..."
 
-RELEVANT_PATTERNS = [p.strip() for p in RELEVANT_PATTERNS_STR.split(';') if p.strip()]
-last_sync_file_map = {} # Debounce per file
-
-# Ensure log directories exist and files are touchable/writable by the script runner (root)
-def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(name)s - %(levelname)s - %(message)s'):
-    # Create directory if it doesn't exist
-    log_dir = os.path.dirname(log_file)
-    if log_dir and not os.path.exists(log_dir):
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            os.chmod(log_dir, 0o755) # Permissions for root to write
-        except Exception as e:
-            print(f"Error creating log directory {log_dir}: {e}")
-            # Fallback to /tmp if creation fails
-            log_file = os.path.join("/tmp", os.path.basename(log_file))
-            print(f"Falling back to log file: {log_file}")
-    
-    # Touch and set permissions for the log file itself
-    try:
-        with open(log_file, 'a'):
-            os.utime(log_file, None)
-        os.chmod(log_file, 0o644) 
-    except Exception as e:
-        print(f"Error touching/chmod log file {log_file}: {e}")
-
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    handler = logging.FileHandler(log_file, mode='a')
-    handler.setFormatter(logging.Formatter(formatter_str))
-    logger.addHandler(handler)
-    return logger
-
-monitor_logger = setup_logger('PY_INOTIFY_MONITOR', LOG_FILE_MONITOR)
-transfer_logger = setup_logger('PY_S3_TRANSFER', S3_TRANSFER_LOG, formatter_str='%(asctime)s - %(message)s')
-
-
-class Watcher(FileSystemEventHandler):
-    def _is_excluded(self, filepath):
-        # Simple exclusion for common temp/junk files - watchdog doesn't have a built-in regex exclude
-        filename = os.path.basename(filepath)
-        if filename.endswith(('.swp', '.swx', '~', '.part', '.crdownload')):
-            return True
-        if '/cache/' in filepath or '/.git/' in filepath or '/node_modules/' in filepath or '/uploads/sites/' in filepath : # Multisite uploads sub-sites
-            return True
-        return False
-
-    def process(self, event):
-        filepath_to_check = ""
-        event_desc = ""
-
-        if event.event_type == 'moved':
-            filepath_to_check = event.dest_path
-            event_desc = f"MOVED from {event.src_path} to {event.dest_path}"
-        elif event.event_type in ['created', 'modified']:
-            filepath_to_check = event.src_path
-            event_desc = f"{event.event_type.upper()} at {filepath_to_check}"
-        else: # deleted, etc.
-            # monitor_logger.info(f"Ignoring event type: {event.event_type} for {event.src_path}")
-            return
-
-        if event.is_directory or self._is_excluded(filepath_to_check):
-            # monitor_logger.info(f"Ignoring directory or excluded file event: {event_desc}")
-            return
-
-        monitor_logger.info(f"Raw Event: {event_desc}")
-
-        try:
-            if not filepath_to_check.startswith(MONITOR_DIR_BASE + os.path.sep):
-                monitor_logger.info(f"File '{filepath_to_check}' outside base '{MONITOR_DIR_BASE}'. Ignored.")
-                return
-                
-            relative_file_path = os.path.relpath(filepath_to_check, MONITOR_DIR_BASE)
-
-            file_is_relevant = False
-            for pattern in RELEVANT_PATTERNS:
-                if fnmatch.fnmatch(relative_file_path, pattern):
-                    file_is_relevant = True
-                    monitor_logger.info(f"File '{relative_file_path}' matches pattern '{pattern}'.")
-                    break
-            
-            if not file_is_relevant:
-                monitor_logger.info(f"File '{relative_file_path}' not relevant. Ignored.")
-                return
-
-            monitor_logger.info(f"Relevant file '{relative_file_path}' changed. Preparing for S3.")
-
-            current_time = time.time()
-            if filepath_to_check in last_sync_file_map and \
-               (current_time - last_sync_file_map[filepath_to_check] < SYNC_DEBOUNCE_SECONDS):
-                monitor_logger.info(f"Debounce for '{filepath_to_check}'. Skipped.")
-                return
-
-            s3_dest_path = f"s3://{S3_BUCKET}/{relative_file_path}"
-            monitor_logger.info(f"Copying '{filepath_to_check}' to '{s3_dest_path}'...")
-
-            process = subprocess.run(
-                [AWS_CLI_PATH, 's3', 'cp', filepath_to_check, s3_dest_path, '--acl', 'private', '--only-show-errors'],
-                capture_output=True, text=True, check=False # check=False to handle errors manually
-            )
-
-            if process.returncode == 0:
-                monitor_logger.info(f"S3 copy OK for '{relative_file_path}'.")
-                transfer_logger.info(f"TRANSFERRED: {relative_file_path}")
-                last_sync_file_map[filepath_to_check] = current_time
-            else:
-                monitor_logger.error(f"S3 copy FAILED for '{relative_file_path}'. RC: {process.returncode}. Error: {process.stderr.strip()}")
-
-        except Exception as e:
-            monitor_logger.error(f"Error processing event for {filepath_to_check}: {e}", exc_info=True)
-
-    def on_any_event(self, event): # Catch-all to simplify event handling logic
-        # We are interested in files being fully written.
-        # 'modified' can fire many times. 'closed' (watchdog FileClosedEvent/DirClosedEvent) is better but not always available/reliable with all editors.
-        # 'created' and 'moved' (to new location) are good.
-        # Let's focus on 'created' and 'modified'. Watchdog might coalesce rapid 'modified' events.
-        # A common pattern is to react on FileClosedEvent if available, or on_modified with debounce.
-        # For simplicity with watchdog's base FileSystemEventHandler, let's react on modified and created.
-        # We can also check event.event_type == 'closed' for FileSystemEvent (though it's more for specific event types)
-        
-        # We want to act when a file is fully written. `on_modified` might fire multiple times for one save.
-        # `on_created` is good for new files. `on_moved` for renames/moves.
-        # Let's try to process primarily on created and moved (destination).
-        # And on_modified, but the debounce logic is key here.
-        if event.event_type == 'created' or event.event_type == 'modified' or event.event_type == 'moved':
-             if not event.is_directory: # Only process file events here
-                self.process(event)
-
-
-if __name__ == "__main__":
-    monitor_logger.info(f"Python Watchdog Monitor (v2.3.0) starting for '{MONITOR_DIR_BASE}'.")
-    monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
-    monitor_logger.info(f"Relevant Patterns: {RELEVANT_PATTERNS}")
-    
-    if not S3_BUCKET or not RELEVANT_PATTERNS_STR:
-        monitor_logger.critical("S3_BUCKET or WP_RELEVANT_PATTERNS environment variables not set. Exiting.")
-        exit(1)
-    if not os.path.isdir(MONITOR_DIR_BASE):
-        monitor_logger.critical(f"Monitor directory '{MONITOR_DIR_BASE}' does not exist. Exiting.")
-        exit(1)
-
-    event_handler = Watcher()
-    observer = Observer()
-    observer.schedule(event_handler, MONITOR_DIR_BASE, recursive=True)
-    
-    try:
-        observer.start()
-        monitor_logger.info("Observer started. Monitoring for file changes...")
-        while observer.is_alive(): # Use is_alive() for a cleaner loop
-            observer.join(1) # Wait for 1 second, or until observer thread terminates
-    except KeyboardInterrupt:
-        monitor_logger.info("Keyboard interrupt received. Stopping observer...")
-    except Exception as e:
-        monitor_logger.critical(f"Critical error in observer loop: {e}", exc_info=True)
-    finally:
-        if observer.is_alive():
-            observer.stop()
-        observer.join()
-        monitor_logger.info("Observer stopped and joined. Exiting.")
-EOF_PYTHON_SCRIPT
+    if ! sudo aws s3 cp "$s3_python_script_uri" "$PYTHON_MONITOR_SCRIPT_PATH" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
+        echo "ERRO CRÍTICO: Falha ao baixar o script Python de '$s3_python_script_uri'."
+        echo "ERRO CRÍTICO: Verifique permissões do IAM Role, nome do bucket/chave S3 e região."
+        exit 1
+    fi
 
     sudo chmod +x "$PYTHON_MONITOR_SCRIPT_PATH"
-    echo "INFO: Script de monitoramento Python '$PYTHON_MONITOR_SCRIPT_PATH' criado e tornado executável."
+    echo "INFO: Script de monitoramento Python '$PYTHON_MONITOR_SCRIPT_PATH' baixado e tornado executável."
 }
+
 
 # --- Função para Criar e Habilitar o Serviço Systemd para Python Monitor ---
 create_and_enable_python_monitor_service() {
-    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.0)..."
+    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.1)..."
     local service_file_path="/etc/systemd/system/${PYTHON_MONITOR_SERVICE_NAME}.service"
 
     # Lista de padrões para WP_RELEVANT_PATTERNS (separados por ponto e vírgula)
+    # ATENÇÃO: Esta string será passada como variável de ambiente. Cuidado com caracteres especiais.
+    # É mais seguro se o script Python tiver essa lista embutida ou a ler de um arquivo de config simples.
+    # Por enquanto, vamos passar via env var, mas pode precisar de ajustes se houver muitos patterns complexos.
     local patterns_env_str="wp-content/uploads/*;wp-content/themes/*/*.css;wp-content/themes/*/*.js;wp-content/themes/*/*.jpg;wp-content/themes/*/*.jpeg;wp-content/themes/*/*.png;wp-content/themes/*/*.gif;wp-content/themes/*/*.svg;wp-content/themes/*/*.webp;wp-content/themes/*/*.ico;wp-content/themes/*/*.woff;wp-content/themes/*/*.woff2;wp-content/themes/*/*.ttf;wp-content/themes/*/*.eot;wp-content/themes/*/*.otf;wp-content/plugins/*/*.css;wp-content/plugins/*/*.js;wp-content/plugins/*/*.jpg;wp-content/plugins/*/*.jpeg;wp-content/plugins/*/*.png;wp-content/plugins/*/*.gif;wp-content/plugins/*/*.svg;wp-content/plugins/*/*.webp;wp-content/plugins/*/*.ico;wp-content/plugins/*/*.woff;wp-content/plugins/*/*.woff2;wp-includes/js/*;wp-includes/css/*;wp-includes/images/*"
 
-    # Limpeza de serviço anterior
     echo "INFO: Tentando limpar o serviço '$PYTHON_MONITOR_SERVICE_NAME' existente, se houver..."
     if sudo systemctl is-active "$PYTHON_MONITOR_SERVICE_NAME.service" &>/dev/null; then sudo systemctl stop "$PYTHON_MONITOR_SERVICE_NAME.service"; echo "INFO: Serviço '$PYTHON_MONITOR_SERVICE_NAME' parado."; fi
     if sudo systemctl is-enabled "$PYTHON_MONITOR_SERVICE_NAME.service" &>/dev/null; then sudo systemctl disable "$PYTHON_MONITOR_SERVICE_NAME.service"; echo "INFO: Serviço '$PYTHON_MONITOR_SERVICE_NAME' desabilitado."; fi
@@ -315,11 +159,15 @@ create_and_enable_python_monitor_service() {
     echo "INFO: Limpeza de serviço systemd anterior concluída."
 
     local mount_unit_name; mount_unit_name=$(systemd-escape -p --suffix=mount "$MOUNT_POINT")
-    local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws") # Default to /usr/bin/aws if not in PATH for root's service
+    local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws")
+
+    # Escapar a string de patterns para uso seguro em Environment
+    local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" # Simple assignment, systemd handles most escaping
+
 
     sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
 [Unit]
-Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.0)
+Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.1)
 Documentation=file://$PYTHON_MONITOR_SCRIPT_PATH
 After=network.target remote-fs.target $mount_unit_name
 Requires=$mount_unit_name
@@ -332,12 +180,12 @@ Restart=on-failure
 RestartSec=15s
 Environment="WP_MONITOR_DIR_BASE=$MOUNT_POINT"
 Environment="WP_S3_BUCKET=$AWS_S3_BUCKET_TARGET_NAME_0"
-Environment="WP_RELEVANT_PATTERNS=$patterns_env_str"
+Environment="WP_RELEVANT_PATTERNS=$escaped_patterns_env_str"
 Environment="WP_PY_MONITOR_LOG_FILE=$PY_MONITOR_LOG_FILE"
 Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
 Environment="WP_SYNC_DEBOUNCE_SECONDS=5"
 Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" # Ensure PATH for subprocesses
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 [Install]
 WantedBy=multi-user.target
@@ -351,7 +199,7 @@ EOF_PY_SYSTEMD_SERVICE
     sudo systemctl enable "$PYTHON_MONITOR_SERVICE_NAME.service"
     if sudo systemctl start "$PYTHON_MONITOR_SERVICE_NAME.service"; then
         echo "INFO: Serviço Python $PYTHON_MONITOR_SERVICE_NAME iniciado com sucesso."
-        sleep 3 # Give it a moment to start and possibly log
+        sleep 3
         sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
     else
         echo "ERRO: Falha ao iniciar o serviço Python $PYTHON_MONITOR_SERVICE_NAME."
@@ -364,7 +212,7 @@ EOF_PY_SYSTEMD_SERVICE
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.3.0) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v2.3.1) ($(date)) ---"
 echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
 echo "INFO: =================================================="
 if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root."; exit 1; fi
@@ -387,9 +235,8 @@ echo "INFO: Verificação de variáveis concluída."
 
 echo "INFO: Instalando pacotes (Python3, pip, watchdog)..."
 sudo yum update -y -q
-sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils python3 python3-pip # Adicionado python3, python3-pip
-# sudo yum remove -y inotify-tools # Se não for mais necessário
-sudo pip3 install --upgrade pip # Boa prática
+sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils python3 python3-pip
+sudo pip3 install --upgrade pip
 sudo pip3 install watchdog
 echo "INFO: Pacotes (incluindo watchdog) instalados."
 
@@ -419,21 +266,19 @@ if [ -d "$MOUNT_POINT/wp-includes" ]&&[ -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo 
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"; echo "INFO: Limpeza WP temps OK."
 fi
 
-# Salvar variáveis de ambiente para o script Python usar via systemd Environment.
-# Este arquivo ENV_VARS_FILE pode se tornar menos crucial se todas as vars forem passadas via systemd.
+# Este arquivo ENV_VARS_FILE é menos crítico agora, mas pode ser útil para debug manual ou se o script Python precisar de mais vars.
 echo "INFO: (Opcional) Salvando vars em '$ENV_VARS_FILE'..."
-ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para $PYTHON_MONITOR_SCRIPT_PATH (v2.3.0)\n"
+ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.3.1)\n"
 ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"
 ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_NAME_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_NAME_0")\n"
-# Adicionar outros se o script python precisar ler deste arquivo.
-echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE (para referência ou fallback)."
+echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE."
 
 
 if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "ERRO: $CONFIG_SAMPLE_ON_EFS não encontrado."; exit 1; fi
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando..."; create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"; else echo "WARN: '$ACTIVE_CONFIG_FILE_EFS' já existe."; fi
 
 echo "INFO: Criando health check '$HEALTH_CHECK_FILE_PATH_EFS'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.0 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.1 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php); sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"; echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
 if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then echo "INFO: Health check criado."; else echo "ERRO: Falha criar health check."; fi; rm -f "$TEMP_HEALTH_CHECK_FILE"
 
@@ -443,7 +288,7 @@ sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; ; sudo find "$MOUNT_POINT
 if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi; if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi; echo "INFO: Permissões ajustadas."
 
 echo "INFO: Configurando Apache..."
-HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.0.conf"
+HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.1.conf"
 if [ ! -f "$HTTPD_WP_CONF" ]; then echo "INFO: Criando $HTTPD_WP_CONF"; sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF_APACHE_CONF
 <Directory "${MOUNT_POINT}">
     AllowOverride All
@@ -467,12 +312,12 @@ if ! sudo systemctl restart httpd; then echo "ERRO: Falha reiniciar httpd."; sud
 sleep 3; if systemctl is-active --quiet httpd && systemctl is-active --quiet php-fpm; then echo "INFO: httpd e php-fpm ativos."; else echo "ERRO: httpd ou php-fpm não ativos."; exit 1; fi
 
 # --- Configuração do Monitoramento Python com Watchdog ---
-create_python_monitor_script
-create_and_enable_python_monitor_service
+setup_python_monitor_script # Baixa o script Python do S3
+create_and_enable_python_monitor_service # Cria e inicia o serviço systemd para o script Python
 
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.3.0) concluído! ($(date)) ---"
-echo "INFO: Sincronização com S3 agora é via Python Watchdog."
+echo "INFO: --- Script WordPress Setup (v2.3.1) concluído! ($(date)) ---"
+echo "INFO: Sincronização com S3 agora é via Python Watchdog (script baixado do S3)."
 echo "INFO: Script de monitoramento Python: $PYTHON_MONITOR_SCRIPT_PATH"
 echo "INFO: Serviço Python: $PYTHON_MONITOR_SERVICE_NAME (Log do monitor: $PY_MONITOR_LOG_FILE, Log de transferências: $PY_S3_TRANSFER_LOG_FILE)"
 echo "INFO: Logs: Principal=${LOG_FILE}"
