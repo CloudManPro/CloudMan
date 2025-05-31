@@ -1,21 +1,25 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.3.1-zero-touch-s3-python-watchdog-external (Downloads Python script from S3)
+# Versão: 2.3.2-zero-touch-s3-python-watchdog-hardcoded-pykey (Hardcoded Python Script Key)
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.1.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.2.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.1_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.2_env_vars.sh"
 
 # Script de Monitoramento Python e Serviço
-readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.1.py" # Nome do script Python na instância
+readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.2.py" # Nome do script Python na instância
 readonly PYTHON_MONITOR_SCRIPT_PATH="/usr/local/bin/$PYTHON_MONITOR_SCRIPT_NAME"
-readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.1"
-readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.1.log"
-readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.1.log"
+readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.2"
+readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.2.log"
+readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.2.log"
+
+# --- VALOR HARDCODED PARA A CHAVE DO SCRIPT PYTHON NO S3 ---
+# !!! AJUSTE ESTE VALOR PARA O CAMINHO CORRETO DO SEU SCRIPT PYTHON NO BUCKET S3 !!!
+readonly AWS_S3_PYTHON_SCRIPT_KEY="scripts/efs_s3_monitor.py" # Exemplo: 'scripts/efs_s3_monitor.py' ou 'efs_s3_monitor.py'
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.3.1.log"
+LOG_FILE="/var/log/wordpress_setup_v2.3.2.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -28,6 +32,7 @@ EFS_OWNER_UID=1000
 EFS_OWNER_USER="ec2-user"
 
 # --- Variáveis Essenciais (Esperadas do Ambiente, carregadas pelo UserData) ---
+# AWS_S3_PYTHON_SCRIPT_KEY foi REMOVIDA desta lista
 essential_vars=(
     "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"
     "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"
@@ -40,13 +45,12 @@ essential_vars=(
     "AWS_S3_BUCKET_TARGET_NAME_0"    # Bucket para offload de estáticos do WP
     "AWS_S3_BUCKET_TARGET_NAME_SCRIPT" # Bucket onde os scripts (este e o Python) estão
     "AWS_S3_BUCKET_TARGET_REGION_SCRIPT" # Região do bucket de scripts
-    "AWS_S3_PYTHON_SCRIPT_KEY"       # Chave/Caminho do script Python no bucket de scripts
     # "AWS_CLOUDFRONT_DISTRIBUTION_ID_0"
 )
 
 # --- Função de Auto-Instalação do Script Principal ---
 self_install_script() {
-    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.1)..."
+    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.2)..."
     local current_script_path; current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
     if ! cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then echo "ERRO CRÍTICO (self_install): Falha ao copiar script. Abortando."; exit 1; fi
@@ -54,7 +58,7 @@ self_install_script() {
     echo "INFO (self_install): Script principal instalado e executável em $THIS_SCRIPT_TARGET_PATH."
 }
 
-# --- Funções Auxiliares (mount_efs, create_wp_config_template - idênticas à v2.2.2) ---
+# --- Funções Auxiliares (mount_efs, create_wp_config_template - idênticas à v2.3.1) ---
 mount_efs() {
     local efs_id=$1; local mount_point_arg=$2; local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}"
     local max_retries=5; local retry_delay_seconds=15; local attempt_num=1
@@ -97,7 +101,7 @@ create_wp_config_template() {
         rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
     else echo "ERRO: Falha ao obter SALTS."; fi
     PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.3.1.sh
+// Gerado por wordpress_setup_v2.3.2.sh
 \$site_scheme = 'https';
 \$site_host = '$primary_wpdomain_for_fallback';
 if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
@@ -117,13 +121,13 @@ EOPHP
 
 # --- Função para Baixar e Configurar o Script de Monitoramento Python ---
 setup_python_monitor_script() {
-    echo "INFO: Baixando e configurando script de monitoramento Python (v2.3.1)..."
+    echo "INFO: Baixando e configurando script de monitoramento Python (v2.3.2)..."
 
-    # Verificar variáveis S3 para o script Python
+    # AWS_S3_PYTHON_SCRIPT_KEY é agora uma constante readonly definida no topo deste script.
     if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] || \
        [ -z "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}" ] || \
-       [ -z "${AWS_S3_PYTHON_SCRIPT_KEY:-}" ]; then
-        echo "ERRO CRÍTICO: Variáveis para download do script Python não definidas (BUCKET_SCRIPT, REGION_SCRIPT, PYTHON_SCRIPT_KEY)."
+       [ -z "$AWS_S3_PYTHON_SCRIPT_KEY" ]; then # Verifica a constante
+        echo "ERRO CRÍTICO: Variáveis para download do script Python não definidas (BUCKET_SCRIPT, REGION_SCRIPT ou AWS_S3_PYTHON_SCRIPT_KEY hardcoded está vazia)."
         exit 1
     fi
 
@@ -132,7 +136,7 @@ setup_python_monitor_script() {
 
     if ! sudo aws s3 cp "$s3_python_script_uri" "$PYTHON_MONITOR_SCRIPT_PATH" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
         echo "ERRO CRÍTICO: Falha ao baixar o script Python de '$s3_python_script_uri'."
-        echo "ERRO CRÍTICO: Verifique permissões do IAM Role, nome do bucket/chave S3 e região."
+        echo "ERRO CRÍTICO: Verifique permissões do IAM Role, nome do bucket/chave S3 ('$AWS_S3_BUCKET_TARGET_NAME_SCRIPT' / '$AWS_S3_PYTHON_SCRIPT_KEY') e região ('$AWS_S3_BUCKET_TARGET_REGION_SCRIPT')."
         exit 1
     fi
 
@@ -143,13 +147,8 @@ setup_python_monitor_script() {
 
 # --- Função para Criar e Habilitar o Serviço Systemd para Python Monitor ---
 create_and_enable_python_monitor_service() {
-    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.1)..."
+    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.2)..."
     local service_file_path="/etc/systemd/system/${PYTHON_MONITOR_SERVICE_NAME}.service"
-
-    # Lista de padrões para WP_RELEVANT_PATTERNS (separados por ponto e vírgula)
-    # ATENÇÃO: Esta string será passada como variável de ambiente. Cuidado com caracteres especiais.
-    # É mais seguro se o script Python tiver essa lista embutida ou a ler de um arquivo de config simples.
-    # Por enquanto, vamos passar via env var, mas pode precisar de ajustes se houver muitos patterns complexos.
     local patterns_env_str="wp-content/uploads/*;wp-content/themes/*/*.css;wp-content/themes/*/*.js;wp-content/themes/*/*.jpg;wp-content/themes/*/*.jpeg;wp-content/themes/*/*.png;wp-content/themes/*/*.gif;wp-content/themes/*/*.svg;wp-content/themes/*/*.webp;wp-content/themes/*/*.ico;wp-content/themes/*/*.woff;wp-content/themes/*/*.woff2;wp-content/themes/*/*.ttf;wp-content/themes/*/*.eot;wp-content/themes/*/*.otf;wp-content/plugins/*/*.css;wp-content/plugins/*/*.js;wp-content/plugins/*/*.jpg;wp-content/plugins/*/*.jpeg;wp-content/plugins/*/*.png;wp-content/plugins/*/*.gif;wp-content/plugins/*/*.svg;wp-content/plugins/*/*.webp;wp-content/plugins/*/*.ico;wp-content/plugins/*/*.woff;wp-content/plugins/*/*.woff2;wp-includes/js/*;wp-includes/css/*;wp-includes/images/*"
 
     echo "INFO: Tentando limpar o serviço '$PYTHON_MONITOR_SERVICE_NAME' existente, se houver..."
@@ -160,14 +159,11 @@ create_and_enable_python_monitor_service() {
 
     local mount_unit_name; mount_unit_name=$(systemd-escape -p --suffix=mount "$MOUNT_POINT")
     local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws")
-
-    # Escapar a string de patterns para uso seguro em Environment
-    local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" # Simple assignment, systemd handles most escaping
-
+    local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str"
 
     sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
 [Unit]
-Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.1)
+Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.2)
 Documentation=file://$PYTHON_MONITOR_SCRIPT_PATH
 After=network.target remote-fs.target $mount_unit_name
 Requires=$mount_unit_name
@@ -212,8 +208,9 @@ EOF_PY_SYSTEMD_SERVICE
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.3.1) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v2.3.2) ($(date)) ---"
 echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
+echo "INFO: Python Script S3 Key (Hardcoded): $AWS_S3_PYTHON_SCRIPT_KEY"
 echo "INFO: =================================================="
 if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root."; exit 1; fi
 
@@ -222,14 +219,21 @@ self_install_script
 echo "INFO: Verificando e imprimindo variáveis de ambiente essenciais..."
 if [ -z "${ACCOUNT:-}" ]; then ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); if [ -n "$ACCOUNT_STS" ]; then ACCOUNT="$ACCOUNT_STS"; echo "INFO: ACCOUNT ID obtido via STS: $ACCOUNT"; else echo "WARN: Falha obter ACCOUNT ID via STS."; ACCOUNT=""; fi; fi
 AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""; if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ]&&[ -n "${ACCOUNT:-}" ]&&[ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"; fi
-error_found=0; echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS ---"
+error_found=0; echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS E HARDCODED ---"
 for var_name in "${essential_vars[@]}"; do
     current_var_value="${!var_name:-UNDEFINED}"; var_name_for_check="$var_name"; current_var_value_to_check="${!var_name:-}"
     if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then current_var_value_to_check="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"; var_name_for_check="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (de $var_name)"; fi
-    echo "INFO: Var: $var_name_for_check = '$current_var_value_to_check'"
+    echo "INFO: Var (env): $var_name_for_check = '$current_var_value_to_check'"
     if [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && [ -z "$current_var_value_to_check" ]; then echo "ERRO: Var essencial '$var_name_for_check' vazia."; error_found=1; fi
-done; echo "INFO: --- FIM DOS VALORES DAS VARIÁVEIS ---"
-if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis essenciais faltando. Abortando."; exit 1; fi
+done
+# Imprimir e verificar a variável hardcoded
+echo "INFO: Var (hardcoded): AWS_S3_PYTHON_SCRIPT_KEY = '$AWS_S3_PYTHON_SCRIPT_KEY'"
+if [ -z "$AWS_S3_PYTHON_SCRIPT_KEY" ]; then
+    echo "ERRO CRÍTICO: Variável hardcoded AWS_S3_PYTHON_SCRIPT_KEY está vazia no script! Defina seu valor no topo do script."
+    error_found=1
+fi
+echo "INFO: --- FIM DOS VALORES DAS VARIÁVEIS ---"
+if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando ou mal configuradas. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
 
@@ -266,9 +270,8 @@ if [ -d "$MOUNT_POINT/wp-includes" ]&&[ -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo 
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"; echo "INFO: Limpeza WP temps OK."
 fi
 
-# Este arquivo ENV_VARS_FILE é menos crítico agora, mas pode ser útil para debug manual ou se o script Python precisar de mais vars.
 echo "INFO: (Opcional) Salvando vars em '$ENV_VARS_FILE'..."
-ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.3.1)\n"
+ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.3.2)\n"
 ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"
 ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_NAME_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_NAME_0")\n"
 echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE."
@@ -278,7 +281,7 @@ if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "ERRO: $CONFIG_SAMPLE_ON_EFS não
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando..."; create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"; else echo "WARN: '$ACTIVE_CONFIG_FILE_EFS' já existe."; fi
 
 echo "INFO: Criando health check '$HEALTH_CHECK_FILE_PATH_EFS'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.1 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.2 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php); sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"; echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
 if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then echo "INFO: Health check criado."; else echo "ERRO: Falha criar health check."; fi; rm -f "$TEMP_HEALTH_CHECK_FILE"
 
@@ -288,7 +291,7 @@ sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; ; sudo find "$MOUNT_POINT
 if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi; if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi; echo "INFO: Permissões ajustadas."
 
 echo "INFO: Configurando Apache..."
-HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.1.conf"
+HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.2.conf"
 if [ ! -f "$HTTPD_WP_CONF" ]; then echo "INFO: Criando $HTTPD_WP_CONF"; sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF_APACHE_CONF
 <Directory "${MOUNT_POINT}">
     AllowOverride All
@@ -316,12 +319,13 @@ setup_python_monitor_script # Baixa o script Python do S3
 create_and_enable_python_monitor_service # Cria e inicia o serviço systemd para o script Python
 
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.3.1) concluído! ($(date)) ---"
+echo "INFO: --- Script WordPress Setup (v2.3.2) concluído! ($(date)) ---"
 echo "INFO: Sincronização com S3 agora é via Python Watchdog (script baixado do S3)."
 echo "INFO: Script de monitoramento Python: $PYTHON_MONITOR_SCRIPT_PATH"
 echo "INFO: Serviço Python: $PYTHON_MONITOR_SERVICE_NAME (Log do monitor: $PY_MONITOR_LOG_FILE, Log de transferências: $PY_S3_TRANSFER_LOG_FILE)"
 echo "INFO: Logs: Principal=${LOG_FILE}"
 echo "INFO: Site: https://${WPDOMAIN}, Health Check: /healthcheck.php"
 echo "INFO: LEMBRE-SE de configurar o EFS Access Point com uid=48 e gid=48."
+echo "INFO: LEMBRE-SE de colocar o script Python ($PYTHON_MONITOR_SCRIPT_NAME ou o nome que você usar) no bucket S3 '$AWS_S3_BUCKET_TARGET_NAME_SCRIPT' com a chave '$AWS_S3_PYTHON_SCRIPT_KEY'."
 echo "INFO: =================================================="
 exit 0
