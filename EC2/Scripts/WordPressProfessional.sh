@@ -42,60 +42,67 @@ essential_vars=(
 )
 
 # --- Função de Auto-Instalação e Configuração do Sudoers ---
+# DENTRO DO SCRIPT wordpress_setup_v2.1.sh (ou chame de v2.1.1)
+
+# --- Função de Auto-Instalação e Configuração do Sudoers ---
 self_install_and_configure_sudoers() {
     echo "INFO (self_install): Iniciando auto-instalação e configuração do sudoers..."
+    # ... (cópia do script para THIS_SCRIPT_TARGET_PATH como antes) ...
     local current_script_path
     current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
     echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
-    if ! cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then
+    if ! cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then # Mudança aqui para não usar sudo se já for root
         echo "ERRO CRÍTICO (self_install): Falha ao copiar script para '$THIS_SCRIPT_TARGET_PATH'. Abortando."
         exit 1
     fi
-    chmod +x "$THIS_SCRIPT_TARGET_PATH"
+    chmod +x "$THIS_SCRIPT_TARGET_PATH" # Mudança aqui para não usar sudo se já for root
     echo "INFO (self_install): Script copiado e tornado executável em $THIS_SCRIPT_TARGET_PATH."
 
-    # Verificar e tentar ativar #includedir /etc/sudoers.d no /etc/sudoers principal
-    if grep -q "^#includedir /etc/sudoers.d" /etc/sudoers; then
-        echo "INFO (self_install): A diretiva '#includedir /etc/sudoers.d' está comentada em /etc/sudoers."
-        echo "INFO (self_install): Tentando descomentar (REQUER QUE O SCRIPT RODE COMO ROOT E TENHA PERMISSÕES DE ESCRITA EM /etc/sudoers via sudo)..."
-        # CUIDADO: Esta operação é sensível. Fazer backup do /etc/sudoers antes seria prudente em produção manual.
-        # Usando sed para substituir. Se falhar, a criação do arquivo em sudoers.d não terá efeito.
-        if sudo sed -i.bak -e 's|^#includedir /etc/sudoers.d|includedir /etc/sudoers.d|' /etc/sudoers; then
-            echo "INFO (self_install): Diretiva 'includedir /etc/sudoers.d' descomentada em /etc/sudoers. Backup criado em /etc/sudoers.bak"
-            # Validar a sintaxe do sudoers principal após a modificação
-            if ! sudo visudo -c -f /etc/sudoers; then
-                echo "ERRO CRÍTICO (self_install): /etc/sudoers ficou com sintaxe inválida após descomentar 'includedir'. Restaurando backup."
-                sudo mv /etc/sudoers.bak /etc/sudoers
-                echo "ERRO CRÍTICO (self_install): Não foi possível ativar 'includedir /etc/sudoers.d'. Regras em /etc/sudoers.d/ podem não funcionar."
-            else
-                 echo "INFO (self_install): /etc/sudoers principal validado após modificação."
-            fi
-        else
-            echo "AVISO (self_install): Falha ao tentar descomentar '#includedir /etc/sudoers.d' em /etc/sudoers. Verifique manualmente."
-        fi
-    elif ! grep -q "^includedir /etc/sudoers.d" /etc/sudoers; then
-        echo "AVISO (self_install): Diretiva 'includedir /etc/sudoers.d' não encontrada em /etc/sudoers. Regras em /etc/sudoers.d/ podem não funcionar. Adicione-a manualmente se necessário."
-    else
-        echo "INFO (self_install): Diretiva 'includedir /etc/sudoers.d' já parece estar ativa em /etc/sudoers."
-    fi
 
+    # Verificar a diretiva includedir no /etc/sudoers principal
+    if grep -q "^#includedir /etc/sudoers.d" /etc/sudoers; then
+        echo "AVISO IMPORTANTE (self_install): A diretiva 'includedir /etc/sudoers.d' está comentada em /etc/sudoers."
+        echo "AVISO IMPORTANTE (self_install): Regras em /etc/sudoers.d/ (como a que será criada) NÃO terão efeito."
+        echo "AVISO IMPORTANTE (self_install): Você precisará descomentar essa linha manualmente usando 'sudo visudo' e removendo o '#' inicial."
+        echo "AVISO IMPORTANTE (self_install): Exemplo: mude '#includedir /etc/sudoers.d' para 'includedir /etc/sudoers.d'."
+    elif ! grep -q "^includedir /etc/sudoers.d" /etc/sudoers; then
+        echo "AVISO IMPORTANTE (self_install): Diretiva 'includedir /etc/sudoers.d' não encontrada ou não ativa em /etc/sudoers."
+        echo "AVISO IMPORTANTE (self_install): Regras em /etc/sudoers.d/ podem não funcionar."
+        echo "AVISO IMPORTANTE (self_install): Certifique-se de que 'includedir /etc/sudoers.d' (sem '#') está presente em /etc/sudoers."
+    else
+        echo "INFO (self_install): Diretiva 'includedir /etc/sudoers.d' parece estar ativa em /etc/sudoers."
+    fi
 
     local sudoers_entry_path="/etc/sudoers.d/$SUDOERS_FILE_NAME"
     local sudoers_content="$APACHE_USER ALL=(ALL) NOPASSWD: $THIS_SCRIPT_TARGET_PATH s3sync"
     echo "INFO (self_install): Configurando sudoers em $sudoers_entry_path para o usuário '$APACHE_USER'..."
-    if echo "$sudoers_content" | sudo tee "$sudoers_entry_path" > /dev/null; then
-        sudo chmod 0440 "$sudoers_entry_path"
-        # Validar o arquivo específico
-        if sudo visudo -c -f "$sudoers_entry_path"; then
-            echo "INFO (self_install): Configuração do sudoers '$sudoers_entry_path' concluída e validada."
+    # Usar sudo para tee e chmod, pois o script principal roda como root no UserData
+    echo "$sudoers_content" | sudo tee "$sudoers_entry_path" > /dev/null
+    if [ $? -ne 0 ]; then
+        echo "ERRO CRÍTICO (self_install): Falha ao escrever em $sudoers_entry_path. Verifique permissões. Abortando."
+        exit 1
+    fi
+    sudo chmod 0440 "$sudoers_entry_path"
+
+    # Validar o arquivo específico criado E o /etc/sudoers geral
+    # Primeiro, valide o arquivo que acabamos de criar
+    if sudo visudo -c -f "$sudoers_entry_path"; then
+        echo "INFO (self_install): Arquivo sudoers '$sudoers_entry_path' validado com sucesso."
+        # Agora, valide a configuração geral do sudoers
+        if sudo visudo -c; then
+            echo "INFO (self_install): Configuração geral do sudoers (/etc/sudoers e /etc/sudoers.d/*) validada com sucesso."
+            echo "INFO (self_install): Configuração do sudoers '$sudoers_entry_path' concluída."
         else
-            echo "ERRO CRÍTICO (self_install): Arquivo sudoers '$sudoers_entry_path' criado com sintaxe inválida. Removendo..."
+            echo "ERRO CRÍTICO (self_install): Configuração GERAL do sudoers inválida APÓS criar '$sudoers_entry_path'. Isso não deveria acontecer se o arquivo individual foi validado."
+            echo "ERRO CRÍTICO (self_install): Removendo '$sudoers_entry_path' como precaução."
             sudo rm -f "$sudoers_entry_path"
+            echo "ERRO CRÍTICO (self_install): Verifique /etc/sudoers manualmente com 'sudo visudo'."
             exit 1
         fi
     else
-        echo "ERRO CRÍTICO (self_install): Falha ao escrever em $sudoers_entry_path. Verifique se o script está rodando como root. Abortando."
+        echo "ERRO CRÍTICO (self_install): Arquivo sudoers '$sudoers_entry_path' criado com sintaxe inválida. Removendo..."
+        sudo rm -f "$sudoers_entry_path"
         exit 1
     fi
     echo "INFO (self_install): Auto-instalação concluída."
