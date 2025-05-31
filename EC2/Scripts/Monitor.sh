@@ -316,8 +316,8 @@ services:
     restart: unless-stopped
     ports: ["${SCRIPT_INTERNAL_FB_PORT}:80"]
     volumes:
-  - "${EFS_MOUNT_POINT}:/srv" # Monta o EFS com permissão de escrita
-  - "${HOST_FB_CONFIG_DIR}:/database" # Persiste o BD e config do FileBrowser
+      - "${EFS_MOUNT_POINT}:/srv" # Monta o EFS com permissão de escrita
+      - "${HOST_FB_CONFIG_DIR}:/database" # Persiste o BD e config do FileBrowser
     environment:
       FB_PORT: "80"
       FB_ADDRESS: "0.0.0.0"
