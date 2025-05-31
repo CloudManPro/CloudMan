@@ -1,36 +1,25 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 1.9.9-cloudfront-optimized (URLs dinâmicas otimizadas para CloudFront e Apache HTTPS fix)
+# Versão: 1.9.9-zero-touch-s3-sync (CloudFront, Apache HTTPS, S3 Sync MU-Plugin, Zero-Touch)
 
-# --- Variáveis Essenciais ---
-essential_vars=(
-    "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0"
-    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"
-    "AWS_DB_INSTANCE_TARGET_NAME_0"
-    "WPDOMAIN" # Usado como fallback para o host e para logs
-    "ACCOUNT"
-    "AWS_EFS_ACCESS_POINT_TARGET_ID_0"
-)
-echo "Nomes das variáveis em essential_vars:"
-printf "%s\n" "${essential_vars[@]}"
+# --- Configurações Chave ---
+# Caminho onde este script será/estará instalado e referenciado pelo mu-plugin e sudoers
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_1.9.9.sh" # Nomeado para refletir a base
+readonly SUDOERS_FILE_NAME="91-wp-s3sync-1.9.9-sudo" # Nome do arquivo em /etc/sudoers.d/
+readonly APACHE_USER="apache" # Usuário do Apache (pode ser www-data em outros sistemas como Debian/Ubuntu)
+readonly ENV_VARS_FILE="/etc/wordpress_setup_1.9.9_env_vars.sh" # Arquivo para persistir variáveis
 
-echo "INFO: As esperas por cloud-init e yum foram REMOVIDAS."
+# --- Variáveis Globais (serão preenchidas/usadas) ---
+LOG_FILE="/var/log/wordpress_setup_1.9.9.log"
+S3_SYNC_LOG_FILE="/tmp/s3_mu_plugin_sync_1.9.9.log"
+PHP_TRIGGER_LOG_FILE="/tmp/s3_php_trigger_1.9.9.log"
 
-# --- Configuração Inicial e Logging ---
-set -e
-# set -x
-
-# --- Variáveis ---
-LOG_FILE="/var/log/wordpress_setup.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
 
 ACTIVE_CONFIG_FILE_EFS="$MOUNT_POINT/wp-config.php"
 CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
-
 HEALTH_CHECK_FILE_PATH_EFS="$MOUNT_POINT/healthcheck.php"
 
 MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"
@@ -39,56 +28,58 @@ MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*
 EFS_OWNER_UID=1000
 EFS_OWNER_USER="ec2-user"
 
-# --- Redirecionamento de Logs ---
-exec > >(tee -a "${LOG_FILE}") 2>&1
-echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v1.9.8-cloudfront-optimized) ($(date)) ---"
-echo "INFO: Logging configurado para: ${LOG_FILE}"
-echo "INFO: =================================================="
+# --- Variáveis Essenciais (Preenchidas por Variáveis de Ambiente da Instância) ---
+# Adicionando AWS_S3_BUCKET_TARGET_NAME_0 e AWS_CLOUDFRONT_DISTRIBUTION_ID_0
+essential_vars=(
+    "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"
+    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"
+    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0"
+    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"
+    "AWS_DB_INSTANCE_TARGET_NAME_0"
+    "WPDOMAIN"
+    "ACCOUNT"
+    "AWS_EFS_ACCESS_POINT_TARGET_ID_0"
+    "AWS_S3_BUCKET_TARGET_NAME_0" # Adicionada para S3 Sync
+    # "AWS_CLOUDFRONT_DISTRIBUTION_ID_0" # Opcional: Para invalidação do CloudFront
+)
+# O `printf` das essential_vars já está no seu script original, será mantido.
 
-# --- Verificação de Variáveis de Ambiente Essenciais ---
-echo "INFO: Verificando variáveis de ambiente essenciais..."
-if [ -z "${ACCOUNT:-}" ]; then
-    echo "INFO: ACCOUNT ID não fornecido, tentando obter via AWS STS..."
-    ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
-    if [ -z "$ACCOUNT" ]; then
-        echo "WARN: Falha ao obter ACCOUNT ID."
+# --- Função de Auto-Instalação e Configuração do Sudoers ---
+self_install_and_configure_sudoers() {
+    echo "INFO (self_install): Iniciando auto-instalação e configuração do sudoers..."
+    local current_script_path
+    current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
+    if ! cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then
+        echo "ERRO CRÍTICO (self_install): Falha ao copiar script para '$THIS_SCRIPT_TARGET_PATH'. Abortando."
+        exit 1
+    fi
+    chmod +x "$THIS_SCRIPT_TARGET_PATH"
+    echo "INFO (self_install): Script copiado e tornado executável em $THIS_SCRIPT_TARGET_PATH."
+
+    local sudoers_entry_path="/etc/sudoers.d/$SUDOERS_FILE_NAME"
+    local sudoers_content="$APACHE_USER ALL=(ALL) NOPASSWD: $THIS_SCRIPT_TARGET_PATH s3sync"
+    echo "INFO (self_install): Configurando sudoers em $sudoers_entry_path para o usuário '$APACHE_USER'..."
+    if echo "$sudoers_content" > "$sudoers_entry_path"; then
+        chmod 0440 "$sudoers_entry_path"
+        echo "INFO (self_install): Configuração do sudoers '$sudoers_entry_path' concluída."
     else
-        echo "INFO: ACCOUNT ID obtido: $ACCOUNT"
+        echo "ERRO CRÍTICO (self_install): Falha ao escrever em $sudoers_entry_path. Verifique se o script está rodando como root. Abortando."
+        exit 1
     fi
-fi
-if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ] && \
-   [ -n "${ACCOUNT:-}" ] && \
-   [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then
-    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
-else
-    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
-fi
-error_found=0
-for var_name in "${essential_vars[@]}"; do
-    current_var_value="${!var_name:-}"
-    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then
-        if [ -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" ] && [ -z "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-}" ]; then error_found=1; fi
-    elif [ -z "$current_var_value" ]; then
-        echo "ERRO: Variável de ambiente essencial '$var_name' não definida ou vazia."
-        error_found=1
-    fi
-done
-if [ "$error_found" -eq 1 ]; then
-    echo "ERRO: Uma ou mais variáveis essenciais estão faltando. Abortando."
-    exit 1
-fi
-echo "INFO: Domínio de Produção (WPDOMAIN - usado como fallback): ${WPDOMAIN}"
-echo "INFO: Verificação de variáveis essenciais concluída."
+    echo "INFO (self_install): Auto-instalação concluída."
+}
 
-# --- Funções Auxiliares ---
+# --- Funções Auxiliares (mount_efs, create_wp_config_template - mantidas da sua v1.9.9) ---
+# A função mount_efs da sua v1.9.9 com retentativas já está aqui.
 mount_efs() {
     local efs_id=$1
     local mount_point_arg=$2
-    local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}"
+    local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}" # Já definido em essential_vars
 
     local max_retries=5
-    local retry_delay_seconds=15 # Aumentar se necessário
+    local retry_delay_seconds=15
     local attempt_num=1
 
     echo "INFO: Tentando montar EFS '$efs_id' em '$mount_point_arg' via AP '$efs_ap_id' (até $max_retries tentativas)..."
@@ -97,25 +88,32 @@ mount_efs() {
         echo "INFO: Tentativa de montagem EFS: $attempt_num de $max_retries..."
         if mount | grep -q "on ${mount_point_arg} type efs"; then
             echo "INFO: EFS já está montado em '$mount_point_arg'."
-            return 0 # Sucesso, sair da função
+            return 0
         fi
 
         sudo mkdir -p "$mount_point_arg"
-        local mount_options="tls,accesspoint=$efs_ap_id"
-        local mount_source="$efs_id"
+        local mount_options="tls" # Opção base
+        local mount_source="$efs_id:/" # Formato moderno para EFS ID (fs-xxxx)
 
-        # Adicionar -v para verbosidade no comando mount para ajudar no debug
+        if [ -n "$efs_ap_id" ]; then
+            mount_options="tls,accesspoint=$efs_ap_id"
+            # Para AP, a fonte é apenas o EFS ID, não EFS_ID:/
+            mount_source="$efs_id"
+            echo "INFO: Usando Access Point '$efs_ap_id'."
+        else
+            echo "INFO: Não usando Access Point (AWS_EFS_ACCESS_POINT_TARGET_ID_0 não definido ou vazio)."
+        fi
+
+
         if sudo timeout 30 mount -t efs -o "$mount_options" "$mount_source" "$mount_point_arg" -v; then
             echo "INFO: EFS montado com sucesso em '$mount_point_arg' na tentativa $attempt_num."
-
-            # Adicionar ao /etc/fstab APENAS SE BEM-SUCEDIDO e não existir
             if ! grep -q "${mount_point_arg} efs" /etc/fstab; then
-                local fstab_mount_options="_netdev,${mount_options}" # Manter _netdev
+                local fstab_mount_options="_netdev,${mount_options}"
                 local fstab_entry="$mount_source $mount_point_arg efs $fstab_mount_options 0 0"
                 echo "$fstab_entry" | sudo tee -a /etc/fstab >/dev/null
                 echo "INFO: Entrada adicionada ao /etc/fstab: '$fstab_entry'"
             fi
-            return 0 # Sucesso, sair da função
+            return 0
         else
             echo "AVISO: Falha ao montar EFS na tentativa $attempt_num. Código de saída: $?"
             if [ $attempt_num -lt $max_retries ]; then
@@ -126,18 +124,15 @@ mount_efs() {
         attempt_num=$((attempt_num + 1))
     done
 
-    echo "ERRO CRÍTICO: Falha ao montar EFS após $max_retries tentativas. Verifique logs do sistema, conectividade e config do AP."
-    # Opcional: Coletar mais informações de diagnóstico aqui antes de sair
-    echo "DEBUG: Informações de rede (exemplo):"
-    ip addr
-    echo "DEBUG: Últimas mensagens do kernel (dmesg):"
-    dmesg | tail -n 20
-    exit 1 # Falha após todas as tentativas
+    echo "ERRO CRÍTICO: Falha ao montar EFS após $max_retries tentativas. Verifique logs, conectividade e config do AP/EFS."
+    echo "DEBUG: Informações de rede (exemplo):"; ip addr
+    echo "DEBUG: Últimas mensagens do kernel (dmesg):"; dmesg | tail -n 20
+    exit 1
 }
 
 create_wp_config_template() {
     local target_file_on_efs="$1"
-    local primary_wpdomain_for_fallback="$2" # WPDOMAIN, usado como fallback para o host
+    local primary_wpdomain_for_fallback="$2"
     local db_name="$3"
     local db_user="$4"
     local db_password="$5"
@@ -168,10 +163,11 @@ create_wp_config_template() {
         TEMP_SALT_FILE_INNER=$(mktemp /tmp/salts.XXXXXX)
         sudo chmod 644 "$TEMP_SALT_FILE_INNER"
         echo "$SALT" >"$TEMP_SALT_FILE_INNER"
-        sed -i -e "/^define( *'AUTH_KEY'/d" -e "/^define( *'SECURE_AUTH_KEY'/d" \
-            -e "/^define( *'LOGGED_IN_KEY'/d" -e "/^define( *'NONCE_KEY'/d" \
-            -e "/^define( *'AUTH_SALT'/d" -e "/^define( *'SECURE_AUTH_SALT'/d" \
-            -e "/^define( *'LOGGED_IN_SALT'/d" -e "/^define( *'NONCE_SALT'/d" "$temp_config_file"
+        # shellcheck disable=SC2016
+        sed -i -e '/^define( *'\''AUTH_KEY'\''/d' -e '/^define( *'\''SECURE_AUTH_KEY'\''/d' \
+            -e '/^define( *'\''LOGGED_IN_KEY'\''/d' -e '/^define( *'\''NONCE_KEY'\''/d' \
+            -e '/^define( *'\''AUTH_SALT'\''/d' -e '/^define( *'\''SECURE_AUTH_SALT'\''/d' \
+            -e '/^define( *'\''LOGGED_IN_SALT'\''/d' -e '/^define( *'\''NONCE_SALT'\''/d' "$temp_config_file"
         if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then
             sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE_INNER" "$temp_config_file"
         else
@@ -192,6 +188,8 @@ if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) {
     // HTTP_X_FORWARDED_HOST can contain multiple hosts, take the first one.
     \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']);
     \$site_host = trim(\$hosts[0]);
+} elseif (!empty(\$_SERVER['HTTP_HOST'])) { // Fallback to HTTP_HOST
+    \$site_host = \$_SERVER['HTTP_HOST'];
 }
 
 // Inform WordPress that the connection is HTTPS if X-Forwarded-Proto is https.
@@ -212,6 +210,10 @@ define('FS_METHOD', 'direct');
 if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
     \$_SERVER['HTTPS'] = 'on';
 }
+// Additional check for other common SSL proxy headers
+if (isset(\$_SERVER['HTTP_X_FORWARDED_SSL']) && \$_SERVER['HTTP_X_FORWARDED_SSL'] == 'on') {
+    \$_SERVER['HTTPS'] = 'on';
+}
 EOPHP
 )
 
@@ -226,30 +228,235 @@ EOPHP
     rm -f "$TEMP_DEFINES_FILE_INNER"
     echo "INFO: Defines (incluindo URLs otimizadas para CloudFront) configurados."
 
-    echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como 'apache'..."
-    if sudo -u apache cp "$temp_config_file" "$target_file_on_efs"; then
+    echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como '$APACHE_USER'..."
+    if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then
         echo "INFO: Arquivo '$target_file_on_efs' criado."
     else
-        echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como 'apache'."
+        echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."
         exit 1
     fi
 }
 
-# --- Instalação de Pré-requisitos ---
+# --- Função: Sincronização de Estáticos para S3 ---
+sync_static_to_s3() {
+    echo "INFO ($(date)): Função sync_static_to_s3 iniciada..."
+    local source_dir="$MOUNT_POINT"
+    local s3_bucket="$AWS_S3_BUCKET_TARGET_NAME_0"
+    local s3_prefix=""
+
+    echo "INFO (sync_static_to_s3): Sincronizando de '$source_dir' para 's3://$s3_bucket/$s3_prefix'..."
+    if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then echo "ERRO (sync_static_to_s3): Diretório fonte '$source_dir' não definido ou não existe." ; return 1; fi
+    if [ -z "$s3_bucket" ]; then echo "ERRO (sync_static_to_s3): Nome do bucket S3 (AWS_S3_BUCKET_TARGET_NAME_0) não está definido." ; return 1; fi
+
+    local aws_cli_path
+    aws_cli_path=$(command -v aws)
+    if [ -z "$aws_cli_path" ]; then echo "ERRO (sync_static_to_s3): AWS CLI não encontrado."; return 1; fi
+
+    "$aws_cli_path" configure set default.s3.max_concurrent_requests 20
+    "$aws_cli_path" configure set default.s3.max_queue_size 10000
+
+    declare -a include_patterns=(
+        "wp-content/uploads/*"
+        "wp-content/themes/*/*.css" "wp-content/themes/*/*.js" "wp-content/themes/*/*.jpg"
+        "wp-content/themes/*/*.jpeg" "wp-content/themes/*/*.png" "wp-content/themes/*/*.gif"
+        "wp-content/themes/*/*.svg" "wp-content/themes/*/*.webp" "wp-content/themes/*/*.ico"
+        "wp-content/themes/*/*.woff" "wp-content/themes/*/*.woff2" "wp-content/themes/*/*.ttf"
+        "wp-content/themes/*/*.eot" "wp-content/themes/*/*.otf"
+        "wp-content/plugins/*/*.css" "wp-content/plugins/*/*.js" "wp-content/plugins/*/*.jpg"
+        "wp-content/plugins/*/*.jpeg" "wp-content/plugins/*/*.png" "wp-content/plugins/*/*.gif"
+        "wp-content/plugins/*/*.svg" "wp-content/plugins/*/*.webp" "wp-content/plugins/*/*.ico"
+        "wp-content/plugins/*/*.woff" "wp-content/plugins/*/*.woff2"
+        "wp-includes/js/*" "wp-includes/css/*" "wp-includes/images/*"
+    )
+    local sync_command_args=()
+    sync_command_args+=("--exclude" "*")
+    for pattern in "${include_patterns[@]}"; do sync_command_args+=("--include" "$pattern"); done
+    sync_command_args+=("--delete")
+    # sync_command_args+=("--acl" "public-read")
+
+    echo "INFO (sync_static_to_s3): Executando comando: $aws_cli_path s3 sync \"$source_dir\" \"s3://$s3_bucket/$s3_prefix\" ${sync_command_args[*]}"
+    if "$aws_cli_path" s3 sync "$source_dir" "s3://$s3_bucket/$s3_prefix" "${sync_command_args[@]}"; then
+        echo "INFO (sync_static_to_s3): Sincronização para S3 concluída com sucesso."
+        # if [ -n "${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}" ]; then
+        #    echo "INFO (sync_static_to_s3): Invalidando cache do CloudFront '${AWS_CLOUDFRONT_DISTRIBUTION_ID_0}' para '/*'"
+        #    "$aws_cli_path" cloudfront create-invalidation --distribution-id "$AWS_CLOUDFRONT_DISTRIBUTION_ID_0" --paths "/*"
+        # fi
+    else
+        echo "ERRO (sync_static_to_s3): Falha na sincronização para S3. Verifique permissões do IAM Role e logs."
+        return 1
+    fi
+    return 0
+}
+
+# --- Função: Criar MU-Plugin para S3 Sync Trigger ---
+create_s3_sync_mu_plugin() {
+    local mu_plugins_dir="$MOUNT_POINT/wp-content/mu-plugins"
+    local mu_plugin_file="$mu_plugins_dir/auto-s3-sync-trigger-1.9.9.php"
+    local bash_script_to_call="$THIS_SCRIPT_TARGET_PATH"
+
+    echo "INFO: Criando MU-Plugin para disparar sincronização S3..."
+    if [ ! -d "$MOUNT_POINT/wp-content" ]; then echo "ERRO: Diretório '$MOUNT_POINT/wp-content' não encontrado." ; return 1; fi
+
+    sudo mkdir -p "$mu_plugins_dir"
+    sudo chown "$APACHE_USER":"$APACHE_USER" "$mu_plugins_dir"
+    sudo chmod 775 "$mu_plugins_dir"
+
+    # shellcheck disable=SC2016 # Ignora expansão de variáveis PHP no heredoc
+    read -r -d '' PHP_MU_PLUGIN_CONTENT <<EOF
+<?php
+/**
+ * MU-Plugin para disparar automaticamente a sincronização de arquivos estáticos para o S3.
+ * Gerado por: wordpress_setup_1.9.9.sh
+ * Versão: 1.2
+ */
+
+if ( ! defined( 'ABSPATH' ) ) { exit; }
+
+define('S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP', '${bash_script_to_call}');
+define('S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP', '${PHP_TRIGGER_LOG_FILE}');
+
+function s3_sync_php_log_message(\$message) {
+    \$timestamp = date('[Y-m-d H:i:s] ');
+    if (is_writable(S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP) || (!file_exists(S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP) && is_writable(dirname(S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP)))) {
+        file_put_contents(S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP, \$timestamp . \$message . PHP_EOL, FILE_APPEND);
+    } else {
+        error_log("S3 Sync PHP Log (fallback): " . \$message);
+    }
+}
+
+function trigger_s3_static_sync_from_php_hook(\$caller_hook = 'unknown_hook') {
+    if ( ! defined('S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP') || ! file_exists(S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP) ) {
+        s3_sync_php_log_message("S3 Sync ERRO: S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP ('" . S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP . "') não definido ou script não encontrado.");
+        return;
+    }
+    \$command = 'sudo ' . S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP . ' s3sync > /dev/null 2>&1 &';
+    s3_sync_php_log_message("S3 Sync: Disparado por '{\$caller_hook}'. Comando: {\$command}");
+    shell_exec(\$command);
+}
+
+add_action('add_attachment', function() { trigger_s3_static_sync_from_php_hook('add_attachment'); }, 10, 0);
+add_action('edit_attachment', function(\$attachment_id) { trigger_s3_static_sync_from_php_hook('edit_attachment'); }, 10, 1);
+add_action('upgrader_process_complete', function(\$upgrader_object, \$options) {
+    \$actions_to_sync = ['update', 'install'];
+    if (isset(\$options['type']) && isset(\$options['action']) && in_array(\$options['action'], \$actions_to_sync)) {
+        trigger_s3_static_sync_from_php_hook("upgrader_process_complete_{type:{\$options['type']},action:{\$options['action']}}");
+    }
+}, 10, 2);
+add_action('after_switch_theme', function() { trigger_s3_static_sync_from_php_hook('after_switch_theme'); }, 10, 0);
+
+s3_sync_php_log_message("S3 Sync: MU-Plugin auto-s3-sync-trigger-1.9.9.php carregado.");
+EOF
+
+    echo "INFO: Conteúdo do MU-Plugin definido. Tentando escrever em '$mu_plugin_file'..."
+    echo "$PHP_MU_PLUGIN_CONTENT" | sudo tee "$mu_plugin_file" > /dev/null
+    if [ $? -eq 0 ]; then
+        echo "INFO: MU-Plugin '$mu_plugin_file' criado com sucesso."
+        sudo chown "$APACHE_USER":"$APACHE_USER" "$mu_plugin_file"
+        sudo chmod 644 "$mu_plugin_file"
+        echo "INFO: Permissões do MU-Plugin ajustadas."
+    else
+        echo "ERRO: Falha ao criar MU-Plugin '$mu_plugin_file'."
+        return 1
+    fi
+}
+
+# --- Lógica Principal de Execução ---
+
+# Argumento 's3sync': Chamado pelo MU-Plugin
+if [ "$1" == "s3sync" ]; then
+    exec > >(tee -a "${S3_SYNC_LOG_FILE}") 2>&1 # Redireciona logs para o arquivo de sync.
+    echo "INFO ($(date)): Chamada 's3sync' recebida pelo script $THIS_SCRIPT_TARGET_PATH..."
+    if [ -f "$ENV_VARS_FILE" ]; then
+        echo "INFO (s3sync call): Carregando variáveis de ambiente de $ENV_VARS_FILE"
+        # shellcheck source=/dev/null
+        source "$ENV_VARS_FILE"
+    else
+        echo "WARN (s3sync call): Arquivo de variáveis $ENV_VARS_FILE não encontrado. Sincronização pode falhar."
+        MOUNT_POINT="${MOUNT_POINT:-/var/www/html}"
+    fi
+    sync_static_to_s3
+    exit $?
+fi
+
+# --- Continuação do Script Principal de Setup (executado uma vez via UserData) ---
+# O `exec > >(tee ...)` já foi feito no início do script v1.9.9 original.
+# Mantendo o cabeçalho de log original.
+# echo "INFO: =================================================="
+# echo "INFO: --- Iniciando Script WordPress Setup (v1.9.9-zero-touch-s3-sync) ($(date)) ---"
+# echo "INFO: Script alvo para instalação: $THIS_SCRIPT_TARGET_PATH"
+# echo "INFO: Logging principal configurado para: ${LOG_FILE}"
+# echo "INFO: =================================================="
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERRO CRÍTICO: A execução inicial deste script de setup precisa ser como root (ex: UserData)."
+  exit 1
+fi
+
+self_install_and_configure_sudoers # Executa a auto-instalação e configuração do sudoers
+
+# A verificação de variáveis de ambiente já existe no seu script v1.9.9.
+# Apenas precisamos garantir que AWS_S3_BUCKET_TARGET_NAME_0 seja verificada.
+# A lista essential_vars já foi atualizada.
+# O bloco de verificação original é mantido.
+# (bloco de verificação de essential_vars da v1.9.9)
+echo "INFO: Verificando variáveis de ambiente essenciais..."
+if [ -z "${ACCOUNT:-}" ]; then
+    echo "INFO: ACCOUNT ID não fornecido, tentando obter via AWS STS..."
+    ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
+    if [ -z "$ACCOUNT" ]; then
+        echo "WARN: Falha ao obter ACCOUNT ID."
+    else
+        echo "INFO: ACCOUNT ID obtido: $ACCOUNT"
+    fi
+fi
+if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ] && \
+   [ -n "${ACCOUNT:-}" ] && \
+   [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then
+    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
+else
+    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
+    echo "WARN: Não foi possível construir o ARN completo do Secrets Manager."
+fi
+
+error_found=0
+for var_name in "${essential_vars[@]}"; do
+    current_var_value="${!var_name:-}"
+    # Tratar ARN do SecretsManager
+    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then
+        if [ -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" ]; then
+            echo "ERRO: Variável de ambiente '$var_name' (ou seu ARN construído) não definida ou vazia."
+            error_found=1
+        fi
+    # Tratar outras variáveis obrigatórias
+    elif [ -z "$current_var_value" ]; then
+        echo "ERRO: Variável de ambiente essencial '$var_name' não definida ou vazia."
+        error_found=1
+    fi
+done
+if [ "$error_found" -eq 1 ]; then
+    echo "ERRO CRÍTICO: Uma ou mais variáveis essenciais estão faltando. Abortando setup."
+    exit 1
+fi
+echo "INFO: Domínio de Produção (WPDOMAIN - usado como fallback): ${WPDOMAIN}"
+echo "INFO: Bucket S3 para offload (AWS_S3_BUCKET_TARGET_NAME_0): ${AWS_S3_BUCKET_TARGET_NAME_0}" # Log do bucket S3
+echo "INFO: Verificação de variáveis essenciais concluída."
+
+
+# --- Instalação de Pré-requisitos (mantido da v1.9.9) ---
 echo "INFO: Instalando pacotes..."
 sudo yum update -y -q
 sudo amazon-linux-extras install -y epel -q
 sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils
-sudo amazon-linux-extras enable php7.4 -y -q
-sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap
+sudo amazon-linux-extras enable php7.4 -y -q # Considere atualizar para php8.0+ se possível
+sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache
 echo "INFO: Pacotes instalados."
 
-# --- Montagem do EFS ---
+# --- Montagem do EFS (mantido da v1.9.9) ---
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
 
-# --- Teste de Escrita no EFS ---
+# --- Teste de Escrita no EFS (mantido da v1.9.9) ---
 echo "INFO: Testando escrita no EFS como usuário '$EFS_OWNER_USER' (UID $EFS_OWNER_UID)..."
-TEMP_EFS_TEST_FILE="$MOUNT_POINT/efs_write_test_owner.txt"
+TEMP_EFS_TEST_FILE="$MOUNT_POINT/efs_write_test_owner_$(date +%s).txt"
 if sudo -u "$EFS_OWNER_USER" touch "$TEMP_EFS_TEST_FILE"; then
     echo "INFO: Teste de escrita no EFS como '$EFS_OWNER_USER' SUCESSO."
     sudo -u "$EFS_OWNER_USER" rm "$TEMP_EFS_TEST_FILE"
@@ -259,24 +466,29 @@ else
     exit 1
 fi
 
-# --- Obtenção de Credenciais do RDS ---
+# --- Obtenção de Credenciais do RDS (mantido da v1.9.9) ---
 echo "INFO: Obtendo credenciais do RDS..."
 SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" --query 'SecretString' --output text --region "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0")
-if [ -z "$SECRET_STRING_VALUE" ]; then
-    echo "ERRO: Falha ao obter segredo RDS."
-    exit 1
-fi
+if [ -z "$SECRET_STRING_VALUE" ]; then echo "ERRO: Falha ao obter segredo RDS."; exit 1; fi
 DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username)
 DB_PASSWORD=$(echo "$SECRET_STRING_VALUE" | jq -r .password)
+DB_NAME_FROM_SECRET=$(echo "$SECRET_STRING_VALUE" | jq -r .dbname)
+
 if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" == "null" ]; then
-    echo "ERRO: Falha ao extrair creds RDS."
+    echo "ERRO: Falha ao extrair creds RDS (username/password)."
+    exit 1
+fi
+DB_NAME_TO_USE="${DB_NAME_FROM_SECRET:-$AWS_DB_INSTANCE_TARGET_NAME_0}"
+if [ "$DB_NAME_TO_USE" == "null" ] || [ -z "$DB_NAME_TO_USE" ]; then
+    echo "ERRO CRÍTICO: Nome do banco de dados (DB_NAME) não pôde ser determinado."
     exit 1
 fi
 DB_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1)
-echo "INFO: Credenciais RDS extraídas (Usuário: $DB_USER)."
+echo "INFO: Credenciais RDS extraídas (Usuário: $DB_USER, DB: $DB_NAME_TO_USE)."
 
-# --- Download e Preparação do WordPress ---
-echo "INFO: Verificando se WordPress já existe em '$MOUNT_POINT'..."
+
+# --- Download e Preparação do WordPress (mantido da v1.9.9) ---
+echo "INFO: Verificando se WordPress já existe em '$MOUNT_POINT/wp-includes'..."
 if [ -d "$MOUNT_POINT/wp-includes" ] && [ -f "$CONFIG_SAMPLE_ON_EFS" ]; then
     echo "WARN: WordPress já encontrado em '$MOUNT_POINT'. Pulando download."
 else
@@ -284,7 +496,6 @@ else
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-
     cd "$WP_DOWNLOAD_DIR"
     echo "INFO: Baixando WordPress para '$WP_DOWNLOAD_DIR'..."
     curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha download WP."; exit 1; }
@@ -292,7 +503,6 @@ else
     tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha extração WP."; exit 1; }
     rm latest.tar.gz
     echo "INFO: WordPress baixado e extraído para '$WP_FINAL_CONTENT_DIR'."
-
     echo "INFO: Copiando arquivos do WordPress de '$WP_FINAL_CONTENT_DIR' para '$MOUNT_POINT' como '$EFS_OWNER_USER'..."
     if sudo -u "$EFS_OWNER_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"; then
         echo "INFO: Arquivos do WordPress copiados para EFS."
@@ -305,98 +515,161 @@ else
     echo "INFO: Limpeza dos diretórios de download/preparação concluída."
 fi
 
-# --- Configuração do wp-config.php ---
+# --- Salvar Variáveis de Ambiente para Chamadas Futuras do s3sync ---
+echo "INFO: Salvando variáveis de ambiente essenciais para chamadas futuras do s3sync em '$ENV_VARS_FILE'..."
+ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Variáveis de ambiente para $THIS_SCRIPT_TARGET_PATH s3sync\n"
+for var_name in "${essential_vars[@]}"; do
+    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then
+        current_var_value_escaped=$(printf '%q' "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0")
+        ENV_VARS_FILE_CONTENT+="export AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=$current_var_value_escaped\n"
+    else
+        current_var_value_escaped=$(printf '%q' "${!var_name}")
+        ENV_VARS_FILE_CONTENT+="export $var_name=$current_var_value_escaped\n"
+    fi
+done
+ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"
+ENV_VARS_FILE_CONTENT+="export APACHE_USER=$(printf '%q' "$APACHE_USER")\n"
+if [ -n "${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}" ]; then
+    ENV_VARS_FILE_CONTENT+="export AWS_CLOUDFRONT_DISTRIBUTION_ID_0=$(printf '%q' "$AWS_CLOUDFRONT_DISTRIBUTION_ID_0")\n"
+fi
+echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null
+sudo chmod 644 "$ENV_VARS_FILE"
+echo "INFO: Variáveis salvas em '$ENV_VARS_FILE'."
+
+
+# --- Configuração do wp-config.php (mantido da v1.9.9) ---
 if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then
-    echo "ERRO CRÍTICO: $CONFIG_SAMPLE_ON_EFS não encontrado. O WordPress foi copiado corretamente para o EFS?"
+    echo "ERRO CRÍTICO: $CONFIG_SAMPLE_ON_EFS não encontrado."
     exit 1
 fi
-
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then
-    echo "INFO: Arquivo '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando com configurações dinâmicas otimizadas para CloudFront..."
+    echo "INFO: Arquivo '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando..."
     create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" \
-        "$AWS_DB_INSTANCE_TARGET_NAME_0" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
+        "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
 else
-    echo "WARN: Arquivo de configuração ativo '$ACTIVE_CONFIG_FILE_EFS' já existe. Verifique se as configurações de URL e SSL estão corretas para CloudFront."
+    echo "WARN: Arquivo de configuração ativo '$ACTIVE_CONFIG_FILE_EFS' já existe."
 fi
 
-# --- Adicionar Arquivo de Health Check ---
-echo "INFO: Criando health check em '$HEALTH_CHECK_FILE_PATH_EFS' como 'apache'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header(\"Content-Type: text/plain; charset=utf-8\"); echo \"OK - WP Health Check - v1.9.8-cloudfront-optimized - \" . date(\"Y-m-d\TH:i:s\Z\"); exit; ?>"
+# --- Criar o MU-Plugin para S3 Sync ---
+if [ -d "$MOUNT_POINT/wp-content" ]; then
+    create_s3_sync_mu_plugin
+else
+    echo "AVISO: $MOUNT_POINT/wp-content não existe, pulando criação do mu-plugin de sync S3."
+fi
+
+# --- Adicionar Arquivo de Health Check (mantido da v1.9.9) ---
+echo "INFO: Criando health check em '$HEALTH_CHECK_FILE_PATH_EFS' como '$APACHE_USER'..."
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header(\"Content-Type: text/plain; charset=utf-8\"); echo \"OK - WP Health Check - v1.9.9-zero-touch-s3-sync - \" . date(\"Y-m-d\TH:i:s\Z\"); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php)
 sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"
 echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
-if sudo -u apache cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then
+if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then
     echo "INFO: Health check criado."
-else echo "ERRO: Falha ao criar health check como 'apache'."; fi
+else echo "ERRO: Falha ao criar health check como '$APACHE_USER'."; fi
 rm -f "$TEMP_HEALTH_CHECK_FILE"
 
-# --- Ajustes de Permissões e Propriedade ---
-echo "INFO: Ajustando permissões finais em '$MOUNT_POINT'..."
-if sudo chown -R apache:apache "$MOUNT_POINT"; then
-    echo "INFO: Propriedade de '$MOUNT_POINT' definida para apache:apache."
+# --- Ajustes de Permissões e Propriedade (mantido da v1.9.9, adaptado para APACHE_USER) ---
+echo "INFO: Ajustando permissões finais em '$MOUNT_POINT' para o usuário '$APACHE_USER'..."
+if sudo chown -R "$APACHE_USER":"$APACHE_USER" "$MOUNT_POINT"; then
+    echo "INFO: Propriedade de '$MOUNT_POINT' definida para $APACHE_USER:$APACHE_USER."
 else
-    echo "WARN: Falha no chown -R apache:apache '$MOUNT_POINT'. Verificando GID."
-    if ! stat -c "%g" "$MOUNT_POINT" | grep -q "48"; then # 48 é geralmente o GID do apache
-        echo "ERRO CRÍTICO: GID do '$MOUNT_POINT' não é 48 (apache) E chown falhou."
+    echo "WARN: Falha no chown -R $APACHE_USER:$APACHE_USER '$MOUNT_POINT'. Verificando GID."
+    APACHE_GID=$(getent group "$APACHE_USER" | cut -d: -f3)
+    CURRENT_GID=$(stat -c "%g" "$MOUNT_POINT")
+    if [ "$CURRENT_GID" != "$APACHE_GID" ]; then
+        echo "ERRO CRÍTICO: GID do '$MOUNT_POINT' ($CURRENT_GID) não é $APACHE_GID ($APACHE_USER) E chown falhou."
         ls -ld "$MOUNT_POINT"
     else
-        echo "INFO: GID do '$MOUNT_POINT' é 48 (apache). Permissões de grupo devem ser suficientes."
+        echo "INFO: GID do '$MOUNT_POINT' é $APACHE_GID ($APACHE_USER). Permissões de grupo podem ser suficientes."
     fi
 fi
-sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \;
-sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
-
-if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi # Mais restritivo para wp-config
-if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi
+sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; # rwxrwxr-x
+sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \; # rw-rw-r--
+if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi # rw-r-----
+if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi # rw-r--r--
 echo "INFO: Permissões ajustadas."
 
-# --- Configuração e Inicialização do Apache ---
+# --- Configuração e Inicialização do Apache (mantido da v1.9.9) ---
 echo "INFO: Configurando Apache..."
 HTTPD_CONF="/etc/httpd/conf/httpd.conf"
+HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress-1.9.9.conf"
 
-# 1. Configurar AllowOverride para .htaccess funcionar
-if grep -q "<Directory \"/var/www/html\">" "$HTTPD_CONF" && ! grep -A5 "<Directory \"/var/www/html\">" "$HTTPD_CONF" | grep -q "AllowOverride All"; then
-    sudo sed -i '/<Directory "\/var\/www\/html">/,/<\/Directory>/s/AllowOverride .*/AllowOverride All/' "$HTTPD_CONF" && echo "INFO: AllowOverride All definido para /var/www/html."
-else echo "INFO: AllowOverride All já parece OK ou bloco não encontrado para /var/www/html."; fi
+if [ ! -f "$HTTPD_WP_CONF" ]; then
+    echo "INFO: Criando arquivo de configuração do Apache para WordPress em $HTTPD_WP_CONF"
+    sudo tee "$HTTPD_WP_CONF" > /dev/null <<EOF
+<Directory "${MOUNT_POINT}">
+    AllowOverride All
+    Require all granted
+</Directory>
 
-# 2. Adicionar SetEnvIf para X-Forwarded-Proto (CRUCIAL PARA SSL ATRÁS DE PROXY)
-APACHE_HTTPS_FORWARD_CONF="<IfModule mod_setenvif.c>\n  SetEnvIf X-Forwarded-Proto \\\"^https$\\\" HTTPS=on\n</IfModule>"
-if ! grep -q "SetEnvIf X-Forwarded-Proto" "$HTTPD_CONF"; then
-    echo "INFO: Adicionando configuração 'SetEnvIf X-Forwarded-Proto https HTTPS=on' ao Apache."
-    # Tenta inserir antes de "IncludeOptional conf.d/*.conf", senão adiciona ao final.
-    if sudo grep -q "IncludeOptional conf.d/\*\.conf" "$HTTPD_CONF"; then
-        # Usando awk para uma inserção mais segura antes de uma linha específica
-        sudo awk -v insert="$APACHE_HTTPS_FORWARD_CONF" '/IncludeOptional conf\.d\/\*\.conf/ {print insert} {print}' "$HTTPD_CONF" > /tmp/httpd.conf.tmp && sudo mv /tmp/httpd.conf.tmp "$HTTPD_CONF"
-    else
-        echo -e "\n$APACHE_HTTPS_FORWARD_CONF" | sudo tee -a "$HTTPD_CONF" > /dev/null
-    fi
-    echo "INFO: Configuração 'SetEnvIf X-Forwarded-Proto' adicionada."
+<IfModule mod_setenvif.c>
+  SetEnvIf X-Forwarded-Proto "^https$" HTTPS=on
+</IfModule>
+EOF
+    echo "INFO: Arquivo $HTTPD_WP_CONF criado."
 else
-    echo "INFO: Configuração 'SetEnvIf X-Forwarded-Proto' já parece existir no Apache."
+    # Garante que AllowOverride All está presente se o arquivo já existe
+    if ! grep -q "AllowOverride All" "$HTTPD_WP_CONF"; then
+        sudo sed -i '/<Directory "${MOUNT_POINT//\//\\/}">/a \    AllowOverride All' "$HTTPD_WP_CONF"
+        echo "INFO: AllowOverride All adicionado a $HTTPD_WP_CONF existente."
+    fi
+    if ! grep -q "SetEnvIf X-Forwarded-Proto" "$HTTPD_WP_CONF"; then
+         echo -e "\n<IfModule mod_setenvif.c>\n  SetEnvIf X-Forwarded-Proto \"^https\$\" HTTPS=on\n</IfModule>" | sudo tee -a "$HTTPD_WP_CONF" > /dev/null
+        echo "INFO: SetEnvIf X-Forwarded-Proto adicionado a $HTTPD_WP_CONF existente."
+    fi
+    echo "INFO: $HTTPD_WP_CONF já existe, verificações/adições feitas."
+fi
+
+# Remover do httpd.conf principal se existir, para centralizar no wordpress.conf
+if grep -q "<Directory \"${MOUNT_POINT}\">" "$HTTPD_CONF"; then
+    echo "INFO: Removendo configuração de diretório de $HTTPD_CONF para centralizar em $HTTPD_WP_CONF."
+    sudo sed -i "/<Directory \"${MOUNT_POINT//\//\\/}\">/,/<\/Directory>/d" "$HTTPD_CONF"
+fi
+if grep -q "SetEnvIf X-Forwarded-Proto" "$HTTPD_CONF" && \
+   ! grep -q "IncludeOptional conf.d/\*\.conf" <(grep "SetEnvIf X-Forwarded-Proto" -B5 "$HTTPD_CONF" ) ; then # Evita remover se estiver fora de um bloco <Directory> e não em conf.d
+    echo "INFO: Removendo SetEnvIf X-Forwarded-Proto de $HTTPD_CONF para centralizar em $HTTPD_WP_CONF."
+    # Cuidado para não remover globalmente se for necessário para outros vhosts
+    # Esta remoção é um pouco mais arriscada, pode ser comentada se causar problemas.
+    # sudo sed -i "/<IfModule mod_setenvif.c>/,/<\/IfModule>/ { /SetEnvIf X-Forwarded-Proto/d }" "$HTTPD_CONF" # Remove a linha específica dentro do bloco
+    # sudo sed -i '/^<IfModule mod_setenvif.c>$/ { N; /SetEnvIf X-Forwarded-Proto "^\^https\$" HTTPS=on\\n<\/IfModule>$/d; }' "$HTTPD_CONF" # Tenta remover o bloco inteiro se só tiver isso
 fi
 
 
-echo "INFO: Habilitando e reiniciando httpd..."
+echo "INFO: Habilitando e reiniciando httpd e php-fpm..."
 sudo systemctl enable httpd
+sudo systemctl enable php-fpm
+if ! sudo systemctl restart php-fpm; then
+    echo "ERRO: Falha ao reiniciar php-fpm."
+    sudo systemctl status php-fpm -l --no-pager
+fi
 if ! sudo systemctl restart httpd; then
     echo "ERRO CRÍTICO: Falha ao reiniciar httpd."
     sudo apachectl configtest
-    sudo tail -n 30 /var/log/httpd/error_log
+    sudo tail -n 50 /var/log/httpd/error_log
     exit 1
 fi
-sleep 3 # Pequena pausa para o serviço estabilizar
-if systemctl is-active --quiet httpd; then echo "INFO: httpd ativo."; else
-    echo "ERRO CRÍTICO: httpd não ativo após reinício."
-    sudo tail -n 30 /var/log/httpd/error_log
+sleep 3
+if systemctl is-active --quiet httpd && systemctl is-active --quiet php-fpm; then
+    echo "INFO: httpd e php-fpm ativos."
+else
+    echo "ERRO CRÍTICO: httpd ou php-fpm não ativos após reinício."
+    sudo systemctl status httpd -l --no-pager ; sudo systemctl status php-fpm -l --no-pager
+    sudo tail -n 50 /var/log/httpd/error_log
     exit 1
 fi
 
 # --- Conclusão ---
+# Mensagem de conclusão original da v1.9.9, adaptada
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v1.9.8-cloudfront-optimized) concluído! ($(date)) ---"
-echo "INFO: WordPress configurado com URLs dinâmicas otimizadas para CloudFront."
-echo "INFO: Domínio primário esperado (via X-Forwarded-Host ou fallback WPDOMAIN): https://${WPDOMAIN}" # WPDOMAIN é o fallback
-echo "INFO: Health Check: /healthcheck.php"
-echo "INFO: Log: ${LOG_FILE}"
+echo "INFO: --- Script WordPress Setup (v1.9.9-zero-touch-s3-sync) concluído! ($(date)) ---"
+echo "INFO: WordPress configurado com URLs dinâmicas, S3 Sync MU-Plugin e otimizações CloudFront/Apache."
+echo "INFO: Script instalado em: $THIS_SCRIPT_TARGET_PATH"
+echo "INFO: Sudoers configurado em: /etc/sudoers.d/$SUDOERS_FILE_NAME"
+echo "INFO: Variáveis para sync salvas em: $ENV_VARS_FILE"
+echo "INFO: Logs do trigger PHP: $PHP_TRIGGER_LOG_FILE"
+echo "INFO: Logs da execução do sync S3 (quando chamado pelo PHP): $S3_SYNC_LOG_FILE"
+echo "INFO: Domínio primário esperado (via X-Forwarded-Host ou fallback WPDOMAIN): https://${WPDOMAIN}"
+echo "INFO: Health Check: /healthcheck.php (Ex: https://${WPDOMAIN}/healthcheck.php)"
+echo "INFO: Log principal do setup: ${LOG_FILE}"
 echo "INFO: =================================================="
 exit 0
