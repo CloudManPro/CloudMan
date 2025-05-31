@@ -1,32 +1,30 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.2.2-zero-touch-s3-inotify-selective-root-log (Monitors root, Selective S3 Sync, Transfer Log)
+# Versão: 2.3.0-zero-touch-s3-python-watchdog (Python Watchdog for S3 Sync)
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.2.2.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.0.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.2.2_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.0_env_vars.sh" # Para vars que o script Python pode precisar se não passadas via env do systemd
 
-# Script de Monitoramento Inotify e Serviço
-readonly INOTIFY_MONITOR_SCRIPT_PATH="/usr/local/bin/wp_efs_s3_inotify_monitor_v2.2.2.sh"
-readonly INOTIFY_SERVICE_NAME="wp-efs-s3-sync-inotify-v2.2.2"
-readonly INOTIFY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_inotify_monitor_v2.2.2.log"
-readonly S3_TRANSFER_LOG_FILE="/var/log/wp_s3_transferred_files_v2.2.2.log" # Novo log para arquivos transferidos
+# Script de Monitoramento Python e Serviço
+readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.0.py"
+readonly PYTHON_MONITOR_SCRIPT_PATH="/usr/local/bin/$PYTHON_MONITOR_SCRIPT_NAME"
+readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.0"
+readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.0.log"
+readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.0.log"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.2.2.log" # Log deste script principal
+LOG_FILE="/var/log/wordpress_setup_v2.3.0.log"
 
-MOUNT_POINT="/var/www/html" # Raiz do WordPress, será monitorada pelo inotify
+MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
-
 ACTIVE_CONFIG_FILE_EFS="$MOUNT_POINT/wp-config.php"
 CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
 HEALTH_CHECK_FILE_PATH_EFS="$MOUNT_POINT/healthcheck.php"
-
 MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"
 MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
-
 EFS_OWNER_UID=1000
 EFS_OWNER_USER="ec2-user"
 
@@ -46,7 +44,7 @@ essential_vars=(
 
 # --- Função de Auto-Instalação do Script Principal ---
 self_install_script() {
-    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.2.2)..."
+    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.0)..."
     local current_script_path; current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
     if ! cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then echo "ERRO CRÍTICO (self_install): Falha ao copiar script. Abortando."; exit 1; fi
@@ -54,7 +52,7 @@ self_install_script() {
     echo "INFO (self_install): Script principal instalado e executável em $THIS_SCRIPT_TARGET_PATH."
 }
 
-# --- Funções Auxiliares (mount_efs, create_wp_config_template - idênticas à v2.2.0) ---
+# --- Funções Auxiliares (mount_efs, create_wp_config_template - idênticas à v2.2.2) ---
 mount_efs() {
     local efs_id=$1; local mount_point_arg=$2; local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}"
     local max_retries=5; local retry_delay_seconds=15; local attempt_num=1
@@ -78,233 +76,302 @@ mount_efs() {
     echo "ERRO CRÍTICO: Falha ao montar EFS após $max_retries tentativas."; ip addr; dmesg | tail -n 20; exit 1
 }
 
-# --- Função para Criar o Script de Monitoramento Inotify (MODIFICADA) ---
-create_inotify_monitor_script() {
-    echo "INFO: Criando script de monitoramento inotify seletivo em $INOTIFY_MONITOR_SCRIPT_PATH (v2.2.2 - correção array)..."
-
-    local safe_monitor_dir_base; printf -v safe_monitor_dir_base "%q" "$MOUNT_POINT"
-    local safe_inotify_log_file; printf -v safe_inotify_log_file "%q" "$INOTIFY_MONITOR_LOG_FILE"
-    local safe_s3_transfer_log_file; printf -v safe_s3_transfer_log_file "%q" "$S3_TRANSFER_LOG_FILE"
-    local safe_env_vars_file; printf -v safe_env_vars_file "%q" "$ENV_VARS_FILE"
-    local safe_s3_bucket; printf -v safe_s3_bucket "%q" "$AWS_S3_BUCKET_TARGET_NAME_0"
-
-    # Construir a definição do array RELEVANT_PATTERNS corretamente para o script inotify
-    # Cada elemento em uma nova linha, devidamente citado para o shell do script inotify
-    local relevant_patterns_definition="declare -a RELEVANT_PATTERNS=(\n"
-    relevant_patterns_definition+="    \"wp-content/uploads/*\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.css\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.js\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.jpg\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.jpeg\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.png\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.gif\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.svg\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.webp\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.ico\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.woff\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.woff2\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.ttf\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.eot\"\n"
-    relevant_patterns_definition+="    \"wp-content/themes/*/*.otf\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.css\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.js\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.jpg\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.jpeg\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.png\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.gif\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.svg\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.webp\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.ico\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.woff\"\n"
-    relevant_patterns_definition+="    \"wp-content/plugins/*/*.woff2\"\n"
-    relevant_patterns_definition+="    \"wp-includes/js/*\"\n"
-    relevant_patterns_definition+="    \"wp-includes/css/*\"\n"
-    relevant_patterns_definition+="    \"wp-includes/images/*\"\n"
-    relevant_patterns_definition+=")"
-
-
-    # Template do script de monitoramento
-    # A variável $relevant_patterns_definition será injetada aqui
-    local inotify_script_content
-    inotify_script_content=$(cat <<EOF_INOTIFY_TEMPLATE_CONTENT
-#!/bin/bash
-# Script de monitoramento de EFS para S3 Sync usando inotifywait (Seletivo v2.2.2 - array fix)
-# Gerado por: $THIS_SCRIPT_TARGET_PATH
-
-# Valores injetados pelo script de setup:
-readonly MONITOR_DIR_BASE=$safe_monitor_dir_base
-readonly LOG_FILE_INOTIFY=$safe_inotify_log_file
-readonly S3_TRANSFER_LOG_FILE=$safe_s3_transfer_log_file
-readonly ENV_VARS_FOR_SETUP_SCRIPT=$safe_env_vars_file
-readonly S3_BUCKET_TARGET_NAME_0=$safe_s3_bucket
-
-log_inotify_message() {
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') - INOTIFY_MONITOR - \$1" >> "\$LOG_FILE_INOTIFY"
+create_wp_config_template() {
+    local target_file_on_efs="$1"; local primary_wpdomain_for_fallback="$2"; local db_name="$3"; local db_user="$4"; local db_password="$5"; local db_host="$6"
+    local temp_config_file; temp_config_file=$(mktemp /tmp/wp-config.XXXXXX.php); sudo chmod 644 "$temp_config_file"; trap 'rm -f "$temp_config_file"' RETURN
+    echo "INFO: Criando wp-config.php em '$temp_config_file' para EFS '$target_file_on_efs'..."
+    if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "ERRO: '$CONFIG_SAMPLE_ON_EFS' não encontrado."; exit 1; fi
+    sudo cp "$CONFIG_SAMPLE_ON_EFS" "$temp_config_file"
+    SAFE_DB_NAME=$(echo "$db_name" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g"); SAFE_DB_USER=$(echo "$db_user" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
+    SAFE_DB_PASSWORD=$(echo "$db_password" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g"); SAFE_DB_HOST=$(echo "$db_host" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
+    sed -i "s/database_name_here/$SAFE_DB_NAME/g" "$temp_config_file"; sed -i "s/username_here/$SAFE_DB_USER/g" "$temp_config_file"
+    sed -i "s/password_here/$SAFE_DB_PASSWORD/g" "$temp_config_file"; sed -i "s/localhost/$SAFE_DB_HOST/g" "$temp_config_file"
+    SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
+    if [ -n "$SALT" ]; then
+        TEMP_SALT_FILE_INNER=$(mktemp /tmp/salts.XXXXXX); sudo chmod 644 "$TEMP_SALT_FILE_INNER"; echo "$SALT" >"$TEMP_SALT_FILE_INNER"
+        # shellcheck disable=SC2016
+        sed -i -e '/^define( *'\''AUTH_KEY'\''/d' -e '/^define( *'\''SECURE_AUTH_KEY'\''/d' -e '/^define( *'\''LOGGED_IN_KEY'\''/d' -e '/^define( *'\''NONCE_KEY'\''/d' -e '/^define( *'\''AUTH_SALT'\''/d' -e '/^define( *'\''SECURE_AUTH_SALT'\''/d' -e '/^define( *'\''LOGGED_IN_SALT'\''/d' -e '/^define( *'\''NONCE_SALT'\''/d' "$temp_config_file"
+        if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE_INNER" "$temp_config_file"; else cat "$TEMP_SALT_FILE_INNER" >>"$temp_config_file"; fi
+        rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
+    else echo "ERRO: Falha ao obter SALTS."; fi
+    PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
+// Gerado por wordpress_setup_v2.3.0.sh
+\$site_scheme = 'https';
+\$site_host = '$primary_wpdomain_for_fallback';
+if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') { \$_SERVER['HTTPS'] = 'on'; }
+define('WP_HOME', \$site_scheme . '://' . \$site_host); define('WP_SITEURL', \$site_scheme . '://' . \$site_host);
+define('FS_METHOD', 'direct');
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') { \$_SERVER['HTTPS'] = 'on'; }
+if (isset(\$_SERVER['HTTP_X_FORWARDED_SSL']) && \$_SERVER['HTTP_X_FORWARDED_SSL'] == 'on') { \$_SERVER['HTTPS'] = 'on'; }
+EOPHP
+) # Fim do EOPHP deve estar sozinho na linha
+    TEMP_DEFINES_FILE_INNER=$(mktemp /tmp/defines.XXXXXX); sudo chmod 644 "$TEMP_DEFINES_FILE_INNER"; echo -e "\n$PHP_DEFINES_BLOCK_CONTENT" >"$TEMP_DEFINES_FILE_INNER"
+    if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE_INNER" "$temp_config_file"; else cat "$TEMP_DEFINES_FILE_INNER" >>"$temp_config_file"; fi
+    rm -f "$TEMP_DEFINES_FILE_INNER"; echo "INFO: Defines configurados."
+    echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como '$APACHE_USER'..."
+    if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
 }
 
-log_s3_transfer() {
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') - S3_TRANSFER - \$1" >> "\$S3_TRANSFER_LOG_FILE"
-}
+# --- Função para Criar o Script de Monitoramento Python ---
+create_python_monitor_script() {
+    echo "INFO: Criando script de monitoramento Python em $PYTHON_MONITOR_SCRIPT_PATH (v2.3.0)..."
 
-readonly SYNC_DEBOUNCE_SECONDS=3
-declare -A last_sync_file_map # Deve ser declarado antes de ser usado
+    sudo tee "$PYTHON_MONITOR_SCRIPT_PATH" > /dev/null <<'EOF_PYTHON_SCRIPT'
+import time
+import logging
+import subprocess
+import os
+import fnmatch # For glob pattern matching
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-# Carregar variáveis (se houver alguma específica que o aws s3 cp precise e não esteja no ambiente)
-# if [ -f "\$ENV_VARS_FOR_SETUP_SCRIPT" ]; then source "\$ENV_VARS_FOR_SETUP_SCRIPT"; fi
+# Configuration (Read from environment variables passed by systemd service)
+MONITOR_DIR_BASE = os.environ.get('WP_MONITOR_DIR_BASE', '/var/www/html') # Default if not set
+S3_BUCKET = os.environ.get('WP_S3_BUCKET')
+RELEVANT_PATTERNS_STR = os.environ.get('WP_RELEVANT_PATTERNS', '')
+LOG_FILE_MONITOR = os.environ.get('WP_PY_MONITOR_LOG_FILE', '/tmp/wp_py_monitor.log')
+S3_TRANSFER_LOG = os.environ.get('WP_PY_S3_TRANSFER_LOG', '/tmp/wp_py_s3_transferred.log')
+SYNC_DEBOUNCE_SECONDS = int(os.environ.get('WP_SYNC_DEBOUNCE_SECONDS', '5'))
+AWS_CLI_PATH = os.environ.get('WP_AWS_CLI_PATH', 'aws') # Allow overriding aws cli path if needed
 
-if [ ! -d "\$MONITOR_DIR_BASE" ]; then log_inotify_message "ERRO: Diretório base '\$MONITOR_DIR_BASE' não existe."; exit 1; fi
-if [ -z "\$S3_BUCKET_TARGET_NAME_0" ]; then log_inotify_message "ERRO: S3_BUCKET_TARGET_NAME_0 não definido."; exit 1; fi
+RELEVANT_PATTERNS = [p.strip() for p in RELEVANT_PATTERNS_STR.split(';') if p.strip()]
+last_sync_file_map = {} # Debounce per file
 
-log_inotify_message "INFO: Iniciando monitoramento de '\$MONITOR_DIR_BASE' para S3 sync seletivo."
-touch "\$LOG_FILE_INOTIFY" "\$S3_TRANSFER_LOG_FILE"; chmod 644 "\$LOG_FILE_INOTIFY" "\$S3_TRANSFER_LOG_FILE"
+# Ensure log directories exist and files are touchable/writable by the script runner (root)
+def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(name)s - %(levelname)s - %(message)s'):
+    # Create directory if it doesn't exist
+    log_dir = os.path.dirname(log_file)
+    if log_dir and not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            os.chmod(log_dir, 0o755) # Permissions for root to write
+        except Exception as e:
+            print(f"Error creating log directory {log_dir}: {e}")
+            # Fallback to /tmp if creation fails
+            log_file = os.path.join("/tmp", os.path.basename(log_file))
+            print(f"Falling back to log file: {log_file}")
+    
+    # Touch and set permissions for the log file itself
+    try:
+        with open(log_file, 'a'):
+            os.utime(log_file, None)
+        os.chmod(log_file, 0o644) 
+    except Exception as e:
+        print(f"Error touching/chmod log file {log_file}: {e}")
 
-# Definição do array RELEVANT_PATTERNS injetada aqui
-$relevant_patterns_definition
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    handler = logging.FileHandler(log_file, mode='a')
+    handler.setFormatter(logging.Formatter(formatter_str))
+    logger.addHandler(handler)
+    return logger
 
-aws_cli_path=\$(command -v aws)
-if [ -z "\$aws_cli_path" ]; then log_inotify_message "ERRO: AWS CLI não encontrado."; exit 1; fi
+monitor_logger = setup_logger('PY_INOTIFY_MONITOR', LOG_FILE_MONITOR)
+transfer_logger = setup_logger('PY_S3_TRANSFER', S3_TRANSFER_LOG, formatter_str='%(asctime)s - %(message)s')
 
-while true; do
-    inotifywait -q -m -r \\
-        -e create -e modify -e moved_to -e close_write \\
-        --format '%w%f %e' \\
-        --exclude '(\\.swp\$|\\.swx\$|~$|\\.part\$|\\.crdownload\$|cache/|\\.git/|node_modules/|uploads/sites/)' \\
-        "\$MONITOR_DIR_BASE" |
-    while IFS=' ' read -r DETECTED_ABSOLUTE_FILE DETECTED_EVENTS; do
-        if [ -d "\$DETECTED_ABSOLUTE_FILE" ]; then continue; fi
 
-        log_inotify_message "Evento: '\$DETECTED_EVENTS' em '\$DETECTED_ABSOLUTE_FILE'."
-        RELATIVE_FILE_PATH="\${DETECTED_ABSOLUTE_FILE#\$MONITOR_DIR_BASE/}"
+class Watcher(FileSystemEventHandler):
+    def _is_excluded(self, filepath):
+        # Simple exclusion for common temp/junk files - watchdog doesn't have a built-in regex exclude
+        filename = os.path.basename(filepath)
+        if filename.endswith(('.swp', '.swx', '~', '.part', '.crdownload')):
+            return True
+        if '/cache/' in filepath or '/.git/' in filepath or '/node_modules/' in filepath or '/uploads/sites/' in filepath : # Multisite uploads sub-sites
+            return True
+        return False
 
-        file_is_relevant=false
-        for pattern in "\${RELEVANT_PATTERNS[@]}"; do
-            if [[ "\$RELATIVE_FILE_PATH" == \$pattern ]]; then # Match de glob do Bash
-                file_is_relevant=true
-                log_inotify_message "INFO: Arquivo '\$RELATIVE_FILE_PATH' corresponde ao pattern '\$pattern'."
-                break
-            fi
-        done
+    def process(self, event):
+        filepath_to_check = ""
+        event_desc = ""
+
+        if event.event_type == 'moved':
+            filepath_to_check = event.dest_path
+            event_desc = f"MOVED from {event.src_path} to {event.dest_path}"
+        elif event.event_type in ['created', 'modified']:
+            filepath_to_check = event.src_path
+            event_desc = f"{event.event_type.upper()} at {filepath_to_check}"
+        else: # deleted, etc.
+            # monitor_logger.info(f"Ignoring event type: {event.event_type} for {event.src_path}")
+            return
+
+        if event.is_directory or self._is_excluded(filepath_to_check):
+            # monitor_logger.info(f"Ignoring directory or excluded file event: {event_desc}")
+            return
+
+        monitor_logger.info(f"Raw Event: {event_desc}")
+
+        try:
+            if not filepath_to_check.startswith(MONITOR_DIR_BASE + os.path.sep):
+                monitor_logger.info(f"File '{filepath_to_check}' outside base '{MONITOR_DIR_BASE}'. Ignored.")
+                return
+                
+            relative_file_path = os.path.relpath(filepath_to_check, MONITOR_DIR_BASE)
+
+            file_is_relevant = False
+            for pattern in RELEVANT_PATTERNS:
+                if fnmatch.fnmatch(relative_file_path, pattern):
+                    file_is_relevant = True
+                    monitor_logger.info(f"File '{relative_file_path}' matches pattern '{pattern}'.")
+                    break
+            
+            if not file_is_relevant:
+                monitor_logger.info(f"File '{relative_file_path}' not relevant. Ignored.")
+                return
+
+            monitor_logger.info(f"Relevant file '{relative_file_path}' changed. Preparing for S3.")
+
+            current_time = time.time()
+            if filepath_to_check in last_sync_file_map and \
+               (current_time - last_sync_file_map[filepath_to_check] < SYNC_DEBOUNCE_SECONDS):
+                monitor_logger.info(f"Debounce for '{filepath_to_check}'. Skipped.")
+                return
+
+            s3_dest_path = f"s3://{S3_BUCKET}/{relative_file_path}"
+            monitor_logger.info(f"Copying '{filepath_to_check}' to '{s3_dest_path}'...")
+
+            process = subprocess.run(
+                [AWS_CLI_PATH, 's3', 'cp', filepath_to_check, s3_dest_path, '--acl', 'private', '--only-show-errors'],
+                capture_output=True, text=True, check=False # check=False to handle errors manually
+            )
+
+            if process.returncode == 0:
+                monitor_logger.info(f"S3 copy OK for '{relative_file_path}'.")
+                transfer_logger.info(f"TRANSFERRED: {relative_file_path}")
+                last_sync_file_map[filepath_to_check] = current_time
+            else:
+                monitor_logger.error(f"S3 copy FAILED for '{relative_file_path}'. RC: {process.returncode}. Error: {process.stderr.strip()}")
+
+        except Exception as e:
+            monitor_logger.error(f"Error processing event for {filepath_to_check}: {e}", exc_info=True)
+
+    def on_any_event(self, event): # Catch-all to simplify event handling logic
+        # We are interested in files being fully written.
+        # 'modified' can fire many times. 'closed' (watchdog FileClosedEvent/DirClosedEvent) is better but not always available/reliable with all editors.
+        # 'created' and 'moved' (to new location) are good.
+        # Let's focus on 'created' and 'modified'. Watchdog might coalesce rapid 'modified' events.
+        # A common pattern is to react on FileClosedEvent if available, or on_modified with debounce.
+        # For simplicity with watchdog's base FileSystemEventHandler, let's react on modified and created.
+        # We can also check event.event_type == 'closed' for FileSystemEvent (though it's more for specific event types)
         
-        # Fallback específico para uploads, se necessário (a glob * já deve pegar)
-        if ! \$file_is_relevant && [[ "\$RELATIVE_FILE_PATH" == wp-content/uploads/* ]]; then
-            file_is_relevant=true
-            log_inotify_message "INFO: Arquivo '\$RELATIVE_FILE_PATH' (upload) considerado relevante por fallback."
-        fi
+        # We want to act when a file is fully written. `on_modified` might fire multiple times for one save.
+        # `on_created` is good for new files. `on_moved` for renames/moves.
+        # Let's try to process primarily on created and moved (destination).
+        # And on_modified, but the debounce logic is key here.
+        if event.event_type == 'created' or event.event_type == 'modified' or event.event_type == 'moved':
+             if not event.is_directory: # Only process file events here
+                self.process(event)
 
-        if ! \$file_is_relevant; then
-            log_inotify_message "INFO: Arquivo '\$RELATIVE_FILE_PATH' não relevante. Ignorando."
-            continue
-        fi
 
-        log_inotify_message "INFO: Arquivo relevante '\$RELATIVE_FILE_PATH' modificado. Preparando para S3."
+if __name__ == "__main__":
+    monitor_logger.info(f"Python Watchdog Monitor (v2.3.0) starting for '{MONITOR_DIR_BASE}'.")
+    monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
+    monitor_logger.info(f"Relevant Patterns: {RELEVANT_PATTERNS}")
+    
+    if not S3_BUCKET or not RELEVANT_PATTERNS_STR:
+        monitor_logger.critical("S3_BUCKET or WP_RELEVANT_PATTERNS environment variables not set. Exiting.")
+        exit(1)
+    if not os.path.isdir(MONITOR_DIR_BASE):
+        monitor_logger.critical(f"Monitor directory '{MONITOR_DIR_BASE}' does not exist. Exiting.")
+        exit(1)
 
-        current_time=\$(date +%s)
-        # Correção na verificação do array associativo para debounce
-        if [ -v "last_sync_file_map[\$DETECTED_ABSOLUTE_FILE]" ] && \\
-           (( current_time - last_sync_file_map[\$DETECTED_ABSOLUTE_FILE] < SYNC_DEBOUNCE_SECONDS )); then
-            log_inotify_message "INFO: Debounce ativo para '\$DETECTED_ABSOLUTE_FILE'. Pulando."
-            continue
-        fi
+    event_handler = Watcher()
+    observer = Observer()
+    observer.schedule(event_handler, MONITOR_DIR_BASE, recursive=True)
+    
+    try:
+        observer.start()
+        monitor_logger.info("Observer started. Monitoring for file changes...")
+        while observer.is_alive(): # Use is_alive() for a cleaner loop
+            observer.join(1) # Wait for 1 second, or until observer thread terminates
+    except KeyboardInterrupt:
+        monitor_logger.info("Keyboard interrupt received. Stopping observer...")
+    except Exception as e:
+        monitor_logger.critical(f"Critical error in observer loop: {e}", exc_info=True)
+    finally:
+        if observer.is_alive():
+            observer.stop()
+        observer.join()
+        monitor_logger.info("Observer stopped and joined. Exiting.")
+EOF_PYTHON_SCRIPT
 
-        S3_DEST_PATH="s3://\$S3_BUCKET_TARGET_NAME_0/\$RELATIVE_FILE_PATH"
-        log_inotify_message "INFO: Copiando '\$DETECTED_ABSOLUTE_FILE' para '\$S3_DEST_PATH'..."
-
-        if "\$aws_cli_path" s3 cp "\$DETECTED_ABSOLUTE_FILE" "\$S3_DEST_PATH" --acl private --only-show-errors; then
-            log_inotify_message "INFO: Cópia S3 OK para '\$RELATIVE_FILE_PATH'."
-            log_s3_transfer "TRANSFERRED: \$RELATIVE_FILE_PATH"
-            last_sync_file_map["\$DETECTED_ABSOLUTE_FILE"]=\$(date +%s)
-        else
-            log_inotify_message "ERRO: Falha ao copiar '\$RELATIVE_FILE_PATH' para S3."
-        fi
-    done
-    log_inotify_message "AVISO: Loop inotifywait terminou. Reiniciando em 10s..."
-    sleep 10
-done
-EOF_INOTIFY_TEMPLATE_CONTENT
-)
-
-    echo "$inotify_script_content" > "$INOTIFY_MONITOR_SCRIPT_PATH"
-    chmod +x "$INOTIFY_MONITOR_SCRIPT_PATH"
-    echo "INFO: Script de monitoramento inotify '$INOTIFY_MONITOR_SCRIPT_PATH' criado e tornado executável (com correção de array e sintaxe while)."
+    sudo chmod +x "$PYTHON_MONITOR_SCRIPT_PATH"
+    echo "INFO: Script de monitoramento Python '$PYTHON_MONITOR_SCRIPT_PATH' criado e tornado executável."
 }
 
+# --- Função para Criar e Habilitar o Serviço Systemd para Python Monitor ---
+create_and_enable_python_monitor_service() {
+    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.0)..."
+    local service_file_path="/etc/systemd/system/${PYTHON_MONITOR_SERVICE_NAME}.service"
 
-# --- Função para Criar e Habilitar o Serviço Systemd para Inotify (MODIFICADA) ---
-create_and_enable_inotify_service() {
-    echo "INFO: Criando serviço systemd para o monitoramento inotify: $INOTIFY_SERVICE_NAME (v2.2.2)..."
-    local service_file_path="/etc/systemd/system/${INOTIFY_SERVICE_NAME}.service"
+    # Lista de padrões para WP_RELEVANT_PATTERNS (separados por ponto e vírgula)
+    local patterns_env_str="wp-content/uploads/*;wp-content/themes/*/*.css;wp-content/themes/*/*.js;wp-content/themes/*/*.jpg;wp-content/themes/*/*.jpeg;wp-content/themes/*/*.png;wp-content/themes/*/*.gif;wp-content/themes/*/*.svg;wp-content/themes/*/*.webp;wp-content/themes/*/*.ico;wp-content/themes/*/*.woff;wp-content/themes/*/*.woff2;wp-content/themes/*/*.ttf;wp-content/themes/*/*.eot;wp-content/themes/*/*.otf;wp-content/plugins/*/*.css;wp-content/plugins/*/*.js;wp-content/plugins/*/*.jpg;wp-content/plugins/*/*.jpeg;wp-content/plugins/*/*.png;wp-content/plugins/*/*.gif;wp-content/plugins/*/*.svg;wp-content/plugins/*/*.webp;wp-content/plugins/*/*.ico;wp-content/plugins/*/*.woff;wp-content/plugins/*/*.woff2;wp-includes/js/*;wp-includes/css/*;wp-includes/images/*"
 
-    # Garantir que o MOUNT_POINT seja uma dependência explícita para a montagem do EFS
-    # O nome do unit da montagem systemd geralmente é baseado no caminho,
-    # substituindo '/' por '-' e prefixando com o tipo de montagem, e.g., var-www-html.mount
-    # Para EFS, pode ser mais complexo se não estiver no fstab ou se o systemd não o gerenciar automaticamente.
-    # Usar remote-fs.target é um bom começo. Adicionar um `RequiresMountsFor=` se souber o caminho exato do systemd.
-    # Para um ponto de montagem como /var/www/html, a unidade systemd gerada pelo fstab seria var-www-html.mount
-    local mount_unit_name
-    mount_unit_name=$(systemd-escape -p --suffix=mount "$MOUNT_POINT") # Gera o nome da unidade de montagem
+    # Limpeza de serviço anterior
+    echo "INFO: Tentando limpar o serviço '$PYTHON_MONITOR_SERVICE_NAME' existente, se houver..."
+    if sudo systemctl is-active "$PYTHON_MONITOR_SERVICE_NAME.service" &>/dev/null; then sudo systemctl stop "$PYTHON_MONITOR_SERVICE_NAME.service"; echo "INFO: Serviço '$PYTHON_MONITOR_SERVICE_NAME' parado."; fi
+    if sudo systemctl is-enabled "$PYTHON_MONITOR_SERVICE_NAME.service" &>/dev/null; then sudo systemctl disable "$PYTHON_MONITOR_SERVICE_NAME.service"; echo "INFO: Serviço '$PYTHON_MONITOR_SERVICE_NAME' desabilitado."; fi
+    sudo rm -f "$service_file_path"; sudo rm -f "/etc/systemd/system/multi-user.target.wants/${PYTHON_MONITOR_SERVICE_NAME}.service"; sudo systemctl daemon-reload
+    echo "INFO: Limpeza de serviço systemd anterior concluída."
 
-    # Conteúdo do arquivo de serviço systemd
-    # Usar printf para escapar valores que vão para o template
-    local safe_inotify_script_path; printf -v safe_inotify_script_path "%q" "$INOTIFY_MONITOR_SCRIPT_PATH"
-    local safe_inotify_log_file; printf -v safe_inotify_log_file "%q" "$INOTIFY_MONITOR_LOG_FILE"
+    local mount_unit_name; mount_unit_name=$(systemd-escape -p --suffix=mount "$MOUNT_POINT")
+    local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws") # Default to /usr/bin/aws if not in PATH for root's service
 
-    # Usamos um template para o arquivo de serviço para evitar problemas com expansão de variáveis no here-doc
-    local systemd_service_content
-    systemd_service_content=$(cat <<EOF_SYSTEMD_SERVICE_TEMPLATE
+    sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
 [Unit]
-Description=WordPress EFS to S3 Selective Sync Service (v2.2.2)
-Documentation=file://$THIS_SCRIPT_TARGET_PATH
+Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.0)
+Documentation=file://$PYTHON_MONITOR_SCRIPT_PATH
 After=network.target remote-fs.target $mount_unit_name
-Requires=$mount_unit_name # Garante que o EFS esteja montado
+Requires=$mount_unit_name
 
 [Service]
 Type=simple
 User=root
-ExecStart=$safe_inotify_script_path
+ExecStart=/usr/bin/python3 $PYTHON_MONITOR_SCRIPT_PATH
 Restart=on-failure
 RestartSec=15s
-StandardOutput=append:$safe_inotify_log_file
-StandardError=append:$safe_inotify_log_file
+Environment="WP_MONITOR_DIR_BASE=$MOUNT_POINT"
+Environment="WP_S3_BUCKET=$AWS_S3_BUCKET_TARGET_NAME_0"
+Environment="WP_RELEVANT_PATTERNS=$patterns_env_str"
+Environment="WP_PY_MONITOR_LOG_FILE=$PY_MONITOR_LOG_FILE"
+Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
+Environment="WP_SYNC_DEBOUNCE_SECONDS=5"
+Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" # Ensure PATH for subprocesses
 
 [Install]
 WantedBy=multi-user.target
-EOF_SYSTEMD_SERVICE_TEMPLATE
-) # Fim do here-doc do template
+EOF_PY_SYSTEMD_SERVICE
 
-    echo "$systemd_service_content" | sudo tee "$service_file_path" > /dev/null
-    chmod 644 "$service_file_path"
+    sudo chmod 644 "$service_file_path"
     echo "INFO: Arquivo de serviço '$service_file_path' criado."
 
-    echo "INFO: Recarregando daemon systemd, habilitando e iniciando o serviço $INOTIFY_SERVICE_NAME..."
+    echo "INFO: Recarregando daemon systemd, habilitando e iniciando o serviço $PYTHON_MONITOR_SERVICE_NAME..."
     sudo systemctl daemon-reload
-    sudo systemctl enable "$INOTIFY_SERVICE_NAME.service"
-    if sudo systemctl start "$INOTIFY_SERVICE_NAME.service"; then
-        echo "INFO: Serviço $INOTIFY_SERVICE_NAME iniciado com sucesso."
-        sleep 2
-        sudo systemctl status "$INOTIFY_SERVICE_NAME.service" --no-pager -l
+    sudo systemctl enable "$PYTHON_MONITOR_SERVICE_NAME.service"
+    if sudo systemctl start "$PYTHON_MONITOR_SERVICE_NAME.service"; then
+        echo "INFO: Serviço Python $PYTHON_MONITOR_SERVICE_NAME iniciado com sucesso."
+        sleep 3 # Give it a moment to start and possibly log
+        sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
     else
-        echo "ERRO: Falha ao iniciar o serviço $INOTIFY_SERVICE_NAME."
-        sudo systemctl status "$INOTIFY_SERVICE_NAME.service" --no-pager -l
-        journalctl -u "$INOTIFY_SERVICE_NAME" -n 50 --no-pager
+        echo "ERRO: Falha ao iniciar o serviço Python $PYTHON_MONITOR_SERVICE_NAME."
+        sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
+        journalctl -u "$PYTHON_MONITOR_SERVICE_NAME" -n 50 --no-pager
     fi
 }
 
-# --- Lógica Principal de Execução ---
-# REMOVIDO o bloco if [ "$1" == "s3sync" ], pois não há mais uma função s3sync a ser chamada externamente por este script.
-# O script de monitoramento inotify agora lida com o `aws s3 cp`.
 
-# --- Continuação do Script Principal de Setup ---
+# --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.2.2) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v2.3.0) ($(date)) ---"
 echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
 echo "INFO: =================================================="
 if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root."; exit 1; fi
 
-self_install_script # Apenas instala este script principal
+self_install_script
 
 echo "INFO: Verificando e imprimindo variáveis de ambiente essenciais..."
-# (Bloco de verificação de variáveis, incluindo impressão dos valores - como na v2.2.0)
 if [ -z "${ACCOUNT:-}" ]; then ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); if [ -n "$ACCOUNT_STS" ]; then ACCOUNT="$ACCOUNT_STS"; echo "INFO: ACCOUNT ID obtido via STS: $ACCOUNT"; else echo "WARN: Falha obter ACCOUNT ID via STS."; ACCOUNT=""; fi; fi
 AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""; if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ]&&[ -n "${ACCOUNT:-}" ]&&[ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"; fi
 error_found=0; echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS ---"
@@ -318,11 +385,13 @@ if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis essenciais fal
 echo "INFO: Verificação de variáveis concluída."
 
 
-echo "INFO: Instalando pacotes (incluindo inotify-tools)..."
-sudo yum update -y -q; sudo amazon-linux-extras install -y epel -q;
-sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils inotify-tools
-sudo amazon-linux-extras enable php7.4 -y -q; sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache
-echo "INFO: Pacotes instalados."
+echo "INFO: Instalando pacotes (Python3, pip, watchdog)..."
+sudo yum update -y -q
+sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils python3 python3-pip # Adicionado python3, python3-pip
+# sudo yum remove -y inotify-tools # Se não for mais necessário
+sudo pip3 install --upgrade pip # Boa prática
+sudo pip3 install watchdog
+echo "INFO: Pacotes (incluindo watchdog) instalados."
 
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
 
@@ -350,20 +419,21 @@ if [ -d "$MOUNT_POINT/wp-includes" ]&&[ -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo 
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"; echo "INFO: Limpeza WP temps OK."
 fi
 
-# Salvar variáveis de ambiente para o script Inotify usar, se necessário (embora ele receba muitas via template)
-echo "INFO: Salvando vars para script inotify em '$ENV_VARS_FILE' (pode ser redundante)..."
-ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para $INOTIFY_MONITOR_SCRIPT_PATH (v2.2.2)\n"
-# Apenas algumas chaves que o inotify script poderia precisar diretamente se não fossem injetadas
+# Salvar variáveis de ambiente para o script Python usar via systemd Environment.
+# Este arquivo ENV_VARS_FILE pode se tornar menos crucial se todas as vars forem passadas via systemd.
+echo "INFO: (Opcional) Salvando vars em '$ENV_VARS_FILE'..."
+ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para $PYTHON_MONITOR_SCRIPT_PATH (v2.3.0)\n"
 ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"
 ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_NAME_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_NAME_0")\n"
-# if [ -n "${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}" ]; then ENV_VARS_FILE_CONTENT+="export AWS_CLOUDFRONT_DISTRIBUTION_ID_0=$(printf '%q' "$AWS_CLOUDFRONT_DISTRIBUTION_ID_0")\n"; fi
-echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE."
+# Adicionar outros se o script python precisar ler deste arquivo.
+echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE (para referência ou fallback)."
+
 
 if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "ERRO: $CONFIG_SAMPLE_ON_EFS não encontrado."; exit 1; fi
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando..."; create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"; else echo "WARN: '$ACTIVE_CONFIG_FILE_EFS' já existe."; fi
 
 echo "INFO: Criando health check '$HEALTH_CHECK_FILE_PATH_EFS'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.2.2 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.0 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php); sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"; echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
 if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then echo "INFO: Health check criado."; else echo "ERRO: Falha criar health check."; fi; rm -f "$TEMP_HEALTH_CHECK_FILE"
 
@@ -373,7 +443,7 @@ sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; ; sudo find "$MOUNT_POINT
 if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi; if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi; echo "INFO: Permissões ajustadas."
 
 echo "INFO: Configurando Apache..."
-HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.2.2.conf"
+HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.0.conf"
 if [ ! -f "$HTTPD_WP_CONF" ]; then echo "INFO: Criando $HTTPD_WP_CONF"; sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF_APACHE_CONF
 <Directory "${MOUNT_POINT}">
     AllowOverride All
@@ -396,15 +466,15 @@ if ! sudo systemctl restart php-fpm; then echo "ERRO: Falha reiniciar php-fpm.";
 if ! sudo systemctl restart httpd; then echo "ERRO: Falha reiniciar httpd."; sudo apachectl configtest; sudo tail -n 50 /var/log/httpd/error_log; exit 1; fi
 sleep 3; if systemctl is-active --quiet httpd && systemctl is-active --quiet php-fpm; then echo "INFO: httpd e php-fpm ativos."; else echo "ERRO: httpd ou php-fpm não ativos."; exit 1; fi
 
-# --- Configuração do Monitoramento Inotify ---
-create_inotify_monitor_script
-create_and_enable_inotify_service
+# --- Configuração do Monitoramento Python com Watchdog ---
+create_python_monitor_script
+create_and_enable_python_monitor_service
 
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.2.2) concluído! ($(date)) ---"
-echo "INFO: Sincronização com S3 agora é via Inotify (monitorando $MOUNT_POINT)."
-echo "INFO: Script de monitoramento: $INOTIFY_MONITOR_SCRIPT_PATH"
-echo "INFO: Serviço Inotify: $INOTIFY_SERVICE_NAME (Log do monitor: $INOTIFY_MONITOR_LOG_FILE, Log de transferências: $S3_TRANSFER_LOG_FILE)"
+echo "INFO: --- Script WordPress Setup (v2.3.0) concluído! ($(date)) ---"
+echo "INFO: Sincronização com S3 agora é via Python Watchdog."
+echo "INFO: Script de monitoramento Python: $PYTHON_MONITOR_SCRIPT_PATH"
+echo "INFO: Serviço Python: $PYTHON_MONITOR_SERVICE_NAME (Log do monitor: $PY_MONITOR_LOG_FILE, Log de transferências: $PY_S3_TRANSFER_LOG_FILE)"
 echo "INFO: Logs: Principal=${LOG_FILE}"
 echo "INFO: Site: https://${WPDOMAIN}, Health Check: /healthcheck.php"
 echo "INFO: LEMBRE-SE de configurar o EFS Access Point com uid=48 e gid=48."
