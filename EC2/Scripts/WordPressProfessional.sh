@@ -1,17 +1,20 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.1.1-zero-touch-s3-robust-safer-sudoers (UserData Env, Safer Sudoers, MU-Plugin S3 Sync, DB Name from Env Var)
+# Versão: 2.2.0-zero-touch-s3-inotify (UserData Env, Inotify S3 Sync, DB Name from Env Var, Var Logging)
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.1.1.sh" # Atualizado
-readonly SUDOERS_FILE_NAME="92_wp_s3sync_v211_sudo" # Nome sem pontos, versionado
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.2.0.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.1.1_env_vars.sh" # Versionado
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.2.0_env_vars.sh"
+
+# Script de Monitoramento Inotify e Serviço
+readonly INOTIFY_MONITOR_SCRIPT_PATH="/usr/local/bin/wp_efs_s3_inotify_monitor_v2.2.0.sh"
+readonly INOTIFY_SERVICE_NAME="wp-efs-s3-sync-inotify-v2.2.0" # Nome do serviço versionado
+readonly INOTIFY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_inotify_monitor_v2.2.0.log"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.1.1.log" # Versionado
-S3_SYNC_LOG_FILE="/tmp/s3_mu_plugin_sync_v2.1.1.log" # Versionado
-PHP_TRIGGER_LOG_FILE="/tmp/s3_php_trigger_v2.1.1.log" # Versionado
+LOG_FILE="/var/log/wordpress_setup_v2.2.0.log"
+S3_SYNC_LOG_FILE="/tmp/s3_sync_v2.2.0.log" # Log específico da função s3_sync (chamada pelo inotify)
 
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
@@ -36,74 +39,27 @@ essential_vars=(
     "AWS_DB_INSTANCE_TARGET_NAME_0"
     "WPDOMAIN"
     "ACCOUNT"
-    "AWS_EFS_ACCESS_POINT_TARGET_ID_0"
-    "AWS_S3_BUCKET_TARGET_NAME_0"
-    # "AWS_CLOUDFRONT_DISTRIBUTION_ID_0"
+    "AWS_EFS_ACCESS_POINT_TARGET_ID_0" # Pode ser opcional, mas incluído para verificação
+    "AWS_S3_BUCKET_TARGET_NAME_0"    # Para S3 Sync
+    # "AWS_CLOUDFRONT_DISTRIBUTION_ID_0" # Opcional
 )
 
-# --- Função de Auto-Instalação e Configuração do Sudoers (Mais Segura) ---
-self_install_and_configure_sudoers() {
-    echo "INFO (self_install): Iniciando auto-instalação e configuração do sudoers (v2.1.1)..."
+# --- Função de Auto-Instalação do Script Principal ---
+self_install_script() {
+    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.2.0)..."
     local current_script_path
     current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
     echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
-    # Não precisa de sudo aqui se o script UserData já roda como root
     if ! cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then
         echo "ERRO CRÍTICO (self_install): Falha ao copiar script para '$THIS_SCRIPT_TARGET_PATH'. Abortando."
         exit 1
     fi
     chmod +x "$THIS_SCRIPT_TARGET_PATH"
-    echo "INFO (self_install): Script copiado e tornado executável em $THIS_SCRIPT_TARGET_PATH."
-
-    # Verificar a diretiva includedir no /etc/sudoers principal
-    if grep -q "^#includedir /etc/sudoers.d" /etc/sudoers; then
-        echo "AVISO IMPORTANTE (self_install): A diretiva 'includedir /etc/sudoers.d' está COMENTADA em /etc/sudoers."
-        echo "AVISO IMPORTANTE (self_install): Regras em /etc/sudoers.d/ (como a que será criada) NÃO terão efeito."
-        echo "AVISO IMPORTANTE (self_install): Você precisará descomentar essa linha manualmente usando 'sudo visudo' (remova o '#' inicial)."
-    elif ! grep -q "^includedir /etc/sudoers.d" /etc/sudoers; then
-        echo "AVISO IMPORTANTE (self_install): Diretiva 'includedir /etc/sudoers.d' não encontrada ou não ativa em /etc/sudoers."
-        echo "AVISO IMPORTANTE (self_install): Regras em /etc/sudoers.d/ podem não funcionar. Adicione-a manualmente se necessário."
-    else
-        echo "INFO (self_install): Diretiva 'includedir /etc/sudoers.d' parece estar ativa em /etc/sudoers."
-    fi
-
-    local sudoers_entry_path="/etc/sudoers.d/$SUDOERS_FILE_NAME"
-    local sudoers_content="$APACHE_USER ALL=(ALL) NOPASSWD: $THIS_SCRIPT_TARGET_PATH s3sync"
-    echo "INFO (self_install): Configurando sudoers em $sudoers_entry_path para o usuário '$APACHE_USER'..."
-
-    echo "$sudoers_content" | sudo tee "$sudoers_entry_path" > /dev/null
-    if [ $? -ne 0 ]; then
-        echo "ERRO CRÍTICO (self_install): Falha ao escrever em $sudoers_entry_path. Verifique permissões. Abortando."
-        exit 1
-    fi
-    sudo chmod 0440 "$sudoers_entry_path"
-
-    # Validar o arquivo específico criado E o /etc/sudoers geral
-    if sudo visudo -c -f "$sudoers_entry_path"; then
-        echo "INFO (self_install): Arquivo sudoers '$sudoers_entry_path' validado com sucesso."
-        if sudo visudo -c; then
-            echo "INFO (self_install): Configuração geral do sudoers (/etc/sudoers e /etc/sudoers.d/*) validada com sucesso."
-            echo "INFO (self_install): Configuração do sudoers '$sudoers_entry_path' concluída."
-        else
-            echo "ERRO CRÍTICO (self_install): Configuração GERAL do sudoers inválida APÓS criar '$sudoers_entry_path'."
-            echo "ERRO CRÍTICO (self_install): Removendo '$sudoers_entry_path' como precaução."
-            sudo rm -f "$sudoers_entry_path"
-            echo "ERRO CRÍTICO (self_install): Verifique /etc/sudoers manualmente com 'sudo visudo'."
-            # Não sair aqui, pode ser um problema temporário ou o sudo ainda funciona para root
-            # Mas o NOPASSWD para apache não vai funcionar.
-        fi
-    else
-        echo "ERRO CRÍTICO (self_install): Arquivo sudoers '$sudoers_entry_path' criado com sintaxe inválida. Removendo..."
-        sudo rm -f "$sudoers_entry_path"
-        exit 1 # Erro de sintaxe no arquivo que criamos é fatal para a funcionalidade NOPASSWD.
-    fi
-    echo "INFO (self_install): Auto-instalação e configuração do sudoers concluídas."
+    echo "INFO (self_install): Script principal instalado e tornado executável em $THIS_SCRIPT_TARGET_PATH."
 }
 
-
-# --- Funções Auxiliares (mount_efs, create_wp_config_template, sync_static_to_s3) ---
-# (Estas funções são idênticas à v2.1.0, exceto por nomes de arquivos de log/mu-plugin e versão no healthcheck)
+# --- Funções Auxiliares (mount_efs, create_wp_config_template) ---
 mount_efs() {
     local efs_id=$1; local mount_point_arg=$2; local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}"
     local max_retries=5; local retry_delay_seconds=15; local attempt_num=1
@@ -146,7 +102,7 @@ create_wp_config_template() {
         rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
     else echo "ERRO: Falha ao obter SALTS."; fi
     PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.1.1.sh
+// Gerado por wordpress_setup_v2.2.0.sh
 \$site_scheme = 'https';
 \$site_host = '$primary_wpdomain_for_fallback';
 if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
@@ -164,145 +120,245 @@ EOPHP
     if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
 }
 
+# --- Função: Sincronização de Estáticos para S3 (Chamada pelo Inotify Monitor) ---
 sync_static_to_s3() {
-    echo "INFO ($(date)): Função sync_static_to_s3 (v2.1.1) iniciada..."
-    local source_dir="$MOUNT_POINT"; local s3_bucket="$AWS_S3_BUCKET_TARGET_NAME_0"; local s3_prefix=""
+    # Redireciona a saída desta função para seu próprio log quando chamada.
+    exec >> "${S3_SYNC_LOG_FILE}" 2>&1
+    echo "INFO ($(date)): Função sync_static_to_s3 (v2.2.0) iniciada..."
+
+    # As variáveis MOUNT_POINT e AWS_S3_BUCKET_TARGET_NAME_0 devem ser carregadas
+    # do ENV_VARS_FILE pelo script que chama esta função (inotify monitor ou este script via s3sync arg)
+    local source_dir="$MOUNT_POINT"
+    local s3_bucket="$AWS_S3_BUCKET_TARGET_NAME_0"
+    local s3_prefix=""
+
     echo "INFO (sync): Sincronizando de '$source_dir' para 's3://$s3_bucket/$s3_prefix'..."
     if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then echo "ERRO (sync): Diretório fonte '$source_dir' inválido." ; return 1; fi
     if [ -z "$s3_bucket" ]; then echo "ERRO (sync): Bucket S3 não definido." ; return 1; fi
-    local aws_cli_path; aws_cli_path=$(command -v aws); if [ -z "$aws_cli_path" ]; then echo "ERRO (sync): AWS CLI não encontrado."; return 1; fi
-    "$aws_cli_path" configure set default.s3.max_concurrent_requests 20; "$aws_cli_path" configure set default.s3.max_queue_size 10000
+
+    local aws_cli_path; aws_cli_path=$(command -v aws)
+    if [ -z "$aws_cli_path" ]; then echo "ERRO (sync): AWS CLI não encontrado."; return 1; fi
+
+    "$aws_cli_path" configure set default.s3.max_concurrent_requests 20
+    "$aws_cli_path" configure set default.s3.max_queue_size 10000
+
     declare -a include_patterns=( "wp-content/uploads/*" "wp-content/themes/*/*.css" "wp-content/themes/*/*.js" "wp-content/themes/*/*.jpg" "wp-content/themes/*/*.jpeg" "wp-content/themes/*/*.png" "wp-content/themes/*/*.gif" "wp-content/themes/*/*.svg" "wp-content/themes/*/*.webp" "wp-content/themes/*/*.ico" "wp-content/themes/*/*.woff" "wp-content/themes/*/*.woff2" "wp-content/themes/*/*.ttf" "wp-content/themes/*/*.eot" "wp-content/themes/*/*.otf" "wp-content/plugins/*/*.css" "wp-content/plugins/*/*.js" "wp-content/plugins/*/*.jpg" "wp-content/plugins/*/*.jpeg" "wp-content/plugins/*/*.png" "wp-content/plugins/*/*.gif" "wp-content/plugins/*/*.svg" "wp-content/plugins/*/*.webp" "wp-content/plugins/*/*.ico" "wp-content/plugins/*/*.woff" "wp-content/plugins/*/*.woff2" "wp-includes/js/*" "wp-includes/css/*" "wp-includes/images/*" )
     local sync_command_args=(); sync_command_args+=("--exclude" "*"); for pattern in "${include_patterns[@]}"; do sync_command_args+=("--include" "$pattern"); done; sync_command_args+=("--delete")
+
     echo "INFO (sync): Comando: $aws_cli_path s3 sync \"$source_dir\" \"s3://$s3_bucket/$s3_prefix\" ${sync_command_args[*]}"
     if "$aws_cli_path" s3 sync "$source_dir" "s3://$s3_bucket/$s3_prefix" "${sync_command_args[@]}"; then
         echo "INFO (sync): Sincronização S3 OK."
         # if [ -n "${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}" ]; then "$aws_cli_path" cloudfront create-invalidation --distribution-id "$AWS_CLOUDFRONT_DISTRIBUTION_ID_0" --paths "/*"; fi
-    else echo "ERRO (sync): Falha na sincronização S3."; return 1; fi; return 0
+    else echo "ERRO (sync): Falha na sincronização S3."; return 1; fi
+    echo "INFO ($(date)): Função sync_static_to_s3 concluída."
+    return 0
 }
 
-# --- Função: Criar MU-Plugin para S3 Sync Trigger (Revisada para Here-Document) ---
-create_s3_sync_mu_plugin() {
-    local mu_plugins_dir="$MOUNT_POINT/wp-content/mu-plugins"
-    local mu_plugin_file="$mu_plugins_dir/auto-s3-sync-trigger-v2.1.1.php" # Nome do arquivo versionado
-    local bash_script_to_call="$THIS_SCRIPT_TARGET_PATH" # Caminho do script principal
+# --- Função para Criar o Script de Monitoramento Inotify ---
+create_inotify_monitor_script() {
+    echo "INFO: Criando script de monitoramento inotify em $INOTIFY_MONITOR_SCRIPT_PATH..."
 
-    echo "INFO (MU-Plugin): Criando MU-Plugin para S3 sync em '$mu_plugin_file'..."
-    if [ ! -d "$MOUNT_POINT/wp-content" ]; then
-        echo "ERRO (MU-Plugin): Diretório '$MOUNT_POINT/wp-content' não encontrado. WordPress foi instalado?"
-        return 1
-    fi
+    # Conteúdo do script de monitoramento
+    # As variáveis $THIS_SCRIPT_TARGET_PATH, $ENV_VARS_FILE, $MOUNT_POINT, $INOTIFY_MONITOR_LOG_FILE
+    # são expandidas pelo shell aqui ao criar o script.
+    cat > "$INOTIFY_MONITOR_SCRIPT_PATH" <<EOF_INOTIFY_SCRIPT
+#!/bin/bash
+# Script de monitoramento de EFS para S3 Sync usando inotifywait
+# Gerado por: $THIS_SCRIPT_TARGET_PATH
 
-    sudo mkdir -p "$mu_plugins_dir"
-    sudo chown "$APACHE_USER":"$APACHE_USER" "$mu_plugins_dir"
-    sudo chmod 775 "$mu_plugins_dir"
+readonly WORDPRESS_SETUP_SCRIPT="$THIS_SCRIPT_TARGET_PATH"
+readonly MONITOR_DIR_BASE="$MOUNT_POINT" # Base para wp-content
+readonly WP_CONTENT_DIR="\$MONITOR_DIR_BASE/wp-content"
+readonly LOG_FILE_INOTIFY="$INOTIFY_MONITOR_LOG_FILE"
+readonly ENV_VARS_FOR_SETUP_SCRIPT="$ENV_VARS_FILE"
 
-    # Usar printf para construir o conteúdo PHP de forma segura, evitando problemas com expansão no here-doc
-    local php_define_script_path
-    printf -v php_define_script_path "define('S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP_V211', %q);" "$bash_script_to_call"
-
-    local php_define_log_path
-    printf -v php_define_log_path "define('S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP_V211', %q);" "$PHP_TRIGGER_LOG_FILE"
-
-    # Conteúdo principal do PHP, usando 'EOPHP' para evitar expansão de variáveis PHP pelo shell.
-    # As variáveis $APACHE_USER serão expandidas pelo shell aqui, o que é intencional para o comentário.
-    local php_main_content
-    php_main_content=$(cat <<'EOPHP'
-<?php
-/**
- * MU-Plugin para disparar automaticamente a sincronização de arquivos estáticos para o S3.
- * Gerado por: wordpress_setup_script v2.1.1
- */
-
-if ( ! defined( 'ABSPATH' ) ) {
-    exit; // Acesso direto não permitido
+log_inotify_message() {
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - INOTIFY_MONITOR - \$1" >> "\$LOG_FILE_INOTIFY"
 }
 
-// As constantes S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP_V211 e S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP_V211
-// são definidas pelo script Bash que gera este arquivo.
+# Debounce: não rodar syncs muito próximos. Tempo em segundos.
+readonly SYNC_DEBOUNCE_SECONDS=10
+last_sync_time=0
 
-function s3_sync_php_log_message_v211($message) {
-    $timestamp = date('[Y-m-d H:i:s] ');
-    if (defined('S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP_V211') && (is_writable(S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP_V211) || (!file_exists(S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP_V211) && is_writable(dirname(S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP_V211))))) {
-        @file_put_contents(S3_SYNC_PHP_TRIGGER_LOG_FOR_PHP_V211, $timestamp . $message . PHP_EOL, FILE_APPEND);
-    } else {
-        error_log("S3 Sync PHP Log v2.1.1 (fallback): " . $message);
-    }
+# Carregar variáveis de ambiente necessárias para a função s3sync
+if [ -f "\$ENV_VARS_FOR_SETUP_SCRIPT" ]; then
+    source "\$ENV_VARS_FOR_SETUP_SCRIPT"
+else
+    log_inotify_message "ERRO: Arquivo de variáveis de ambiente '\$ENV_VARS_FOR_SETUP_SCRIPT' não encontrado. A função s3sync pode falhar."
+fi
+
+if [ ! -d "\$WP_CONTENT_DIR" ]; then
+    log_inotify_message "ERRO: Diretório a ser monitorado '\$WP_CONTENT_DIR' não existe. Saindo."
+    exit 1
+fi
+
+log_inotify_message "INFO: Iniciando monitoramento de '\$WP_CONTENT_DIR' para sincronização com S3."
+log_inotify_message "INFO: Script de setup para sync: \$WORDPRESS_SETUP_SCRIPT"
+
+# Loop infinito para monitorar
+while true; do
+    inotifywait -q -m -r \\
+        -e create -e modify -e moved_to -e close_write \\
+        --format '%w%f %e' \\
+        --exclude '(\\\.swp\$|\\\.swx\$|~$|\\\.part\$|\\\.crdownload\$|cache/)' \\
+        "\$WP_CONTENT_DIR" | \\
+    while IFS=' ' read -r DETECTED_FILE DETECTED_EVENTS; do
+        log_inotify_message "Evento: '\$DETECTED_EVENTS' em '\$DETECTED_FILE'."
+
+        current_time=\$(date +%s)
+        if (( current_time - last_sync_time < SYNC_DEBOUNCE_SECONDS )); then
+            log_inotify_message "INFO: Debounce ativo. Último sync foi há \$((\$current_time - \$last_sync_time))s. Pulando este trigger."
+            continue
+        fi
+
+        log_inotify_message "INFO: Disparando sincronização S3..."
+        if [ -x "\$WORDPRESS_SETUP_SCRIPT" ]; then
+            # O script de monitoramento rodará como root (via systemd),
+            # então ele tem permissão para chamar o script principal.
+            # A função sync_static_to_s3 dentro do script principal usa o IAM role.
+            "\$WORDPRESS_SETUP_SCRIPT" s3sync
+            SYNC_EXIT_CODE=\$?
+
+            if [ \$SYNC_EXIT_CODE -eq 0 ]; then
+                log_inotify_message "INFO: Sincronização S3 concluída com sucesso."
+                last_sync_time=\$(date +%s)
+            else
+                log_inotify_message "ERRO: Sincronização S3 falhou com código \$SYNC_EXIT_CODE."
+            fi
+        else
+            log_inotify_message "ERRO: Script de setup '\$WORDPRESS_SETUP_SCRIPT' não encontrado ou não é executável."
+        fi
+    done
+    # Se inotifywait sair (raro com -m, mas pode acontecer), logar e reiniciar o loop
+    log_inotify_message "AVISO: Loop do inotifywait terminou. Reiniciando em 10s..."
+    sleep 10
+done
+EOF_INOTIFY_SCRIPT
+# Fim do Here-Document para o script inotify. O EOF_INOTIFY_SCRIPT DEVE estar sozinho na linha.
+
+    chmod +x "$INOTIFY_MONITOR_SCRIPT_PATH"
+    echo "INFO: Script de monitoramento inotify '$INOTIFY_MONITOR_SCRIPT_PATH' criado e tornado executável."
 }
 
-function trigger_s3_static_sync_from_php_hook_v211($caller_hook = 'unknown_hook') {
-    if ( ! defined('S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP_V211') || ! file_exists(S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP_V211) ) {
-        s3_sync_php_log_message_v211("S3 Sync ERRO: S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP_V211 ('" . (defined('S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP_V211') ? S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP_V211 : 'NOT DEFINED') . "') não definido ou script não encontrado.");
-        return;
-    }
+# --- Função para Criar e Habilitar o Serviço Systemd para Inotify ---
+create_and_enable_inotify_service() {
+    echo "INFO: Criando serviço systemd para o monitoramento inotify: $INOTIFY_SERVICE_NAME..."
+    local service_file_path="/etc/systemd/system/${INOTIFY_SERVICE_NAME}.service"
 
-    // O usuário do servidor web (ex: apache) precisa de permissão via sudoers para executar este comando.
-    $command = 'sudo ' . S3_SYNC_BASH_SCRIPT_PATH_FOR_PHP_V211 . ' s3sync > /dev/null 2>&1 &';
+    # Conteúdo do arquivo de serviço systemd
+    cat > "$service_file_path" <<EOF_SYSTEMD_SERVICE
+[Unit]
+Description=WordPress EFS to S3 Sync Service using Inotify (v2.2.0)
+Documentation=file://$THIS_SCRIPT_TARGET_PATH
+After=network.target remote-fs.target mounted-var-www-html.mount # Garantir que EFS esteja montado
 
-    s3_sync_php_log_message_v211("S3 Sync: Disparado por '{$caller_hook}'. Comando: {$command}");
-    
-    shell_exec($command);
-}
+[Service]
+Type=simple
+User=root # O script de monitoramento precisa rodar como root para ler eventos e chamar o sync
+ExecStart=$INOTIFY_MONITOR_SCRIPT_PATH
+Restart=on-failure
+RestartSec=15s
+StandardOutput=append:$INOTIFY_MONITOR_LOG_FILE # Redireciona stdout do script para seu log
+StandardError=append:$INOTIFY_MONITOR_LOG_FILE  # Redireciona stderr do script para seu log
 
-add_action('add_attachment', function() { trigger_s3_static_sync_from_php_hook_v211('add_attachment'); }, 10, 0);
-add_action('edit_attachment', function($attachment_id) { trigger_s3_static_sync_from_php_hook_v211('edit_attachment'); }, 10, 1);
-add_action('upgrader_process_complete', function($upgrader_object, $options) {
-    $actions_to_sync = ['update', 'install'];
-    if (isset($options['type']) && isset($options['action']) && in_array($options['action'], $actions_to_sync)) {
-        trigger_s3_static_sync_from_php_hook_v211("upgrader_process_complete_{type:{$options['type']},action:{$options['action']}}");
-    }
-}, 10, 2);
-add_action('after_switch_theme', function() { trigger_s3_static_sync_from_php_hook_v211('after_switch_theme'); }, 10, 0);
+[Install]
+WantedBy=multi-user.target
+EOF_SYSTEMD_SERVICE
+# Fim do Here-Document para o serviço systemd. O EOF_SYSTEMD_SERVICE DEVE estar sozinho na linha.
 
-s3_sync_php_log_message_v211("S3 Sync: MU-Plugin auto-s3-sync-trigger-v2.1.1.php loaded.");
-EOPHP
-) # Fim do EOPHP deve estar sozinho na linha
+    chmod 644 "$service_file_path"
+    echo "INFO: Arquivo de serviço '$service_file_path' criado."
 
-    # Combinar as defines com o conteúdo principal
-    local final_php_mu_plugin_content="${php_define_script_path}\n${php_define_log_path}\n\n${php_main_content}"
-
-    echo "INFO (MU-Plugin): Conteúdo do MU-Plugin definido. Tentando escrever em '$mu_plugin_file'..."
-    echo -e "${final_php_mu_plugin_content}" | sudo tee "$mu_plugin_file" > /dev/null
-
-    if [ $? -eq 0 ]; then
-        echo "INFO (MU-Plugin): MU-Plugin '$mu_plugin_file' criado com sucesso."
-        sudo chown "$APACHE_USER":"$APACHE_USER" "$mu_plugin_file"
-        sudo chmod 644 "$mu_plugin_file"
-        echo "INFO (MU-Plugin): Permissões do MU-Plugin ajustadas."
+    echo "INFO: Recarregando daemon systemd, habilitando e iniciando o serviço $INOTIFY_SERVICE_NAME..."
+    sudo systemctl daemon-reload
+    sudo systemctl enable "$INOTIFY_SERVICE_NAME.service"
+    if sudo systemctl start "$INOTIFY_SERVICE_NAME.service"; then
+        echo "INFO: Serviço $INOTIFY_SERVICE_NAME iniciado com sucesso."
+        sleep 2 # Dar um tempo para o serviço iniciar e possivelmente logar algo
+        sudo systemctl status "$INOTIFY_SERVICE_NAME.service" --no-pager -l
     else
-        echo "ERRO (MU-Plugin): Falha ao criar MU-Plugin '$mu_plugin_file'."
-        return 1
+        echo "ERRO: Falha ao iniciar o serviço $INOTIFY_SERVICE_NAME."
+        sudo systemctl status "$INOTIFY_SERVICE_NAME.service" --no-pager -l
+        echo "ERRO: Verifique os logs do journalctl para $INOTIFY_SERVICE_NAME para mais detalhes: journalctl -u $INOTIFY_SERVICE_NAME -n 50 --no-pager"
+        # Não sair com erro fatal aqui, o setup principal pode ter funcionado, mas o sync automático não.
     fi
 }
 
 
 # --- Lógica Principal de Execução ---
+# Argumento 's3sync': Chamado pelo script de monitoramento inotify (ou manualmente para teste)
 if [ "$1" == "s3sync" ]; then
-    exec > >(tee -a "${S3_SYNC_LOG_FILE}") 2>&1
-    echo "INFO ($(date)): Chamada 's3sync' recebida por $THIS_SCRIPT_TARGET_PATH (v2.1.1)..."
-    if [ -f "$ENV_VARS_FILE" ]; then echo "INFO (s3sync): Carregando vars de $ENV_VARS_FILE"; source "$ENV_VARS_FILE"; else echo "WARN (s3sync): $ENV_VARS_FILE não encontrado."; MOUNT_POINT="${MOUNT_POINT:-/var/www/html}"; fi
-    sync_static_to_s3; exit $?
+    # O redirecionamento de log para a função sync_static_to_s3 é feito dentro da própria função agora.
+    echo "INFO ($(date)): Chamada 's3sync' recebida por $THIS_SCRIPT_TARGET_PATH (v2.2.0)..." >> "$S3_SYNC_LOG_FILE" # Log inicial da chamada
+    if [ -f "$ENV_VARS_FILE" ]; then
+        echo "INFO (s3sync): Carregando vars de $ENV_VARS_FILE" >> "$S3_SYNC_LOG_FILE"
+        # shellcheck source=/dev/null
+        source "$ENV_VARS_FILE"
+    else
+        echo "WARN (s3sync): $ENV_VARS_FILE não encontrado. Função sync pode falhar." >> "$S3_SYNC_LOG_FILE"
+        # Tentar usar MOUNT_POINT padrão se não carregado, como fallback mínimo.
+        MOUNT_POINT="${MOUNT_POINT:-/var/www/html}"
+        AWS_S3_BUCKET_TARGET_NAME_0="${AWS_S3_BUCKET_TARGET_NAME_0:-}" # Para evitar erro de unbound variable
+    fi
+    sync_static_to_s3
+    exit $?
 fi
 
+# --- Continuação do Script Principal de Setup (executado uma vez via UserData) ---
+# O UserData já deve ter carregado as variáveis do /home/ec2-user/.env
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.1.1) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v2.2.0) ($(date)) ---"
 echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
 echo "INFO: =================================================="
 if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root."; exit 1; fi
-self_install_and_configure_sudoers
 
-echo "INFO: Verificando variáveis de ambiente (exportadas pelo UserData)..."
-if [ -z "${ACCOUNT:-}" ]; then ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "ACCOUNT_STS_FAILED"); if [ "$ACCOUNT" == "ACCOUNT_STS_FAILED" ] || [ -z "$ACCOUNT" ]; then echo "WARN: Falha ao obter ACCOUNT ID via STS."; ACCOUNT=""; fi; fi
-if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ]&&[ -n "${ACCOUNT:-}" ]&&[ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"; else AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""; echo "WARN: ARN do Secrets Manager não pôde ser construído."; fi
-error_found=0; for var_name in "${essential_vars[@]}"; do current_var_value="${!var_name:-}"; if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]&&[ -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" ]; then echo "ERRO: Var $var_name (ou ARN) vazia."; error_found=1; elif [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && [ -z "$current_var_value" ]; then echo "ERRO: Var $var_name vazia."; error_found=1; fi; done # AWS_EFS_ACCESS_POINT_TARGET_ID_0 é opcional
-if [ "$error_found" -eq 1 ]; then echo "ERRO: Variáveis essenciais faltando. Abortando."; exit 1; fi
-echo "INFO: Vars OK: WPDOMAIN=${WPDOMAIN}, S3_BUCKET=${AWS_S3_BUCKET_TARGET_NAME_0}, DB_NAME_VAR=${AWS_DB_INSTANCE_TARGET_NAME_0}"
+self_install_script # Instala este script principal no local de destino
 
-echo "INFO: Instalando pacotes..."
-sudo yum update -y -q; sudo amazon-linux-extras install -y epel -q; sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils
+echo "INFO: Verificando e imprimindo variáveis de ambiente essenciais (devem ter sido exportadas pelo UserData)..."
+if [ -z "${ACCOUNT:-}" ]; then
+    ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
+    if [ -n "$ACCOUNT_STS" ]; then ACCOUNT="$ACCOUNT_STS"; echo "INFO: ACCOUNT ID obtido via AWS STS: $ACCOUNT"; else echo "WARN: Falha ao obter ACCOUNT ID via AWS STS."; ACCOUNT=""; fi
+fi
+AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
+if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ]&&[ -n "${ACCOUNT:-}" ]&&[ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then
+    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
+fi
+
+error_found=0
+echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS ---"
+for var_name in "${essential_vars[@]}"; do
+    current_var_value="${!var_name:-UNDEFINED}" # Pega o valor ou "UNDEFINED"
+    # Tratar ARN do SecretsManager, que é construído
+    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then
+        # O valor real a ser verificado é o ARN construído
+        current_var_value_to_check="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"
+        var_name_for_check="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (construído de $var_name)"
+    else
+        current_var_value_to_check="${!var_name:-}"
+        var_name_for_check="$var_name"
+    fi
+
+    # Imprimir o valor
+    echo "INFO: Var: $var_name_for_check = '$current_var_value_to_check'"
+
+    # Verificar se está vazia (exceto para AWS_EFS_ACCESS_POINT_TARGET_ID_0 que é opcional)
+    if [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && [ -z "$current_var_value_to_check" ]; then
+        echo "ERRO: Variável essencial '$var_name_for_check' não definida ou vazia."
+        error_found=1
+    fi
+done
+echo "INFO: --- FIM DOS VALORES DAS VARIÁVEIS ESSENCIAIS ---"
+if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Uma ou mais variáveis essenciais estão faltando. Abortando setup."; exit 1; fi
+echo "INFO: Verificação de variáveis essenciais concluída."
+
+
+echo "INFO: Instalando pacotes (incluindo inotify-tools)..."
+sudo yum update -y -q; sudo amazon-linux-extras install -y epel -q;
+sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils inotify-tools # Adicionado inotify-tools
 sudo amazon-linux-extras enable php7.4 -y -q; sudo yum install -y -q php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache
 echo "INFO: Pacotes instalados."
+
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
 
 echo "INFO: Testando escrita EFS como '$EFS_OWNER_USER'..."
@@ -331,19 +387,19 @@ if [ -d "$MOUNT_POINT/wp-includes" ]&&[ -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo 
 fi
 
 echo "INFO: Salvando vars para s3sync em '$ENV_VARS_FILE'..."
-ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para $THIS_SCRIPT_TARGET_PATH s3sync (v2.1.1)\n"
+ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para $THIS_SCRIPT_TARGET_PATH s3sync (v2.2.0)\n"
 for var_name in "${essential_vars[@]}"; do if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then current_var_value_escaped=$(printf '%q' "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"); ENV_VARS_FILE_CONTENT+="export AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=$current_var_value_escaped\n"; else current_var_value_escaped=$(printf '%q' "${!var_name}"); ENV_VARS_FILE_CONTENT+="export $var_name=$current_var_value_escaped\n"; fi; done
-ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"; ENV_VARS_FILE_CONTENT+="export APACHE_USER=$(printf '%q' "$APACHE_USER")\n"
+ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"; ENV_VARS_FILE_CONTENT+="export APACHE_USER=$(printf '%q' "$APACHE_USER")\n" # APACHE_USER não é essencial aqui, mas ok
 if [ -n "${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}" ]; then ENV_VARS_FILE_CONTENT+="export AWS_CLOUDFRONT_DISTRIBUTION_ID_0=$(printf '%q' "$AWS_CLOUDFRONT_DISTRIBUTION_ID_0")\n"; fi
 echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas."
 
 if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "ERRO: $CONFIG_SAMPLE_ON_EFS não encontrado."; exit 1; fi
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando..."; create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"; else echo "WARN: '$ACTIVE_CONFIG_FILE_EFS' já existe."; fi
 
-if [ -d "$MOUNT_POINT/wp-content" ]; then create_s3_sync_mu_plugin; else echo "AVISO: '$MOUNT_POINT/wp-content' não existe, pulando MU-Plugin."; fi
+# REMOVIDA a chamada para create_s3_sync_mu_plugin
 
 echo "INFO: Criando health check '$HEALTH_CHECK_FILE_PATH_EFS'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.1.1 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.2.0 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php); sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"; echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
 if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then echo "INFO: Health check criado."; else echo "ERRO: Falha criar health check."; fi; rm -f "$TEMP_HEALTH_CHECK_FILE"
 
@@ -353,8 +409,8 @@ sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; ; sudo find "$MOUNT_POINT
 if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi; if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi; echo "INFO: Permissões ajustadas."
 
 echo "INFO: Configurando Apache..."
-HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.1.1.conf" # Arquivo de config Apache versionado
-if [ ! -f "$HTTPD_WP_CONF" ]; then echo "INFO: Criando $HTTPD_WP_CONF"; sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF
+HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.2.0.conf"
+if [ ! -f "$HTTPD_WP_CONF" ]; then echo "INFO: Criando $HTTPD_WP_CONF"; sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF_APACHE_CONF
 <Directory "${MOUNT_POINT}">
     AllowOverride All
     Require all granted
@@ -362,21 +418,13 @@ if [ ! -f "$HTTPD_WP_CONF" ]; then echo "INFO: Criando $HTTPD_WP_CONF"; sudo tee
 <IfModule mod_setenvif.c>
   SetEnvIf X-Forwarded-Proto "^https$" HTTPS=on
 </IfModule>
-EOF
-else # Bloco else para garantir que as diretivas existem
+EOF_APACHE_CONF
+else
     echo "INFO: $HTTPD_WP_CONF já existe. Verificando conteúdo..."
-    if ! grep -q "AllowOverride All" "$HTTPD_WP_CONF"; then
-        # Tenta inserir AllowOverride All após a diretiva <Directory>
-        sudo sed -i '/<Directory "${MOUNT_POINT//\//\\/}">/a \    AllowOverride All' "$HTTPD_WP_CONF"
-        echo "INFO: AllowOverride All adicionado a $HTTPD_WP_CONF."
-    fi
-    if ! grep -q "SetEnvIf X-Forwarded-Proto" "$HTTPD_WP_CONF"; then
-         echo -e "\n<IfModule mod_setenvif.c>\n  SetEnvIf X-Forwarded-Proto \"^https\$\" HTTPS=on\n</IfModule>" | sudo tee -a "$HTTPD_WP_CONF" > /dev/null
-         echo "INFO: SetEnvIf X-Forwarded-Proto adicionado a $HTTPD_WP_CONF."
-    fi
+    if ! grep -q "AllowOverride All" "$HTTPD_WP_CONF"; then sudo sed -i '/<Directory "${MOUNT_POINT//\//\\/}">/a \    AllowOverride All' "$HTTPD_WP_CONF"; echo "INFO: AllowOverride All adicionado a $HTTPD_WP_CONF."; fi
+    if ! grep -q "SetEnvIf X-Forwarded-Proto" "$HTTPD_WP_CONF"; then echo -e "\n<IfModule mod_setenvif.c>\n  SetEnvIf X-Forwarded-Proto \"^https\$\" HTTPS=on\n</IfModule>" | sudo tee -a "$HTTPD_WP_CONF" > /dev/null; echo "INFO: SetEnvIf X-Forwarded-Proto adicionado a $HTTPD_WP_CONF."; fi
 fi
 echo "INFO: Configuração Apache em $HTTPD_WP_CONF verificada/criada."
-
 
 echo "INFO: Habilitando e reiniciando httpd e php-fpm..."
 sudo systemctl enable httpd; sudo systemctl enable php-fpm
@@ -384,11 +432,17 @@ if ! sudo systemctl restart php-fpm; then echo "ERRO: Falha reiniciar php-fpm.";
 if ! sudo systemctl restart httpd; then echo "ERRO: Falha reiniciar httpd."; sudo apachectl configtest; sudo tail -n 50 /var/log/httpd/error_log; exit 1; fi
 sleep 3; if systemctl is-active --quiet httpd && systemctl is-active --quiet php-fpm; then echo "INFO: httpd e php-fpm ativos."; else echo "ERRO: httpd ou php-fpm não ativos."; exit 1; fi
 
+# --- Configuração do Monitoramento Inotify ---
+create_inotify_monitor_script
+create_and_enable_inotify_service
+
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.1.1) concluído! ($(date)) ---"
-echo "INFO: Logs: Principal=${LOG_FILE}, PHPTrigger=${PHP_TRIGGER_LOG_FILE}, S3Sync=${S3_SYNC_LOG_FILE}"
+echo "INFO: --- Script WordPress Setup (v2.2.0) concluído! ($(date)) ---"
+echo "INFO: Sincronização com S3 agora é feita via Inotify."
+echo "INFO: Script de monitoramento Inotify: $INOTIFY_MONITOR_SCRIPT_PATH"
+echo "INFO: Serviço Inotify: $INOTIFY_SERVICE_NAME (Log: $INOTIFY_MONITOR_LOG_FILE)"
+echo "INFO: Logs: Principal=${LOG_FILE}, S3Sync (chamado por Inotify)=${S3_SYNC_LOG_FILE}"
 echo "INFO: Site: https://${WPDOMAIN}, Health Check: /healthcheck.php"
 echo "INFO: LEMBRE-SE de configurar o EFS Access Point com uid=48 e gid=48."
-echo "INFO: Verifique manualmente /etc/sudoers se o UserData reportou avisos sobre 'includedir'."
 echo "INFO: =================================================="
 exit 0
