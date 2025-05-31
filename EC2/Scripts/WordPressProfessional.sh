@@ -1,24 +1,24 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.3.3-zero-touch-s3-python-watchdog-phpfix (Re-added PHP-FPM install, Python Watchdog for S3 Sync)
+# Versão: 2.3.4-zero-touch-s3-python-watchdog-phpfix-pyvars (Python Vars no Systemd)
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.3.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.4.sh" # Atualizar versão
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.3_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.4_env_vars.sh" # Atualizar versão
 
 # Script de Monitoramento Python e Serviço
-readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.3.py" # Nome do script Python na instância
+readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.3.py" # Nome do script Python na instância (pode manter a versão do .py se ele não mudou)
 readonly PYTHON_MONITOR_SCRIPT_PATH="/usr/local/bin/$PYTHON_MONITOR_SCRIPT_NAME"
-readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.3"
-readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.3.log"
-readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.3.log"
+readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.4" # Atualizar versão do serviço
+readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.4.log" # Atualizar versão
+readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.4.log" # Atualizar versão
 
 # Chave S3 para o script Python (Hardcoded - AJUSTE CONFORME NECESSÁRIO)
 readonly AWS_S3_PYTHON_SCRIPT_KEY="efs_s3_monitor.py" # Ex: 'scripts/efs_s3_monitor.py' ou o nome do seu script .py
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.3.3.log"
+LOG_FILE="/var/log/wordpress_setup_v2.3.4.log" # Atualizar versão
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -49,7 +49,7 @@ essential_vars=(
 
 # --- Função de Auto-Instalação do Script Principal ---
 self_install_script() {
-    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.3)..."
+    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.4)..."
     local current_script_path; current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
     if ! cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then echo "ERRO CRÍTICO (self_install): Falha ao copiar script. Abortando."; exit 1; fi
@@ -100,7 +100,7 @@ create_wp_config_template() {
         rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
     else echo "ERRO: Falha ao obter SALTS."; fi
     PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.3.3.sh
+// Gerado por wordpress_setup_v2.3.4.sh
 \$site_scheme = 'https';
 \$site_host = '$primary_wpdomain_for_fallback';
 if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
@@ -120,7 +120,7 @@ EOPHP
 
 # --- Função para Baixar e Configurar o Script de Monitoramento Python ---
 setup_python_monitor_script() {
-    echo "INFO: Baixando e configurando script de monitoramento Python (v2.3.3)..."
+    echo "INFO: Baixando e configurando script de monitoramento Python (v2.3.4)..."
     if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] || \
        [ -z "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}" ] || \
        [ -z "$AWS_S3_PYTHON_SCRIPT_KEY" ]; then
@@ -128,21 +128,18 @@ setup_python_monitor_script() {
         exit 1
     fi
     local s3_python_script_uri="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_PYTHON_SCRIPT_KEY}"
-    local temp_python_script_path="/tmp/$(basename "$PYTHON_MONITOR_SCRIPT_PATH")_temp_download" # Download to temp first
+    local temp_python_script_path="/tmp/$(basename "$PYTHON_MONITOR_SCRIPT_PATH")_temp_download"
 
     echo "INFO: Tentando baixar script Python de '$s3_python_script_uri' para '$temp_python_script_path'..."
-
-    # Clear any previous temp file
-    sudo rm -f "$temp_python_script_path"
+    sudo rm -f "$temp_python_script_path" # Limpar download anterior
 
     if ! sudo aws s3 cp "$s3_python_script_uri" "$temp_python_script_path" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
         echo "ERRO CRÍTICO: Falha ao baixar o script Python de '$s3_python_script_uri' para '$temp_python_script_path'."
-        ls -l "$temp_python_script_path" # See if a partial/empty file was created
+        ls -l "$temp_python_script_path" # Verificar se um arquivo parcial/vazio foi criado
         exit 1
     fi
 
-    # Check if the downloaded file has content
-    if [ ! -s "$temp_python_script_path" ]; then
+    if [ ! -s "$temp_python_script_path" ]; then # Checar se o arquivo baixado tem conteúdo
         echo "ERRO CRÍTICO: Script Python baixado '$temp_python_script_path' está vazio ou não existe."
         ls -l "$temp_python_script_path"
         exit 1
@@ -155,17 +152,17 @@ setup_python_monitor_script() {
     fi
 
     if ! sudo chmod +x "$PYTHON_MONITOR_SCRIPT_PATH"; then
-        echo "ERRO CRÍTICO: Falha ao tornar o script Python '$PYTHON_MONITOR_SCRIPT_PATH' executável."
+         echo "ERRO CRÍTICO: Falha ao tornar o script Python '$PYTHON_MONITOR_SCRIPT_PATH' executável."
         exit 1
     fi
-
     echo "INFO: Script de monitoramento Python '$PYTHON_MONITOR_SCRIPT_PATH' configurado e tornado executável."
 }
 
 # --- Função para Criar e Habilitar o Serviço Systemd para Python Monitor ---
 create_and_enable_python_monitor_service() {
-    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.3)..."
+    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.4)..."
     local service_file_path="/etc/systemd/system/${PYTHON_MONITOR_SERVICE_NAME}.service"
+    # Padrões para RELEVANT_PATTERNS. O padrão wp-content/uploads/* já cobre a maioria das mídias.
     local patterns_env_str="wp-content/uploads/*;wp-content/themes/*/*.css;wp-content/themes/*/*.js;wp-content/themes/*/*.jpg;wp-content/themes/*/*.jpeg;wp-content/themes/*/*.png;wp-content/themes/*/*.gif;wp-content/themes/*/*.svg;wp-content/themes/*/*.webp;wp-content/themes/*/*.ico;wp-content/themes/*/*.woff;wp-content/themes/*/*.woff2;wp-content/themes/*/*.ttf;wp-content/themes/*/*.eot;wp-content/themes/*/*.otf;wp-content/plugins/*/*.css;wp-content/plugins/*/*.js;wp-content/plugins/*/*.jpg;wp-content/plugins/*/*.jpeg;wp-content/plugins/*/*.png;wp-content/plugins/*/*.gif;wp-content/plugins/*/*.svg;wp-content/plugins/*/*.webp;wp-content/plugins/*/*.ico;wp-content/plugins/*/*.woff;wp-content/plugins/*/*.woff2;wp-includes/js/*;wp-includes/css/*;wp-includes/images/*"
 
     echo "INFO: Tentando limpar o serviço '$PYTHON_MONITOR_SERVICE_NAME' existente, se houver..."
@@ -175,12 +172,16 @@ create_and_enable_python_monitor_service() {
     echo "INFO: Limpeza de serviço systemd anterior concluída."
 
     local mount_unit_name; mount_unit_name=$(systemd-escape -p --suffix=mount "$MOUNT_POINT")
-    local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws")
-    local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str"
+    local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws") # Garante que temos um caminho para o AWS CLI
+    local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" # Para evitar problemas com caracteres especiais no systemd
+
+    # Valores default para as novas variáveis de ambiente do Python
+    local py_delete_from_efs_after_sync="false" # Mantenha false por segurança, a menos que explicitamente desejado
+    local py_perform_initial_sync="true"      # Recomendado manter true
 
     sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
 [Unit]
-Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.3)
+Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.4)
 Documentation=file://$PYTHON_MONITOR_SCRIPT_PATH
 After=network.target remote-fs.target $mount_unit_name
 Requires=$mount_unit_name
@@ -199,6 +200,9 @@ Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
 Environment="WP_SYNC_DEBOUNCE_SECONDS=5"
 Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Valores "hardcoded" para as novas configurações do Python, conforme solicitado:
+Environment="WP_DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync}"
+Environment="WP_PERFORM_INITIAL_SYNC=${py_perform_initial_sync}"
 
 [Install]
 WantedBy=multi-user.target
@@ -212,19 +216,19 @@ EOF_PY_SYSTEMD_SERVICE
     sudo systemctl enable "$PYTHON_MONITOR_SERVICE_NAME.service"
     if sudo systemctl start "$PYTHON_MONITOR_SERVICE_NAME.service"; then
         echo "INFO: Serviço Python $PYTHON_MONITOR_SERVICE_NAME iniciado com sucesso."
-        sleep 3
+        sleep 3 # Dar um tempo para o serviço iniciar e possivelmente logar algo
         sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
     else
         echo "ERRO: Falha ao iniciar o serviço Python $PYTHON_MONITOR_SERVICE_NAME."
         sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
-        journalctl -u "$PYTHON_MONITOR_SERVICE_NAME" -n 50 --no-pager
+        journalctl -u "$PYTHON_MONITOR_SERVICE_NAME" -n 50 --no-pager # Mostrar logs do journalctl para diagnóstico
     fi
 }
 
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.3.3) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v2.3.4) ($(date)) ---"
 echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
 echo "INFO: Python Script S3 Key (Hardcoded): $AWS_S3_PYTHON_SCRIPT_KEY"
 echo "INFO: =================================================="
@@ -250,7 +254,7 @@ echo "INFO: Verificação de variáveis concluída."
 
 echo "INFO: Instalando pacotes (Apache, PHP, Python3, pip, watchdog, etc.)..."
 sudo yum update -y -q
-sudo amazon-linux-extras install -y epel -q
+sudo amazon-linux-extras install -y epel -q # EPEL para pacotes adicionais se necessário
 sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils # Pacotes base
 
 echo "INFO: Habilitando e instalando PHP 7.4 e módulos relacionados..."
@@ -261,8 +265,8 @@ echo "INFO: PHP e PHP-FPM instalados."
 
 echo "INFO: Instalando Python3, pip e watchdog..."
 sudo yum install -y -q python3 python3-pip
-sudo pip3 install --upgrade pip
-sudo pip3 install watchdog
+sudo pip3 install --upgrade pip # Garante que pip está atualizado
+sudo pip3 install watchdog # Instala watchdog para Python3
 echo "INFO: Python3, pip e watchdog instalados."
 echo "INFO: Todos os pacotes de pré-requisitos foram processados."
 
@@ -281,7 +285,7 @@ if [ -z "$DB_USER" ]||[ "$DB_USER" == "null" ]||[ -z "$DB_PASSWORD" ]||[ "$DB_PA
 DB_NAME_TO_USE="$AWS_DB_INSTANCE_TARGET_NAME_0"
 echo "INFO (DB Setup): Nome do DB será: '$DB_NAME_TO_USE' (de AWS_DB_INSTANCE_TARGET_NAME_0)"
 if [ "$DB_NAME_TO_USE" == "null" ] || [ -z "$DB_NAME_TO_USE" ]; then echo "ERRO CRÍTICO: Nome DB não determinado de AWS_DB_INSTANCE_TARGET_NAME_0 ('$AWS_DB_INSTANCE_TARGET_NAME_0')."; exit 1; fi
-DB_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1)
+DB_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1) # Pega apenas o host, sem a porta
 echo "INFO: Creds RDS OK (User: $DB_USER, DB: $DB_NAME_TO_USE)."
 
 echo "INFO: Verificando WP em '$MOUNT_POINT/wp-includes'..."
@@ -294,9 +298,10 @@ if [ -d "$MOUNT_POINT/wp-includes" ]&&[ -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo 
 fi
 
 echo "INFO: (Opcional) Salvando vars em '$ENV_VARS_FILE'..."
-ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.3.3)\n"
+ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.3.4)\n"
 ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"
 ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_NAME_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_NAME_0")\n"
+# Adicione outras variáveis que queira salvar para referência
 echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE."
 
 
@@ -304,17 +309,19 @@ if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "ERRO: $CONFIG_SAMPLE_ON_EFS não
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando..."; create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"; else echo "WARN: '$ACTIVE_CONFIG_FILE_EFS' já existe."; fi
 
 echo "INFO: Criando health check '$HEALTH_CHECK_FILE_PATH_EFS'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.3 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.4 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php); sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"; echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
 if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then echo "INFO: Health check criado."; else echo "ERRO: Falha criar health check."; fi; rm -f "$TEMP_HEALTH_CHECK_FILE"
 
 echo "INFO: Ajustando permissões finais em '$MOUNT_POINT' para '$APACHE_USER'..."
+# O EFS Access Point deve garantir que os arquivos criados pelo root/ec2-user sejam acessíveis pelo apache
+# Se o AP estiver configurado com uid/gid do apache (48/48), o chown aqui é mais para garantir
 if ! sudo chown -R "$APACHE_USER":"$APACHE_USER" "$MOUNT_POINT"; then echo "AVISO: Falha no chown -R. Verifique config EFS AP. GID atual: $(stat -c "%g" "$MOUNT_POINT") vs Apache GID: $(getent group "$APACHE_USER" | cut -d: -f3)"; ls -ld "$MOUNT_POINT"; fi
 sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; ; sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
 if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi; if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi; echo "INFO: Permissões ajustadas."
 
 echo "INFO: Configurando Apache..."
-HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.3.conf"
+HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.4.conf" # Atualizar versão
 if [ ! -f "$HTTPD_WP_CONF" ]; then echo "INFO: Criando $HTTPD_WP_CONF"; sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF_APACHE_CONF
 <Directory "${MOUNT_POINT}">
     AllowOverride All
@@ -331,9 +338,9 @@ else
 fi
 echo "INFO: Configuração Apache em $HTTPD_WP_CONF verificada/criada."
 
-# --- Detecção e Inicialização de PHP-FPM e HTTPD (MODIFICADO) ---
+# --- Detecção e Inicialização de PHP-FPM e HTTPD ---
 PHP_FPM_SERVICE_NAME=""
-POSSIBLE_FPM_NAMES=("php-fpm.service" "php7.4-fpm.service" "php74-php-fpm.service" "php7.4-php-fpm.service") # Adicionado php74-php-fpm.service
+POSSIBLE_FPM_NAMES=("php-fpm.service" "php7.4-fpm.service" "php74-php-fpm.service" "php7.4-php-fpm.service")
 
 echo "INFO: Detectando nome do serviço PHP-FPM..."
 for fpm_name in "${POSSIBLE_FPM_NAMES[@]}"; do
@@ -348,7 +355,7 @@ if [ -z "$PHP_FPM_SERVICE_NAME" ]; then
     echo "ERRO CRÍTICO: Não foi possível detectar o nome do serviço PHP-FPM instalado."
     echo "INFO: Serviços PHP FPM procurados: ${POSSIBLE_FPM_NAMES[*]}"
     echo "INFO: Verifique os serviços disponíveis com: sudo systemctl list-unit-files | grep php"
-    exit 1 # Falha crítica se não encontrar o serviço PHP-FPM
+    exit 1
 fi
 
 echo "INFO: Habilitando e reiniciando httpd e $PHP_FPM_SERVICE_NAME..."
@@ -382,7 +389,6 @@ if $httpd_restarted_successfully && $php_fpm_restarted_successfully && \
     echo "INFO: httpd e $PHP_FPM_SERVICE_NAME ativos."
 else
     echo "ERRO CRÍTICO: httpd ou $PHP_FPM_SERVICE_NAME não estão ativos após a tentativa de reinício."
-    # Logs adicionais para diagnóstico
     if ! systemctl is-active --quiet httpd; then echo "--- Status httpd DETALHADO ---"; sudo systemctl status httpd -l --no-pager; sudo tail -n 30 /var/log/httpd/error_log; fi
     if ! systemctl is-active --quiet "$PHP_FPM_SERVICE_NAME"; then echo "--- Status $PHP_FPM_SERVICE_NAME DETALHADO ---"; sudo systemctl status "$PHP_FPM_SERVICE_NAME" -l --no-pager; sudo journalctl -u "$PHP_FPM_SERVICE_NAME" -n 30 --no-pager; fi
     exit 1
@@ -395,13 +401,14 @@ setup_python_monitor_script # Baixa o script Python do S3
 create_and_enable_python_monitor_service # Cria e inicia o serviço systemd para o script Python
 
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.3.3) concluído! ($(date)) ---"
+echo "INFO: --- Script WordPress Setup (v2.3.4) concluído! ($(date)) ---"
 echo "INFO: Sincronização com S3 agora é via Python Watchdog (script baixado do S3)."
 echo "INFO: Script de monitoramento Python: $PYTHON_MONITOR_SCRIPT_PATH"
 echo "INFO: Serviço Python: $PYTHON_MONITOR_SERVICE_NAME (Log do monitor: $PY_MONITOR_LOG_FILE, Log de transferências: $PY_S3_TRANSFER_LOG_FILE)"
+echo "INFO: Configurações do Python para EFS/S3 (no service file): DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync:-N/A}, PERFORM_INITIAL_SYNC=${py_perform_initial_sync:-N/A}"
 echo "INFO: Logs: Principal=${LOG_FILE}"
 echo "INFO: Site: https://${WPDOMAIN}, Health Check: /healthcheck.php"
-echo "INFO: LEMBRE-SE de configurar o EFS Access Point com uid=48 e gid=48."
+echo "INFO: LEMBRE-SE de configurar o EFS Access Point com uid=48 e gid=48 (para o apache)."
 echo "INFO: LEMBRE-SE de colocar o script Python ($PYTHON_MONITOR_SCRIPT_NAME ou o nome definido em AWS_S3_PYTHON_SCRIPT_KEY) no bucket S3 '$AWS_S3_BUCKET_TARGET_NAME_SCRIPT' com a chave '$AWS_S3_PYTHON_SCRIPT_KEY'."
 echo "INFO: =================================================="
 exit 0
