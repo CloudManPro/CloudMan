@@ -78,93 +78,57 @@ mount_efs() {
     echo "ERRO CRÍTICO: Falha ao montar EFS após $max_retries tentativas."; ip addr; dmesg | tail -n 20; exit 1
 }
 
-create_wp_config_template() {
-    local target_file_on_efs="$1"; local primary_wpdomain_for_fallback="$2"; local db_name="$3"; local db_user="$4"; local db_password="$5"; local db_host="$6"
-    local temp_config_file; temp_config_file=$(mktemp /tmp/wp-config.XXXXXX.php); sudo chmod 644 "$temp_config_file"; trap 'rm -f "$temp_config_file"' RETURN
-    echo "INFO: Criando wp-config.php em '$temp_config_file' para EFS '$target_file_on_efs'..."
-    if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "ERRO: '$CONFIG_SAMPLE_ON_EFS' não encontrado."; exit 1; fi
-    sudo cp "$CONFIG_SAMPLE_ON_EFS" "$temp_config_file"
-    SAFE_DB_NAME=$(echo "$db_name" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g"); SAFE_DB_USER=$(echo "$db_user" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
-    SAFE_DB_PASSWORD=$(echo "$db_password" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g"); SAFE_DB_HOST=$(echo "$db_host" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
-    sed -i "s/database_name_here/$SAFE_DB_NAME/g" "$temp_config_file"; sed -i "s/username_here/$SAFE_DB_USER/g" "$temp_config_file"
-    sed -i "s/password_here/$SAFE_DB_PASSWORD/g" "$temp_config_file"; sed -i "s/localhost/$SAFE_DB_HOST/g" "$temp_config_file"
-    SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
-    if [ -n "$SALT" ]; then
-        TEMP_SALT_FILE_INNER=$(mktemp /tmp/salts.XXXXXX); sudo chmod 644 "$TEMP_SALT_FILE_INNER"; echo "$SALT" >"$TEMP_SALT_FILE_INNER"
-        # shellcheck disable=SC2016
-        sed -i -e '/^define( *'\''AUTH_KEY'\''/d' -e '/^define( *'\''SECURE_AUTH_KEY'\''/d' -e '/^define( *'\''LOGGED_IN_KEY'\''/d' -e '/^define( *'\''NONCE_KEY'\''/d' -e '/^define( *'\''AUTH_SALT'\''/d' -e '/^define( *'\''SECURE_AUTH_SALT'\''/d' -e '/^define( *'\''LOGGED_IN_SALT'\''/d' -e '/^define( *'\''NONCE_SALT'\''/d' "$temp_config_file"
-        if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE_INNER" "$temp_config_file"; else cat "$TEMP_SALT_FILE_INNER" >>"$temp_config_file"; fi
-        rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
-    else echo "ERRO: Falha ao obter SALTS."; fi
-    PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.2.2.sh
-\$site_scheme = 'https';
-\$site_host = '$primary_wpdomain_for_fallback';
-if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
-if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') { \$_SERVER['HTTPS'] = 'on'; }
-define('WP_HOME', \$site_scheme . '://' . \$site_host); define('WP_SITEURL', \$site_scheme . '://' . \$site_host);
-define('FS_METHOD', 'direct');
-if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') { \$_SERVER['HTTPS'] = 'on'; }
-if (isset(\$_SERVER['HTTP_X_FORWARDED_SSL']) && \$_SERVER['HTTP_X_FORWARDED_SSL'] == 'on') { \$_SERVER['HTTPS'] = 'on'; }
-EOPHP
-) # Fim do EOPHP deve estar sozinho na linha
-    TEMP_DEFINES_FILE_INNER=$(mktemp /tmp/defines.XXXXXX); sudo chmod 644 "$TEMP_DEFINES_FILE_INNER"; echo -e "\n$PHP_DEFINES_BLOCK_CONTENT" >"$TEMP_DEFINES_FILE_INNER"
-    if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE_INNER" "$temp_config_file"; else cat "$TEMP_DEFINES_FILE_INNER" >>"$temp_config_file"; fi
-    rm -f "$TEMP_DEFINES_FILE_INNER"; echo "INFO: Defines configurados."
-    echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como '$APACHE_USER'..."
-    if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
-}
-
-# --- Função para Criar o Script de Monitoramento Inotify (CORRIGIDA) ---
+# --- Função para Criar o Script de Monitoramento Inotify (MODIFICADA) ---
 create_inotify_monitor_script() {
-    echo "INFO: Criando script de monitoramento inotify seletivo em $INOTIFY_MONITOR_SCRIPT_PATH (v2.2.2 - correção sintaxe while)..."
+    echo "INFO: Criando script de monitoramento inotify seletivo em $INOTIFY_MONITOR_SCRIPT_PATH (v2.2.2 - correção array)..."
 
-    # ... (printf para safe_... variáveis como antes) ...
     local safe_monitor_dir_base; printf -v safe_monitor_dir_base "%q" "$MOUNT_POINT"
     local safe_inotify_log_file; printf -v safe_inotify_log_file "%q" "$INOTIFY_MONITOR_LOG_FILE"
     local safe_s3_transfer_log_file; printf -v safe_s3_transfer_log_file "%q" "$S3_TRANSFER_LOG_FILE"
     local safe_env_vars_file; printf -v safe_env_vars_file "%q" "$ENV_VARS_FILE"
     local safe_s3_bucket; printf -v safe_s3_bucket "%q" "$AWS_S3_BUCKET_TARGET_NAME_0"
 
-    # Construir a string de RELEVANT_PATTERNS (como antes)
-    local relevant_patterns_string="RELEVANT_PATTERNS=(\n"
-    relevant_patterns_string+="    \"wp-content/uploads/*\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.css\"\n" # etc... (adicione todos os seus patterns)
-    relevant_patterns_string+="    \"wp-content/themes/*/*.js\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.jpg\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.jpeg\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.png\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.gif\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.svg\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.webp\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.ico\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.woff\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.woff2\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.ttf\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.eot\"\n"
-    relevant_patterns_string+="    \"wp-content/themes/*/*.otf\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.css\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.js\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.jpg\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.jpeg\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.png\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.gif\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.svg\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.webp\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.ico\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.woff\"\n"
-    relevant_patterns_string+="    \"wp-content/plugins/*/*.woff2\"\n"
-    relevant_patterns_string+="    \"wp-includes/js/*\"\n"
-    relevant_patterns_string+="    \"wp-includes/css/*\"\n"
-    relevant_patterns_string+="    \"wp-includes/images/*\"\n"
-    relevant_patterns_string+=")"
+    # Construir a definição do array RELEVANT_PATTERNS corretamente para o script inotify
+    # Cada elemento em uma nova linha, devidamente citado para o shell do script inotify
+    local relevant_patterns_definition="declare -a RELEVANT_PATTERNS=(\n"
+    relevant_patterns_definition+="    \"wp-content/uploads/*\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.css\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.js\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.jpg\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.jpeg\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.png\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.gif\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.svg\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.webp\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.ico\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.woff\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.woff2\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.ttf\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.eot\"\n"
+    relevant_patterns_definition+="    \"wp-content/themes/*/*.otf\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.css\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.js\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.jpg\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.jpeg\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.png\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.gif\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.svg\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.webp\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.ico\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.woff\"\n"
+    relevant_patterns_definition+="    \"wp-content/plugins/*/*.woff2\"\n"
+    relevant_patterns_definition+="    \"wp-includes/js/*\"\n"
+    relevant_patterns_definition+="    \"wp-includes/css/*\"\n"
+    relevant_patterns_definition+="    \"wp-includes/images/*\"\n"
+    relevant_patterns_definition+=")"
 
 
     # Template do script de monitoramento
+    # A variável $relevant_patterns_definition será injetada aqui
     local inotify_script_content
     inotify_script_content=$(cat <<EOF_INOTIFY_TEMPLATE_CONTENT
 #!/bin/bash
-# Script de monitoramento de EFS para S3 Sync usando inotifywait (Seletivo v2.2.2 - correção sintaxe)
+# Script de monitoramento de EFS para S3 Sync usando inotifywait (Seletivo v2.2.2 - array fix)
 # Gerado por: $THIS_SCRIPT_TARGET_PATH
 
 # Valores injetados pelo script de setup:
@@ -183,16 +147,19 @@ log_s3_transfer() {
 }
 
 readonly SYNC_DEBOUNCE_SECONDS=3
-declare -A last_sync_file_map
+declare -A last_sync_file_map # Deve ser declarado antes de ser usado
 
-if [ -f "\$ENV_VARS_FOR_SETUP_SCRIPT" ]; then source "\$ENV_VARS_FOR_SETUP_SCRIPT"; fi
+# Carregar variáveis (se houver alguma específica que o aws s3 cp precise e não esteja no ambiente)
+# if [ -f "\$ENV_VARS_FOR_SETUP_SCRIPT" ]; then source "\$ENV_VARS_FOR_SETUP_SCRIPT"; fi
+
 if [ ! -d "\$MONITOR_DIR_BASE" ]; then log_inotify_message "ERRO: Diretório base '\$MONITOR_DIR_BASE' não existe."; exit 1; fi
 if [ -z "\$S3_BUCKET_TARGET_NAME_0" ]; then log_inotify_message "ERRO: S3_BUCKET_TARGET_NAME_0 não definido."; exit 1; fi
 
 log_inotify_message "INFO: Iniciando monitoramento de '\$MONITOR_DIR_BASE' para S3 sync seletivo."
 touch "\$LOG_FILE_INOTIFY" "\$S3_TRANSFER_LOG_FILE"; chmod 644 "\$LOG_FILE_INOTIFY" "\$S3_TRANSFER_LOG_FILE"
 
-$relevant_patterns_string
+# Definição do array RELEVANT_PATTERNS injetada aqui
+$relevant_patterns_definition
 
 aws_cli_path=\$(command -v aws)
 if [ -z "\$aws_cli_path" ]; then log_inotify_message "ERRO: AWS CLI não encontrado."; exit 1; fi
@@ -202,8 +169,8 @@ while true; do
         -e create -e modify -e moved_to -e close_write \\
         --format '%w%f %e' \\
         --exclude '(\\.swp\$|\\.swx\$|~$|\\.part\$|\\.crdownload\$|cache/|\\.git/|node_modules/|uploads/sites/)' \\
-        "\$MONITOR_DIR_BASE" | # <-- REMOVIDA A BARRA INVERTIDA DAQUI
-    while IFS=' ' read -r DETECTED_ABSOLUTE_FILE DETECTED_EVENTS; do # Esta linha é a continuação lógica do pipe
+        "\$MONITOR_DIR_BASE" |
+    while IFS=' ' read -r DETECTED_ABSOLUTE_FILE DETECTED_EVENTS; do
         if [ -d "\$DETECTED_ABSOLUTE_FILE" ]; then continue; fi
 
         log_inotify_message "Evento: '\$DETECTED_EVENTS' em '\$DETECTED_ABSOLUTE_FILE'."
@@ -211,13 +178,14 @@ while true; do
 
         file_is_relevant=false
         for pattern in "\${RELEVANT_PATTERNS[@]}"; do
-            if [[ "\$RELATIVE_FILE_PATH" == \$pattern ]]; then
+            if [[ "\$RELATIVE_FILE_PATH" == \$pattern ]]; then # Match de glob do Bash
                 file_is_relevant=true
                 log_inotify_message "INFO: Arquivo '\$RELATIVE_FILE_PATH' corresponde ao pattern '\$pattern'."
                 break
             fi
         done
         
+        # Fallback específico para uploads, se necessário (a glob * já deve pegar)
         if ! \$file_is_relevant && [[ "\$RELATIVE_FILE_PATH" == wp-content/uploads/* ]]; then
             file_is_relevant=true
             log_inotify_message "INFO: Arquivo '\$RELATIVE_FILE_PATH' (upload) considerado relevante por fallback."
@@ -231,7 +199,8 @@ while true; do
         log_inotify_message "INFO: Arquivo relevante '\$RELATIVE_FILE_PATH' modificado. Preparando para S3."
 
         current_time=\$(date +%s)
-        if [ -n "\${last_sync_file_map[\$DETECTED_ABSOLUTE_FILE]:-}" ] && \\
+        # Correção na verificação do array associativo para debounce
+        if [ -v "last_sync_file_map[\$DETECTED_ABSOLUTE_FILE]" ] && \\
            (( current_time - last_sync_file_map[\$DETECTED_ABSOLUTE_FILE] < SYNC_DEBOUNCE_SECONDS )); then
             log_inotify_message "INFO: Debounce ativo para '\$DETECTED_ABSOLUTE_FILE'. Pulando."
             continue
@@ -256,7 +225,7 @@ EOF_INOTIFY_TEMPLATE_CONTENT
 
     echo "$inotify_script_content" > "$INOTIFY_MONITOR_SCRIPT_PATH"
     chmod +x "$INOTIFY_MONITOR_SCRIPT_PATH"
-    echo "INFO: Script de monitoramento inotify '$INOTIFY_MONITOR_SCRIPT_PATH' criado e tornado executável (com correção de sintaxe)."
+    echo "INFO: Script de monitoramento inotify '$INOTIFY_MONITOR_SCRIPT_PATH' criado e tornado executável (com correção de array e sintaxe while)."
 }
 
 
