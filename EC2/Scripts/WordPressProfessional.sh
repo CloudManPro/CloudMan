@@ -15,7 +15,7 @@ readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.3.log"
 readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.3.log"
 
 # Chave S3 para o script Python (Hardcoded - AJUSTE CONFORME NECESSÁRIO)
-readonly AWS_S3_PYTHON_SCRIPT_KEY="scripts/efs_s3_monitor.py" # Ex: 'scripts/efs_s3_monitor.py' ou o nome do seu script .py
+readonly AWS_S3_PYTHON_SCRIPT_KEY="efs_s3_monitor.py" # Ex: 'scripts/efs_s3_monitor.py' ou o nome do seu script .py
 
 # --- Variáveis Globais ---
 LOG_FILE="/var/log/wordpress_setup_v2.3.3.log"
