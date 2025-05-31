@@ -176,7 +176,7 @@ create_and_enable_python_monitor_service() {
     local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" # Para evitar problemas com caracteres especiais no systemd
 
     # Valores default para as novas variáveis de ambiente do Python
-    local py_delete_from_efs_after_sync="false" # Mantenha false por segurança, a menos que explicitamente desejado
+    local py_delete_from_efs_after_sync="true" # Mantenha false por segurança, a menos que explicitamente desejado
     local py_perform_initial_sync="true"      # Recomendado manter true
 
     sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
