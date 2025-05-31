@@ -128,13 +128,38 @@ setup_python_monitor_script() {
         exit 1
     fi
     local s3_python_script_uri="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_PYTHON_SCRIPT_KEY}"
-    echo "INFO: Tentando baixar script Python de '$s3_python_script_uri' para '$PYTHON_MONITOR_SCRIPT_PATH'..."
-    if ! sudo aws s3 cp "$s3_python_script_uri" "$PYTHON_MONITOR_SCRIPT_PATH" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
-        echo "ERRO CRÍTICO: Falha ao baixar o script Python de '$s3_python_script_uri'."
+    local temp_python_script_path="/tmp/$(basename "$PYTHON_MONITOR_SCRIPT_PATH")_temp_download" # Download to temp first
+
+    echo "INFO: Tentando baixar script Python de '$s3_python_script_uri' para '$temp_python_script_path'..."
+
+    # Clear any previous temp file
+    sudo rm -f "$temp_python_script_path"
+
+    if ! sudo aws s3 cp "$s3_python_script_uri" "$temp_python_script_path" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
+        echo "ERRO CRÍTICO: Falha ao baixar o script Python de '$s3_python_script_uri' para '$temp_python_script_path'."
+        ls -l "$temp_python_script_path" # See if a partial/empty file was created
         exit 1
     fi
-    sudo chmod +x "$PYTHON_MONITOR_SCRIPT_PATH"
-    echo "INFO: Script de monitoramento Python '$PYTHON_MONITOR_SCRIPT_PATH' baixado e tornado executável."
+
+    # Check if the downloaded file has content
+    if [ ! -s "$temp_python_script_path" ]; then
+        echo "ERRO CRÍTICO: Script Python baixado '$temp_python_script_path' está vazio ou não existe."
+        ls -l "$temp_python_script_path"
+        exit 1
+    fi
+
+    echo "INFO: Script Python baixado para '$temp_python_script_path' com sucesso. Movendo para '$PYTHON_MONITOR_SCRIPT_PATH'."
+    if ! sudo mv "$temp_python_script_path" "$PYTHON_MONITOR_SCRIPT_PATH"; then
+        echo "ERRO CRÍTICO: Falha ao mover script Python de '$temp_python_script_path' para '$PYTHON_MONITOR_SCRIPT_PATH'."
+        exit 1
+    fi
+
+    if ! sudo chmod +x "$PYTHON_MONITOR_SCRIPT_PATH"; then
+        echo "ERRO CRÍTICO: Falha ao tornar o script Python '$PYTHON_MONITOR_SCRIPT_PATH' executável."
+        exit 1
+    fi
+
+    echo "INFO: Script de monitoramento Python '$PYTHON_MONITOR_SCRIPT_PATH' configurado e tornado executável."
 }
 
 # --- Função para Criar e Habilitar o Serviço Systemd para Python Monitor ---
