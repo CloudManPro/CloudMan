@@ -115,24 +115,21 @@ EOPHP
     if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
 }
 
-# --- Função para Criar o Script de Monitoramento Inotify (MODIFICADA) ---
+# --- Função para Criar o Script de Monitoramento Inotify (CORRIGIDA) ---
 create_inotify_monitor_script() {
-    echo "INFO: Criando script de monitoramento inotify seletivo em $INOTIFY_MONITOR_SCRIPT_PATH (v2.2.2)..."
+    echo "INFO: Criando script de monitoramento inotify seletivo em $INOTIFY_MONITOR_SCRIPT_PATH (v2.2.2 - correção sintaxe while)..."
 
-    # Usar printf para escapar os valores que serão inseridos no template
+    # ... (printf para safe_... variáveis como antes) ...
     local safe_monitor_dir_base; printf -v safe_monitor_dir_base "%q" "$MOUNT_POINT"
     local safe_inotify_log_file; printf -v safe_inotify_log_file "%q" "$INOTIFY_MONITOR_LOG_FILE"
     local safe_s3_transfer_log_file; printf -v safe_s3_transfer_log_file "%q" "$S3_TRANSFER_LOG_FILE"
     local safe_env_vars_file; printf -v safe_env_vars_file "%q" "$ENV_VARS_FILE"
     local safe_s3_bucket; printf -v safe_s3_bucket "%q" "$AWS_S3_BUCKET_TARGET_NAME_0"
-    local safe_wp_setup_script_path; printf -v safe_wp_setup_script_path "%q" "$THIS_SCRIPT_TARGET_PATH" # Script principal, se fosse chamar func dele
 
-    # Construir a string de RELEVANT_PATTERNS para o script inotify
-    # Os padrões são relativos à raiz do WordPress ($MONITOR_DIR_BASE)
-    # NOTA: Esta lista é para o SCRIPT DE INOTIFY, NÃO para o `aws s3 sync --include`
+    # Construir a string de RELEVANT_PATTERNS (como antes)
     local relevant_patterns_string="RELEVANT_PATTERNS=(\n"
-    relevant_patterns_string+="    \"wp-content/uploads/*\"\n" # Monitora tudo em uploads
-    relevant_patterns_string+="    \"wp-content/themes/*/*.css\"\n"
+    relevant_patterns_string+="    \"wp-content/uploads/*\"\n"
+    relevant_patterns_string+="    \"wp-content/themes/*/*.css\"\n" # etc... (adicione todos os seus patterns)
     relevant_patterns_string+="    \"wp-content/themes/*/*.js\"\n"
     relevant_patterns_string+="    \"wp-content/themes/*/*.jpg\"\n"
     relevant_patterns_string+="    \"wp-content/themes/*/*.jpeg\"\n"
@@ -162,20 +159,20 @@ create_inotify_monitor_script() {
     relevant_patterns_string+="    \"wp-includes/images/*\"\n"
     relevant_patterns_string+=")"
 
+
     # Template do script de monitoramento
     local inotify_script_content
     inotify_script_content=$(cat <<EOF_INOTIFY_TEMPLATE_CONTENT
 #!/bin/bash
-# Script de monitoramento de EFS para S3 Sync usando inotifywait (Seletivo v2.2.2)
+# Script de monitoramento de EFS para S3 Sync usando inotifywait (Seletivo v2.2.2 - correção sintaxe)
 # Gerado por: $THIS_SCRIPT_TARGET_PATH
 
 # Valores injetados pelo script de setup:
 readonly MONITOR_DIR_BASE=$safe_monitor_dir_base
 readonly LOG_FILE_INOTIFY=$safe_inotify_log_file
 readonly S3_TRANSFER_LOG_FILE=$safe_s3_transfer_log_file
-readonly ENV_VARS_FOR_SETUP_SCRIPT=$safe_env_vars_file # Pode não ser mais necessário aqui
+readonly ENV_VARS_FOR_SETUP_SCRIPT=$safe_env_vars_file
 readonly S3_BUCKET_TARGET_NAME_0=$safe_s3_bucket
-# readonly WORDPRESS_SETUP_SCRIPT=$safe_wp_setup_script_path # Não chamaremos mais func do script principal
 
 log_inotify_message() {
     echo "\$(date '+%Y-%m-%d %H:%M:%S') - INOTIFY_MONITOR - \$1" >> "\$LOG_FILE_INOTIFY"
@@ -185,53 +182,53 @@ log_s3_transfer() {
     echo "\$(date '+%Y-%m-%d %H:%M:%S') - S3_TRANSFER - \$1" >> "\$S3_TRANSFER_LOG_FILE"
 }
 
-readonly SYNC_DEBOUNCE_SECONDS=3 # Debounce menor para arquivos individuais
-declare -A last_sync_file_map # Usar declare -A para array associativo
+readonly SYNC_DEBOUNCE_SECONDS=3
+declare -A last_sync_file_map
 
-# Carregar variáveis (se houver alguma específica que o aws s3 cp precise e não esteja no ambiente)
-# if [ -f "\$ENV_VARS_FOR_SETUP_SCRIPT" ]; then source "\$ENV_VARS_FOR_SETUP_SCRIPT"; fi
-
+if [ -f "\$ENV_VARS_FOR_SETUP_SCRIPT" ]; then source "\$ENV_VARS_FOR_SETUP_SCRIPT"; fi
 if [ ! -d "\$MONITOR_DIR_BASE" ]; then log_inotify_message "ERRO: Diretório base '\$MONITOR_DIR_BASE' não existe."; exit 1; fi
 if [ -z "\$S3_BUCKET_TARGET_NAME_0" ]; then log_inotify_message "ERRO: S3_BUCKET_TARGET_NAME_0 não definido."; exit 1; fi
 
 log_inotify_message "INFO: Iniciando monitoramento de '\$MONITOR_DIR_BASE' para S3 sync seletivo."
-touch "\$LOG_FILE_INOTIFY" "\$S3_TRANSFER_LOG_FILE" # Garante que os arquivos de log existem
-chmod 644 "\$LOG_FILE_INOTIFY" "\$S3_TRANSFER_LOG_FILE"
+touch "\$LOG_FILE_INOTIFY" "\$S3_TRANSFER_LOG_FILE"; chmod 644 "\$LOG_FILE_INOTIFY" "\$S3_TRANSFER_LOG_FILE"
 
-# Lista de padrões de arquivos que DEVEM ser sincronizados (glob patterns)
-# Relativos à raiz do WordPress (\$MONITOR_DIR_BASE)
 $relevant_patterns_string
 
 aws_cli_path=\$(command -v aws)
 if [ -z "\$aws_cli_path" ]; then log_inotify_message "ERRO: AWS CLI não encontrado."; exit 1; fi
 
-# Monitorar a raiz do WordPress (\$MONITOR_DIR_BASE)
 while true; do
     inotifywait -q -m -r \\
         -e create -e modify -e moved_to -e close_write \\
         --format '%w%f %e' \\
-        --exclude '(\\\.swp\$|\\\.swx\$|~$|\\\.part\$|\\\.crdownload\$|cache/|\\.git/|node_modules/|uploads/sites/)' \\
-        "\$MONITOR_DIR_BASE" | \\
-    while IFS=' ' read -r DETECTED_ABSOLUTE_FILE DETECTED_EVENTS; do
-        if [ -d "\$DETECTED_ABSOLUTE_FILE" ]; then continue; fi # Ignorar eventos de diretório para cópia individual
+        --exclude '(\\.swp\$|\\.swx\$|~$|\\.part\$|\\.crdownload\$|cache/|\\.git/|node_modules/|uploads/sites/)' \\
+        "\$MONITOR_DIR_BASE" | # <-- REMOVIDA A BARRA INVERTIDA DAQUI
+    while IFS=' ' read -r DETECTED_ABSOLUTE_FILE DETECTED_EVENTS; do # Esta linha é a continuação lógica do pipe
+        if [ -d "\$DETECTED_ABSOLUTE_FILE" ]; then continue; fi
 
         log_inotify_message "Evento: '\$DETECTED_EVENTS' em '\$DETECTED_ABSOLUTE_FILE'."
         RELATIVE_FILE_PATH="\${DETECTED_ABSOLUTE_FILE#\$MONITOR_DIR_BASE/}"
 
         file_is_relevant=false
         for pattern in "\${RELEVANT_PATTERNS[@]}"; do
-            # Usar [[ string == pattern ]] para correspondência de glob do Bash
             if [[ "\$RELATIVE_FILE_PATH" == \$pattern ]]; then
                 file_is_relevant=true
                 log_inotify_message "INFO: Arquivo '\$RELATIVE_FILE_PATH' corresponde ao pattern '\$pattern'."
                 break
             fi
         done
+        
+        if ! \$file_is_relevant && [[ "\$RELATIVE_FILE_PATH" == wp-content/uploads/* ]]; then
+            file_is_relevant=true
+            log_inotify_message "INFO: Arquivo '\$RELATIVE_FILE_PATH' (upload) considerado relevante por fallback."
+        fi
 
         if ! \$file_is_relevant; then
             log_inotify_message "INFO: Arquivo '\$RELATIVE_FILE_PATH' não relevante. Ignorando."
             continue
         fi
+
+        log_inotify_message "INFO: Arquivo relevante '\$RELATIVE_FILE_PATH' modificado. Preparando para S3."
 
         current_time=\$(date +%s)
         if [ -n "\${last_sync_file_map[\$DETECTED_ABSOLUTE_FILE]:-}" ] && \\
@@ -245,7 +242,7 @@ while true; do
 
         if "\$aws_cli_path" s3 cp "\$DETECTED_ABSOLUTE_FILE" "\$S3_DEST_PATH" --acl private --only-show-errors; then
             log_inotify_message "INFO: Cópia S3 OK para '\$RELATIVE_FILE_PATH'."
-            log_s3_transfer "TRANSFERRED: \$RELATIVE_FILE_PATH" # Log no arquivo de transferências
+            log_s3_transfer "TRANSFERRED: \$RELATIVE_FILE_PATH"
             last_sync_file_map["\$DETECTED_ABSOLUTE_FILE"]=\$(date +%s)
         else
             log_inotify_message "ERRO: Falha ao copiar '\$RELATIVE_FILE_PATH' para S3."
@@ -255,11 +252,11 @@ while true; do
     sleep 10
 done
 EOF_INOTIFY_TEMPLATE_CONTENT
-) # Fim do Here-Document do template
+)
 
     echo "$inotify_script_content" > "$INOTIFY_MONITOR_SCRIPT_PATH"
     chmod +x "$INOTIFY_MONITOR_SCRIPT_PATH"
-    echo "INFO: Script de monitoramento inotify '$INOTIFY_MONITOR_SCRIPT_PATH' criado e tornado executável."
+    echo "INFO: Script de monitoramento inotify '$INOTIFY_MONITOR_SCRIPT_PATH' criado e tornado executável (com correção de sintaxe)."
 }
 
 
