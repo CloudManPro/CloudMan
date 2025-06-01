@@ -206,7 +206,7 @@ Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="WP_DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync}"
 Environment="WP_PERFORM_INITIAL_SYNC=${py_perform_initial_sync}"
-Environment="AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0=${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}" 
+Environment="AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0=${AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0:-}" 
 
 [Install]
 WantedBy=multi-user.target
