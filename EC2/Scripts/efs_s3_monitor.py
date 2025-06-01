@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import time
 import logging
 import subprocess
@@ -5,13 +6,26 @@ import os
 import fnmatch
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import shutil  # Para shutil.which
+import shutil
 import boto3
-import threading # Para o temporizador de debounce da invalidação e locks
+import threading
+import json
 
-# --- Configuration (Read from environment variables passed by systemd service) ---
+try:
+    import pymysql
+except ImportError:
+    print("CRITICAL: pymysql library not found. Please install it: pip install pymysql")
+    exit(1)
+try:
+    from phpserialize import loads as php_loads
+except ImportError:
+    print("CRITICAL: phpserialize library not found. Please install it: pip install phpserialize")
+    exit(1)
+
+# --- Configuration (Read from environment variables) ---
+# EFS Monitor
 MONITOR_DIR_BASE = os.environ.get('WP_MONITOR_DIR_BASE', '/var/www/html')
-S3_BUCKET = os.environ.get('WP_S3_BUCKET')
+S3_BUCKET = os.environ.get('WP_S3_BUCKET') # Usado por ambos EFS sync e RDS queue
 RELEVANT_PATTERNS_STR = os.environ.get('WP_RELEVANT_PATTERNS', '')
 LOG_FILE_MONITOR = os.environ.get(
     'WP_PY_MONITOR_LOG_FILE', '/var/log/wp_efs_s3_py_monitor_default.log')
@@ -19,530 +33,713 @@ S3_TRANSFER_LOG = os.environ.get(
     'WP_PY_S3_TRANSFER_LOG', '/var/log/wp_s3_py_transferred_default.log')
 SYNC_DEBOUNCE_SECONDS = int(os.environ.get('WP_SYNC_DEBOUNCE_SECONDS', '5'))
 AWS_CLI_PATH = os.environ.get('WP_AWS_CLI_PATH', 'aws')
-
-# Configurações para controle fino
 DELETE_FROM_EFS_AFTER_SYNC = os.environ.get('WP_DELETE_FROM_EFS_AFTER_SYNC', 'false').lower() == 'true'
 PERFORM_INITIAL_SYNC = os.environ.get('WP_PERFORM_INITIAL_SYNC', 'true').lower() == 'true'
-CLOUDFRONT_DISTRIBUTION_ID = os.environ.get('AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0')
+DELETABLE_IMAGE_EXTENSIONS_FROM_EFS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.ico', '.svg']
 
-# Configurações para Invalidação em Lote
+# CloudFront
+CLOUDFRONT_DISTRIBUTION_ID = os.environ.get('AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0')
 CF_INVALIDATION_BATCH_MAX_SIZE = int(os.environ.get('CF_INVALIDATION_BATCH_MAX_SIZE', 15))
 CF_INVALIDATION_BATCH_TIMEOUT_SECONDS = int(os.environ.get('CF_INVALIDATION_BATCH_TIMEOUT_SECONDS', 20))
 
-DELETABLE_IMAGE_EXTENSIONS_FROM_EFS = [
-    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.ico', '.svg'
-]
+# RDS Deletion Queue
+RDS_DELETION_QUEUE_ENABLED = os.environ.get('WP_RDS_DELETION_QUEUE_ENABLED', 'true').lower() == 'true'
+RDS_SECRET_ARN_OR_NAME = os.environ.get('WP_RDS_SECRET_ARN_OR_NAME') # ARN ou nome do segredo no Secrets Manager
+# As variáveis RDS_HOST, USER, PASSWORD, DBNAME, PORT serão obtidas do Secrets Manager se RDS_SECRET_ARN_OR_NAME for fornecido
+# Caso contrário, ou como fallback/override, podem ser lidas daqui:
+RDS_HOST_ENV = os.environ.get('WP_RDS_HOST')
+RDS_USER_ENV = os.environ.get('WP_RDS_USER')
+RDS_PASSWORD_ENV = os.environ.get('WP_RDS_PASSWORD') # Não recomendado passar via env var
+RDS_DB_NAME_ENV = os.environ.get('WP_RDS_DB_NAME')
+RDS_PORT_ENV = int(os.environ.get('WP_RDS_PORT', '3306'))
 
-RELEVANT_PATTERNS = [p.strip()
-                     for p in RELEVANT_PATTERNS_STR.split(';') if p.strip()]
+RDS_WP_POSTS_TABLE_NAME = os.environ.get('WP_RDS_POSTS_TABLE_NAME', 'wp_posts')
+RDS_WP_POSTMETA_TABLE_NAME = os.environ.get('WP_RDS_POSTMETA_TABLE_NAME', 'wp_postmeta')
+S3_DELETION_QUEUE_TABLE_NAME = os.environ.get('WP_S3_DELETION_QUEUE_TABLE_NAME', 'wp_s3_deletion_queue')
+S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS = int(os.environ.get('WP_S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS', '900'))
+S3_DELETION_QUEUE_BATCH_SIZE = int(os.environ.get('WP_S3_DELETION_QUEUE_BATCH_SIZE', '10'))
+S3_BASE_PATH_FOR_DELETION_QUEUE = os.environ.get('WP_S3_BASE_PATH_FOR_DELETION_QUEUE', 'wp-content/uploads/')
+
+# --- Globals ---
+RELEVANT_PATTERNS = [p.strip() for p in RELEVANT_PATTERNS_STR.split(';') if p.strip()]
 last_sync_file_map = {}
-
-# Variáveis Globais para Invalidação em Lote
 cf_invalidation_paths_batch = []
 cf_invalidation_timer = None
 cf_invalidation_lock = threading.Lock()
-
-# Variáveis Globais para rastrear deleções do EFS feitas pelo script
 efs_deleted_by_script = set()
 efs_deletion_lock = threading.Lock()
-
+s3_deletion_queue_stop_event = threading.Event()
+s3_client_boto_for_deletion_queue = None # Será inicializado na thread do RDS
+rds_credentials_global = {} # Para armazenar credenciais obtidas do Secrets Manager
 
 # --- Logger Setup ---
-def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(name)s - %(levelname)s - %(message)s'):
+def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(levelname)s - %(name)s - %(message)s'):
     log_dir = os.path.dirname(log_file)
     if log_dir and not os.path.exists(log_dir):
         try:
             os.makedirs(log_dir, exist_ok=True)
-            os.chmod(log_dir, 0o755)
         except Exception as e:
             print(f"Error creating log directory {log_dir}: {e}")
-            log_file = os.path.join("/tmp", os.path.basename(log_file)) # Fallback
+            log_file = os.path.join("/tmp", os.path.basename(log_file))
             print(f"Falling back to log file: {log_file}")
-
     try:
-        with open(log_file, 'a'): 
-            os.utime(log_file, None) 
-        os.chmod(log_file, 0o644) 
+        with open(log_file, 'a'): os.utime(log_file, None)
     except Exception as e:
-        print(f"Error touching/chmod log file {log_file}: {e}")
+        print(f"Error touching log file {log_file}: {e}")
 
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    if not logger.hasHandlers(): 
-        handler = logging.FileHandler(log_file, mode='a') 
+    if not logger.hasHandlers():
+        handler = logging.FileHandler(log_file, mode='a')
         handler.setFormatter(logging.Formatter(formatter_str))
         logger.addHandler(handler)
-        
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.ERROR) 
+        console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(logging.Formatter(formatter_str))
         logger.addHandler(console_handler)
     return logger
 
 monitor_logger = setup_logger('PY_MONITOR', LOG_FILE_MONITOR)
-transfer_logger = setup_logger(
-    'PY_S3_TRANSFER', S3_TRANSFER_LOG, formatter_str='%(asctime)s - %(message)s')
+transfer_logger = setup_logger('PY_S3_TRANSFER', S3_TRANSFER_LOG, formatter_str='%(asctime)s - %(message)s')
+rds_queue_logger = setup_logger('PY_RDS_QUEUE', LOG_FILE_MONITOR) # Log para o mesmo arquivo do monitor
 
-# --- Helper Functions ---
+
+# --- Secrets Manager Function ---
+def get_rds_credentials_from_secrets_manager(secret_arn_or_name):
+    global rds_credentials_global # Vamos popular o global aqui
+    if not secret_arn_or_name:
+        rds_queue_logger.info("RDS Secret ARN or Name not provided. Will attempt to use ENV vars for RDS creds.")
+        rds_credentials_global = {
+            'host': RDS_HOST_ENV, 'port': RDS_PORT_ENV, 'user': RDS_USER_ENV,
+            'password': RDS_PASSWORD_ENV, 'dbname': RDS_DB_NAME_ENV
+        }
+        if not all(rds_credentials_global.values()): # Check if all essential fallback env vars are set
+            rds_queue_logger.error("Fallback RDS ENV vars (HOST, USER, DBNAME) are not fully configured.")
+            return False
+        rds_queue_logger.info("Using RDS credentials from environment variables (password may be missing if not set).")
+        return True
+
+
+    rds_queue_logger.info(f"Attempting to retrieve RDS credentials from Secrets Manager: {secret_arn_or_name}")
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager')
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_arn_or_name)
+        if 'SecretString' in get_secret_value_response:
+            secret_string = get_secret_value_response['SecretString']
+            secret_data = json.loads(secret_string)
+            rds_credentials_global = {
+                'host': secret_data.get('host', RDS_HOST_ENV), # Fallback to ENV if not in secret
+                'port': int(secret_data.get('port', RDS_PORT_ENV)),
+                'user': secret_data.get('username', RDS_USER_ENV),
+                'password': secret_data.get('password'), # Password MUST come from secret
+                'dbname': secret_data.get('dbname', RDS_DB_NAME_ENV)
+            }
+            if not rds_credentials_global.get('password'):
+                rds_queue_logger.error(f"Password not found in secret '{secret_arn_or_name}'.")
+                return False
+            rds_queue_logger.info(f"Successfully retrieved and parsed RDS credentials from secret '{secret_arn_or_name}'.")
+            return True
+        else:
+            rds_queue_logger.error(f"SecretString not found in response for '{secret_arn_or_name}'.")
+            return False
+    except Exception as e:
+        rds_queue_logger.error(f"Error retrieving secret '{secret_arn_or_name}': {e}", exc_info=True)
+        return False
+
+# --- RDS Deletion Queue Functions ---
+def get_rds_connection():
+    if not rds_credentials_global or not all([rds_credentials_global.get(k) for k in ['host', 'user', 'password', 'dbname']]):
+        rds_queue_logger.error("RDS connection details are not fully configured (check Secrets Manager or ENV vars).")
+        return None
+    try:
+        conn = pymysql.connect(
+            host=rds_credentials_global['host'],
+            user=rds_credentials_global['user'],
+            password=rds_credentials_global['password'],
+            database=rds_credentials_global['dbname'],
+            port=rds_credentials_global['port'],
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=10,
+            charset='utf8mb4'
+        )
+        rds_queue_logger.debug(f"Successfully connected to RDS: {rds_credentials_global['host']}/{rds_credentials_global['dbname']}")
+        return conn
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"Error connecting to RDS: {e}")
+        return None
+
+def ensure_deletion_queue_table_exists(conn):
+    if not conn: return False
+    try:
+        with conn.cursor() as cursor:
+            sql = f"""
+            CREATE TABLE IF NOT EXISTS `{S3_DELETION_QUEUE_TABLE_NAME}` (
+                `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `post_id_deleted` BIGINT UNSIGNED NULL,
+                `attachment_metadata_snapshot` LONGTEXT NULL,
+                `s3_keys_to_delete_json` LONGTEXT NULL,
+                `status` ENUM('PENDING', 'PROCESSING', 'DONE', 'ERROR', 'NO_KEYS') NOT NULL DEFAULT 'PENDING',
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `processed_at` TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+                `error_message` TEXT NULL,
+                INDEX `idx_status_created_at` (`status`, `created_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            """
+            cursor.execute(sql)
+        conn.commit()
+        rds_queue_logger.info(f"Table '{S3_DELETION_QUEUE_TABLE_NAME}' ensured to exist.")
+        return True
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"Error ensuring table '{S3_DELETION_QUEUE_TABLE_NAME}' exists: {e}")
+        if conn.open: conn.rollback()
+        return False
+
+def ensure_s3_deletion_trigger_exists(conn):
+    if not conn: return False
+    trigger_name = 'after_attachment_delete_enqueue_s3_v1'
+    rds_queue_logger.info(f"Ensuring RDS trigger '{trigger_name}' exists...")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) as count FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = %s;", (trigger_name,))
+            if cursor.fetchone()['count'] > 0:
+                rds_queue_logger.info(f"Trigger '{trigger_name}' already exists.")
+                return True
+
+            rds_queue_logger.info(f"Trigger '{trigger_name}' not found. Attempting to create...")
+            # User needs TRIGGER permission on the database
+            sql_create_trigger = f"""
+            CREATE TRIGGER `{trigger_name}`
+            AFTER DELETE ON `{RDS_WP_POSTS_TABLE_NAME}`
+            FOR EACH ROW
+            BEGIN
+                DECLARE v_attachment_meta LONGTEXT;
+                IF OLD.post_type = 'attachment' THEN
+                    SELECT meta_value INTO v_attachment_meta
+                    FROM `{RDS_WP_POSTMETA_TABLE_NAME}`
+                    WHERE post_id = OLD.ID AND meta_key = '_wp_attachment_metadata'
+                    LIMIT 1;
+                    INSERT INTO `{S3_DELETION_QUEUE_TABLE_NAME}`
+                        (post_id_deleted, attachment_metadata_snapshot, status)
+                    VALUES
+                        (OLD.ID, v_attachment_meta, 'PENDING');
+                END IF;
+            END
+            """
+            cursor.execute(sql_create_trigger)
+            conn.commit()
+            rds_queue_logger.info(f"Trigger '{trigger_name}' created successfully.")
+            return True
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"MySQL Error for trigger '{trigger_name}': {e.args[0]} - {e.args[1] if len(e.args) > 1 else ''}")
+        if conn.open: conn.rollback()
+        return False
+    except Exception as e_gen:
+        rds_queue_logger.error(f"Unexpected error for trigger '{trigger_name}': {e_gen}", exc_info=True)
+        if conn.open: conn.rollback()
+        return False
+
+def get_pending_s3_deletions(conn, batch_size):
+    # (Identical to previous version)
+    if not conn: return []
+    try:
+        with conn.cursor() as cursor:
+            sql = f"SELECT id, post_id_deleted, attachment_metadata_snapshot, s3_keys_to_delete_json FROM `{S3_DELETION_QUEUE_TABLE_NAME}` WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT %s;"
+            cursor.execute(sql, (batch_size,))
+            items = cursor.fetchall()
+            return items if items else []
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"Error fetching pending S3 deletions: {e}")
+        return []
+
+
+def update_queue_item_status(conn, item_id, status, error_msg=None):
+    # (Identical to previous version)
+    if not conn: return False
+    try:
+        with conn.cursor() as cursor:
+            sql = f"UPDATE `{S3_DELETION_QUEUE_TABLE_NAME}` SET status = %s, error_message = %s WHERE id = %s;"
+            cursor.execute(sql, (status, error_msg, item_id))
+        conn.commit()
+        rds_queue_logger.debug(f"Updated item {item_id} to status {status}.")
+        return True
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"Error updating status for item {item_id} to {status}: {e}")
+        if conn.open: conn.rollback()
+        return False
+
+def parse_s3_keys_from_data(metadata_snapshot_str, s3_keys_json_str, post_id):
+    # (Identical to previous version, including S3_BASE_PATH_FOR_DELETION_QUEUE)
+    s3_keys = []
+    if s3_keys_json_str:
+        try:
+            keys = json.loads(s3_keys_json_str)
+            if isinstance(keys, list) and all(isinstance(k, str) for k in keys):
+                s3_keys.extend(keys)
+                rds_queue_logger.info(f"Using pre-calculated S3 keys from JSON for post_id {post_id}: {len(keys)} keys.")
+                return list(set(s3_keys))
+        except json.JSONDecodeError as e:
+            rds_queue_logger.warning(f"Failed to parse s3_keys_to_delete_json for post_id {post_id}: {e}. Will try metadata_snapshot.")
+
+    if not metadata_snapshot_str:
+        rds_queue_logger.warning(f"No metadata_snapshot_str or valid s3_keys_json for post_id {post_id}.")
+        return []
+    try:
+        metadata = php_loads(metadata_snapshot_str.encode('utf-8'), decode_strings=True)
+        if not isinstance(metadata, dict):
+            rds_queue_logger.error(f"Parsed metadata for post_id {post_id} is not a dictionary.")
+            return []
+        main_file_relative_path = metadata.get('file')
+        if main_file_relative_path:
+            full_s3_key_main = S3_BASE_PATH_FOR_DELETION_QUEUE.rstrip('/') + '/' + main_file_relative_path.lstrip('/')
+            s3_keys.append(full_s3_key_main)
+            main_file_dir_relative = os.path.dirname(main_file_relative_path)
+            sizes = metadata.get('sizes')
+            if isinstance(sizes, dict):
+                for size_info in sizes.values():
+                    if isinstance(size_info, dict) and 'file' in size_info:
+                        thumb_filename = size_info['file']
+                        if main_file_dir_relative and main_file_dir_relative != '.':
+                            thumb_relative_path_to_uploads = os.path.join(main_file_dir_relative, thumb_filename)
+                        else:
+                            thumb_relative_path_to_uploads = thumb_filename
+                        full_s3_key_thumb = S3_BASE_PATH_FOR_DELETION_QUEUE.rstrip('/') + '/' + thumb_relative_path_to_uploads.lstrip('/')
+                        s3_keys.append(full_s3_key_thumb)
+        else:
+            rds_queue_logger.warning(f"Metadata for post_id {post_id} does not contain 'file' key.")
+    except Exception as e:
+        rds_queue_logger.error(f"Error parsing PHP serialized metadata for post_id {post_id}: {e}", exc_info=True)
+    return list(set(s3_keys))
+
+
+def delete_s3_objects_from_queue_item(s3_client, bucket_name, s3_keys):
+    # (Identical to previous version)
+    if not s3_keys:
+        rds_queue_logger.info("No S3 keys provided for deletion.")
+        return True, None
+    objects_to_delete_s3_format = [{'Key': key.lstrip('/')} for key in s3_keys]
+    rds_queue_logger.info(f"Attempting to delete {len(objects_to_delete_s3_format)} objects from S3 bucket '{bucket_name}'.")
+    rds_queue_logger.debug(f"Objects to delete: {objects_to_delete_s3_format}")
+    try:
+        response = s3_client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects_to_delete_s3_format, 'Quiet': False})
+        deleted_successfully_count = len(response.get('Deleted', []))
+        for d_obj in response.get('Deleted', []):
+            transfer_logger.info(f"DELETED_S3_FROM_QUEUE: s3://{bucket_name}/{d_obj['Key']}")
+        if 'Errors' in response and response['Errors']:
+            error_messages = [f"S3 Key: {e['Key']}, Code: {e['Code']}, Message: {e['Message']}" for e in response['Errors']]
+            for e in response['Errors']: transfer_logger.info(f"DELETED_S3_FROM_QUEUE_ERROR: s3://{bucket_name}/{e['Key']} - {e['Message']}")
+            rds_queue_logger.error(f"S3 delete_objects reported errors: {'; '.join(error_messages)}")
+            return deleted_successfully_count > 0, "; ".join(error_messages)
+        rds_queue_logger.info(f"Successfully submitted deletion for {deleted_successfully_count} S3 objects.")
+        return True, None
+    except Exception as e:
+        rds_queue_logger.error(f"Exception during S3 delete_objects: {e}", exc_info=True)
+        return False, str(e)
+
+def process_s3_deletion_queue(conn, s3_client):
+    # (Identical to previous version)
+    if not conn or not s3_client:
+        rds_queue_logger.error("RDS connection or S3 client not available for queue processing.")
+        return
+    pending_items = get_pending_s3_deletions(conn, S3_DELETION_QUEUE_BATCH_SIZE)
+    if not pending_items:
+        rds_queue_logger.debug("No pending items in S3 deletion queue.")
+        return
+    rds_queue_logger.info(f"Found {len(pending_items)} items in S3 deletion queue to process.")
+    for item in pending_items:
+        item_id = item['id']; post_id = item.get('post_id_deleted', 'N/A')
+        metadata_snapshot = item.get('attachment_metadata_snapshot'); s3_keys_json = item.get('s3_keys_to_delete_json')
+        rds_queue_logger.info(f"Processing queue item ID: {item_id}, Post ID: {post_id}")
+        update_queue_item_status(conn, item_id, 'PROCESSING')
+        s3_keys = parse_s3_keys_from_data(metadata_snapshot, s3_keys_json, post_id)
+        if not s3_keys:
+            rds_queue_logger.warning(f"No S3 keys for item ID {item_id}. Marking as NO_KEYS.")
+            update_queue_item_status(conn, item_id, 'NO_KEYS', "Could not determine S3 keys.")
+            continue
+        success, error_message = delete_s3_objects_from_queue_item(s3_client, S3_BUCKET, s3_keys)
+        if success:
+            final_status = 'DONE'
+            if error_message: final_status = 'ERROR'
+            update_queue_item_status(conn, item_id, final_status, error_message)
+            if CLOUDFRONT_DISTRIBUTION_ID:
+                for cf_path_key_only in s3_keys:
+                    watcher_event_handler._add_to_cf_invalidation_batch(cf_path_key_only.lstrip('/'))
+        else:
+            update_queue_item_status(conn, item_id, 'ERROR', error_message)
+
+
+def s3_deletion_queue_worker_thread_func():
+    global s3_client_boto_for_deletion_queue
+    rds_queue_logger.info("S3 Deletion Queue Worker thread started.")
+    rds_conn = None
+
+    if not get_rds_credentials_from_secrets_manager(RDS_SECRET_ARN_OR_NAME):
+        rds_queue_logger.critical("Failed to initialize RDS credentials. RDS queue worker will not run.")
+        return
+
+    try:
+        s3_client_boto_for_deletion_queue = boto3.client('s3')
+        rds_queue_logger.info("Boto3 S3 client initialized for Deletion Queue Worker.")
+    except Exception as e:
+        rds_queue_logger.critical(f"Failed to initialize Boto3 S3 client for Deletion Queue Worker: {e}. Thread exiting.", exc_info=True)
+        return
+
+    initial_setup_done = False
+
+    while not s3_deletion_queue_stop_event.is_set():
+        try:
+            if not rds_conn or rds_conn.closed:
+                rds_queue_logger.info("RDS connection closed or not established. Attempting to (re)connect.")
+                if rds_conn and not rds_conn.closed:
+                    try: rds_conn.close()
+                    except: pass
+                rds_conn = get_rds_connection()
+                if rds_conn:
+                    if not initial_setup_done: # Perform setup once per successful connection sequence
+                        if ensure_deletion_queue_table_exists(rds_conn):
+                            if ensure_s3_deletion_trigger_exists(rds_conn): # Only if table exists
+                                initial_setup_done = True # Mark setup as done for this run
+                            else:
+                                rds_queue_logger.error("Failed to ensure S3 deletion trigger. Processing might be impaired.")
+                                # initial_setup_done remains false, will retry on next connection
+                        else:
+                            rds_queue_logger.error("Failed to ensure deletion queue table. Trigger/Processing will be skipped.")
+                else:
+                    rds_queue_logger.error("Failed to connect to RDS. Will retry later.")
+                    s3_deletion_queue_stop_event.wait(60)
+                    continue
+            
+            if rds_conn: # Only proceed if connection is established
+                try:
+                    if not rds_conn.ping(reconnect=False):
+                        rds_queue_logger.warning("RDS ping failed. Reconnecting.")
+                        try: rds_conn.close()
+                        except: pass
+                        rds_conn = None; initial_setup_done = False # Reset setup flag
+                        continue
+                except (pymysql.Error, AttributeError) as pe:
+                    rds_queue_logger.warning(f"RDS ping error: {pe}. Reconnecting.")
+                    try: rds_conn.close()
+                    except: pass
+                    rds_conn = None; initial_setup_done = False
+                    continue
+
+                if initial_setup_done: # Only process if initial table/trigger setup was successful
+                    rds_queue_logger.info(f"S3 Deletion Queue Worker: Polling queue.")
+                    process_s3_deletion_queue(rds_conn, s3_client_boto_for_deletion_queue)
+                else:
+                    rds_queue_logger.warning("Initial RDS setup (table/trigger) not complete. Skipping queue processing cycle.")
+
+
+        except Exception as e:
+            rds_queue_logger.error(f"Unhandled error in S3 Deletion Queue Worker loop: {e}", exc_info=True)
+            if rds_conn and rds_conn.open:
+                try: rds_conn.rollback()
+                except Exception as rb_e: rds_queue_logger.error(f"Rollback error: {rb_e}")
+
+        s3_deletion_queue_stop_event.wait(S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS)
+
+    if rds_conn and not rds_conn.closed:
+        try: rds_conn.close()
+        except pymysql.Error as e: rds_queue_logger.error(f"Error closing RDS connection: {e}")
+    rds_queue_logger.info("S3 Deletion Queue Worker thread finished.")
+
+# --- Helper Functions (EFS Monitor - Existing) ---
 def is_path_relevant(path_to_check, base_dir, patterns):
-    if not path_to_check.startswith(base_dir + os.path.sep):
-        return False, None
+    # (Identical to previous version)
+    if not path_to_check.startswith(base_dir + os.path.sep): return False, None
     relative_file_path = os.path.relpath(path_to_check, base_dir)
-    is_relevant = any(fnmatch.fnmatch(relative_file_path, pattern) for pattern in patterns)
-    return is_relevant, relative_file_path
+    return any(fnmatch.fnmatch(relative_file_path, pattern) for pattern in patterns), relative_file_path
 
-# --- FileSystem Event Handler Class ---
+
+# --- FileSystem Event Handler Class (EFS Monitor - Existing) ---
 class Watcher(FileSystemEventHandler):
+    # (Content of Watcher class identical to previous version,
+    # including _is_excluded, _get_s3_path, _trigger_batched_cloudfront_invalidation,
+    # _add_to_cf_invalidation_batch, _handle_s3_upload, _handle_s3_delete,
+    # process_event_for_sync, on_created, on_modified, on_deleted, on_moved)
     def __init__(self):
         super().__init__()
 
     def _is_excluded(self, filepath):
         filename = os.path.basename(filepath)
-        if filename.startswith('.') or filename.endswith(('.swp', '.swx', '~', '.part', '.crdownload', '.tmp')):
+        if filename.startswith('.') or filename.endswith(('.swp', '.swx', '~', '.part', '.crdownload', '.tmp')): return True
+        if any(excluded_dir in filepath for excluded_dir in ['/cache/', '/.git/', '/node_modules/', '/uploads/sites/']):
+            if '/uploads/sites/' in filepath: monitor_logger.debug(f"Excluding Multisite sub-site upload path: {filepath}")
             return True
-        if '/cache/' in filepath or '/.git/' in filepath or '/node_modules/' in filepath:
-            return True
-        if '/uploads/sites/' in filepath: 
-             monitor_logger.debug(f"Excluding Multisite sub-site upload path: {filepath}")
-             return True
         return False
 
-    def _get_s3_path(self, relative_file_path):
-        return f"s3://{S3_BUCKET}/{relative_file_path}"
+    def _get_s3_path(self, relative_file_path): return f"s3://{S3_BUCKET}/{relative_file_path}"
 
     def _trigger_batched_cloudfront_invalidation(self):
         global cf_invalidation_paths_batch, cf_invalidation_timer
         with cf_invalidation_lock:
             if not cf_invalidation_paths_batch:
-                monitor_logger.debug("Batched CloudFront invalidation triggered, but batch is empty.")
-                if cf_invalidation_timer:
-                    cf_invalidation_timer.cancel()
-                    cf_invalidation_timer = None
+                if cf_invalidation_timer: cf_invalidation_timer.cancel(); cf_invalidation_timer = None
                 return
-
             if not CLOUDFRONT_DISTRIBUTION_ID:
-                monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set. Skipping batched CloudFront invalidation.")
-                cf_invalidation_paths_batch = [] 
-                if cf_invalidation_timer:
-                    cf_invalidation_timer.cancel()
-                    cf_invalidation_timer = None
+                cf_invalidation_paths_batch = []; # Clear batch
+                if cf_invalidation_timer: cf_invalidation_timer.cancel(); cf_invalidation_timer = None
+                monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set. Skipping CF invalidation.")
                 return
-
             paths_to_invalidate_now = ["/" + p for p in cf_invalidation_paths_batch]
-            current_batch_to_log = list(cf_invalidation_paths_batch) 
-            cf_invalidation_paths_batch = [] 
-            if cf_invalidation_timer:
-                cf_invalidation_timer.cancel()
-                cf_invalidation_timer = None
-            monitor_logger.debug("CloudFront invalidation batch and timer reset before API call.")
-
-        monitor_logger.info(f"Triggering batched CloudFront invalidation for {len(paths_to_invalidate_now)} paths on {CLOUDFRONT_DISTRIBUTION_ID}: {paths_to_invalidate_now}")
-        cloudfront_client_boto = boto3.client('cloudfront')
+            current_batch_to_log = list(cf_invalidation_paths_batch)
+            cf_invalidation_paths_batch = []
+            if cf_invalidation_timer: cf_invalidation_timer.cancel(); cf_invalidation_timer = None
+        monitor_logger.info(f"Triggering batched CF invalidation for {len(paths_to_invalidate_now)} paths on {CLOUDFRONT_DISTRIBUTION_ID}: {paths_to_invalidate_now}")
         try:
-            cloudfront_client_boto.create_invalidation(
+            boto3.client('cloudfront').create_invalidation(
                 DistributionId=CLOUDFRONT_DISTRIBUTION_ID,
                 InvalidationBatch={
-                    'Paths': {
-                        'Quantity': len(paths_to_invalidate_now),
-                        'Items': paths_to_invalidate_now
-                    },
+                    'Paths': {'Quantity': len(paths_to_invalidate_now), 'Items': paths_to_invalidate_now},
                     'CallerReference': f"s3-efs-sync-batch-{int(time.time())}-{len(paths_to_invalidate_now)}"
-                }
-            )
-            monitor_logger.info(f"Batched CloudFront invalidation request created for {len(paths_to_invalidate_now)} paths.")
+                })
+            monitor_logger.info(f"Batched CF invalidation request created for {len(paths_to_invalidate_now)} paths.")
             transfer_logger.info(f"INVALIDATED_CF_BATCH: {len(paths_to_invalidate_now)} paths on {CLOUDFRONT_DISTRIBUTION_ID} - Paths: {', '.join(current_batch_to_log)}")
         except Exception as e:
-            monitor_logger.error(f"Failed to create batched CloudFront invalidation for paths {current_batch_to_log}: {e}", exc_info=True)
+            monitor_logger.error(f"Failed to create batched CF invalidation for {current_batch_to_log}: {e}", exc_info=True)
             transfer_logger.info(f"INVALIDATION_CF_BATCH_FAILED: {len(paths_to_invalidate_now)} paths - {str(e)}")
 
     def _add_to_cf_invalidation_batch(self, object_key_to_invalidate):
         global cf_invalidation_paths_batch, cf_invalidation_timer
+        if not CLOUDFRONT_DISTRIBUTION_ID: return
         with cf_invalidation_lock:
             if object_key_to_invalidate not in cf_invalidation_paths_batch:
                 cf_invalidation_paths_batch.append(object_key_to_invalidate)
-                monitor_logger.info(f"Added '{object_key_to_invalidate}' to CloudFront invalidation batch. Batch size: {len(cf_invalidation_paths_batch)}")
-
-            if cf_invalidation_timer: 
-                cf_invalidation_timer.cancel()
-                monitor_logger.debug("Cancelled existing CloudFront invalidation timer.")
-
+                monitor_logger.info(f"Added '{object_key_to_invalidate}' to CF invalidation batch. Size: {len(cf_invalidation_paths_batch)}")
+            if cf_invalidation_timer: cf_invalidation_timer.cancel()
             if len(cf_invalidation_paths_batch) >= CF_INVALIDATION_BATCH_MAX_SIZE:
-                monitor_logger.info(f"CloudFront invalidation batch reached max size ({CF_INVALIDATION_BATCH_MAX_SIZE}). Triggering invalidation now.")
-                self._trigger_batched_cloudfront_invalidation() 
-            elif cf_invalidation_paths_batch: 
+                self._trigger_batched_cloudfront_invalidation()
+            elif cf_invalidation_paths_batch:
                 cf_invalidation_timer = threading.Timer(CF_INVALIDATION_BATCH_TIMEOUT_SECONDS, self._trigger_batched_cloudfront_invalidation)
-                cf_invalidation_timer.daemon = True 
-                cf_invalidation_timer.start()
-                monitor_logger.debug(f"CloudFront invalidation timer (re)started for {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s. Batch size: {len(cf_invalidation_paths_batch)}")
+                cf_invalidation_timer.daemon = True; cf_invalidation_timer.start()
 
     def _handle_s3_upload(self, local_path, relative_file_path, is_initial_sync=False):
-        global efs_deleted_by_script 
+        global efs_deleted_by_script
         effective_delete_from_efs = DELETE_FROM_EFS_AFTER_SYNC and not is_initial_sync
-
         current_time = time.time()
-        if not is_initial_sync and local_path in last_sync_file_map and \
-           (current_time - last_sync_file_map[local_path] < SYNC_DEBOUNCE_SECONDS):
-            monitor_logger.info(f"Debounce for '{local_path}'. Skipped upload and subsequent actions.")
-            return
-
+        if not is_initial_sync and local_path in last_sync_file_map and (current_time - last_sync_file_map[local_path] < SYNC_DEBOUNCE_SECONDS):
+            monitor_logger.info(f"Debounce for '{local_path}'. Skipped upload."); return
         s3_full_uri = self._get_s3_path(relative_file_path)
         monitor_logger.info(f"Copying '{local_path}' to '{s3_full_uri}'...")
-
         try:
-            process = subprocess.run(
-                [AWS_CLI_PATH, 's3', 'cp', local_path, s3_full_uri,
-                 '--acl', 'private', '--only-show-errors'],
-                capture_output=True, text=True, check=False 
-            )
-
+            process = subprocess.run([AWS_CLI_PATH, 's3', 'cp', local_path, s3_full_uri, '--acl', 'private', '--only-show-errors'], capture_output=True, text=True, check=False)
             if process.returncode == 0:
                 monitor_logger.info(f"S3 copy OK for '{relative_file_path}'.")
                 transfer_logger.info(f"TRANSFERRED: {relative_file_path} to {s3_full_uri}")
                 last_sync_file_map[local_path] = current_time
-
-                if not is_initial_sync: 
-                    monitor_logger.info(f"Adding '{relative_file_path}' to CloudFront invalidation batch due to EFS event (create/update).")
-                    self._add_to_cf_invalidation_batch(relative_file_path)
-                
-                if effective_delete_from_efs:
-                    _, ext = os.path.splitext(local_path)
-                    if ext.lower() in DELETABLE_IMAGE_EXTENSIONS_FROM_EFS:
-                        try:
-                            monitor_logger.info(f"Preparing to delete IMAGE '{local_path}' from EFS by script. Adding to ignore list for subsequent S3 delete.")
-                            with efs_deletion_lock:
-                                efs_deleted_by_script.add(local_path) 
-                            
-                            os.remove(local_path) 
-                            
-                            monitor_logger.info(f"Successfully deleted IMAGE '{local_path}' from EFS (DELETE_FROM_EFS_AFTER_SYNC=true).")
-                            transfer_logger.info(f"DELETED_EFS_IMAGE: {relative_file_path}")
-                        except OSError as e:
-                            monitor_logger.error(f"Failed to delete IMAGE '{local_path}' from EFS: {e}")
-                            with efs_deletion_lock:
-                                if local_path in efs_deleted_by_script:
-                                    efs_deleted_by_script.remove(local_path)
-                                    monitor_logger.info(f"Removed '{local_path}' from efs_deleted_by_script due to deletion failure.")
-                    else:
-                        monitor_logger.info(f"File '{local_path}' (ext: {ext.lower()}) not in DELETABLE_IMAGE_EXTENSIONS_FROM_EFS. Kept on EFS.")
-            else:
-                monitor_logger.error(
-                    f"S3 copy FAILED for '{relative_file_path}'. RC: {process.returncode}. Stdout: {process.stdout.strip()}. Stderr: {process.stderr.strip()}")
-        except FileNotFoundError:
-             monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 copy failed for '{relative_file_path}'.")
-        except Exception as e:
-            monitor_logger.error(f"Exception during S3 copy for {relative_file_path}: {e}", exc_info=True)
+                if not is_initial_sync: self._add_to_cf_invalidation_batch(relative_file_path)
+                if effective_delete_from_efs and os.path.splitext(local_path)[1].lower() in DELETABLE_IMAGE_EXTENSIONS_FROM_EFS:
+                    try:
+                        with efs_deletion_lock: efs_deleted_by_script.add(local_path)
+                        os.remove(local_path)
+                        monitor_logger.info(f"Deleted IMAGE '{local_path}' from EFS."); transfer_logger.info(f"DELETED_EFS_IMAGE: {relative_file_path}")
+                    except OSError as e:
+                        monitor_logger.error(f"Failed to delete IMAGE '{local_path}' from EFS: {e}")
+                        with efs_deletion_lock:
+                            if local_path in efs_deleted_by_script: efs_deleted_by_script.remove(local_path)
+            else: monitor_logger.error(f"S3 copy FAILED for '{relative_file_path}'. RC: {process.returncode}. Stderr: {process.stderr.strip()}")
+        except FileNotFoundError: monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 copy failed for '{relative_file_path}'.")
+        except Exception as e: monitor_logger.error(f"Exception during S3 copy for {relative_file_path}: {e}", exc_info=True)
 
     def _handle_s3_delete(self, relative_file_path):
-        s3_client_boto = boto3.client('s3')
-        s3_target_path_key = relative_file_path 
-        s3_full_uri = self._get_s3_path(relative_file_path)
-
-        monitor_logger.info(f"Attempting to delete '{s3_full_uri}' from S3 via AWS CLI...")
-        cli_delete_reported_success = False
-        cli_rc = -1
-        cli_stderr = ""
-
+        s3_target_path_key = relative_file_path; s3_full_uri = self._get_s3_path(relative_file_path)
+        monitor_logger.info(f"Attempting to delete '{s3_full_uri}' from S3 (EFS event)...")
+        cli_rc = -1; cli_stderr = ""
         try:
-            process = subprocess.run(
-                [AWS_CLI_PATH, 's3', 'rm', s3_full_uri], 
-                capture_output=True, text=True, check=False 
-            )
-            cli_rc = process.returncode
-            cli_stderr = process.stderr.strip()
+            process = subprocess.run([AWS_CLI_PATH, 's3', 'rm', s3_full_uri], capture_output=True, text=True, check=False)
+            cli_rc = process.returncode; cli_stderr = process.stderr.strip()
+            if cli_rc == 0: transfer_logger.info(f"DELETED_S3_EFS_EVENT_CLI_OK: {relative_file_path}")
+            else: transfer_logger.info(f"DELETED_S3_EFS_EVENT_CLI_FAILED: {relative_file_path} - RC={cli_rc} ERR={cli_stderr}"); monitor_logger.error(f"AWS CLI 's3 rm' FAILED for '{relative_file_path}'. RC: {cli_rc}. Stderr: {cli_stderr}")
+        except FileNotFoundError: monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 delete failed."); return
+        except Exception as e: monitor_logger.error(f"Exception during AWS CLI 's3 rm' for {relative_file_path}: {e}", exc_info=True)
 
-            if cli_rc == 0:
-                monitor_logger.info(f"AWS CLI 's3 rm' for '{relative_file_path}' reported success (RC: 0).")
-                if cli_stderr: monitor_logger.info(f"CLI Stderr (RC 0): {cli_stderr}") 
-                transfer_logger.info(f"DELETED_S3_CLI_OK: {relative_file_path}")
-                cli_delete_reported_success = True
-            else:
-                monitor_logger.error(
-                    f"AWS CLI 's3 rm' FAILED for '{relative_file_path}'. RC: {cli_rc}. Stderr: {cli_stderr}")
-                transfer_logger.info(f"DELETED_S3_CLI_FAILED: {relative_file_path} - RC={cli_rc} ERR={cli_stderr}")
-        except FileNotFoundError:
-             monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 delete for '{relative_file_path}' failed at CLI stage.")
-             return 
-        except Exception as e:
-            monitor_logger.error(f"Exception during AWS CLI 's3 rm' for {relative_file_path}: {e}", exc_info=True)
-
-        monitor_logger.info(f"Verifying deletion of '{s3_target_path_key}' in S3 using Boto3 head_object...")
+        monitor_logger.info(f"Verifying S3 deletion of '{s3_target_path_key}' (Boto3 head_object)...")
         try:
-            time.sleep(1) 
-            s3_client_boto.head_object(Bucket=S3_BUCKET, Key=s3_target_path_key)
-            monitor_logger.error(
-                f"S3 delete VERIFICATION FAILED for '{relative_file_path}'. Object still found in S3 after 'aws s3 rm' (CLI RC: {cli_rc}). Review IAM permissions and bucket policies.")
-            if cli_stderr: monitor_logger.error(f"CLI Stderr was: {cli_stderr}")
-            transfer_logger.info(f"DELETED_S3_VERIFICATION_FAILED_STILL_EXISTS: {relative_file_path}")
-        except s3_client_boto.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == '404' or e.response['Error']['Code'] == 'NoSuchKey':
-                monitor_logger.info(f"S3 delete VERIFIED for '{relative_file_path}'. Object no longer found in S3 (confirmed by head_object). CLI RC: {cli_rc}.")
-                if cli_stderr and not cli_delete_reported_success: monitor_logger.info(f"CLI Stderr was (file now gone): {cli_stderr}")
-                transfer_logger.info(f"DELETED_S3_VERIFIED_NOT_FOUND: {relative_file_path}")
-                
-                monitor_logger.info(f"Adding '{relative_file_path}' to CloudFront invalidation batch due to S3 delete confirmation.")
+            time.sleep(1); boto3.client('s3').head_object(Bucket=S3_BUCKET, Key=s3_target_path_key)
+            monitor_logger.error(f"S3 delete VERIFICATION FAILED for '{relative_file_path}'. Object still found. CLI RC: {cli_rc}. CLI Stderr: {cli_stderr}")
+            transfer_logger.info(f"DELETED_S3_EFS_EVENT_VERIFICATION_FAILED_STILL_EXISTS: {relative_file_path}")
+        except boto3.client('s3').exceptions.ClientError as e:
+            if e.response['Error']['Code'] in ['404', 'NoSuchKey']:
+                monitor_logger.info(f"S3 delete VERIFIED for '{relative_file_path}'. CLI RC: {cli_rc}."); transfer_logger.info(f"DELETED_S3_EFS_EVENT_VERIFIED_NOT_FOUND: {relative_file_path}")
                 self._add_to_cf_invalidation_batch(relative_file_path)
-            else: 
-                monitor_logger.error(
-                    f"Error during S3 delete VERIFICATION for '{relative_file_path}' using head_object: {e.response['Error']['Code']} - {e.response['Error']['Message']}. CLI RC: {cli_rc}.")
-                if cli_stderr: monitor_logger.error(f"CLI Stderr was: {cli_stderr}")
-                transfer_logger.info(f"DELETED_S3_VERIFICATION_ERROR_HEAD_OBJECT: {relative_file_path} - {e.response['Error']['Code']}")
-        except Exception as ve: 
-            monitor_logger.error(f"Unexpected error during S3 delete VERIFICATION for '{s3_target_path_key}': {ve}", exc_info=True)
-            transfer_logger.info(f"DELETED_S3_VERIFICATION_UNEXPECTED_ERROR: {relative_file_path}")
-
-    def process_event_for_sync(self, event_type, path, dest_path=None): 
-        global efs_deleted_by_script 
-
-        if event_type == 'moved_from': 
-            if self._is_excluded(path) or (os.path.exists(path) and os.path.isdir(path)): 
-                return
-            relevant_src, relative_src_path = is_path_relevant(path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
-            if not relevant_src or not relative_src_path:
-                return
-            
-            monitor_logger.info(f"Event: MOVED_FROM (source part) for relevant file '{relative_src_path}' (full: {path})")
-            
-            ignore_s3_deletion_for_moved_src = False
-            with efs_deletion_lock:
-                if path in efs_deleted_by_script:
-                    monitor_logger.info(f"EFS MOVED_FROM event for '{path}' was likely part of script-initiated rename/process. Not deleting from S3 for source.")
-                    efs_deleted_by_script.remove(path) 
-                    ignore_s3_deletion_for_moved_src = True
-            
-            if not ignore_s3_deletion_for_moved_src:
-                monitor_logger.info(f"EFS MOVED_FROM event for '{path}' was external. Proceeding with S3 delete for source.")
-                self._handle_s3_delete(relative_src_path)
             else:
-                transfer_logger.info(f"SKIPPED_S3_DELETE_MOVED_FROM_BY_SCRIPT_FLAG: {relative_src_path}")
-            return 
+                monitor_logger.error(f"Error during S3 delete VERIFICATION for '{relative_file_path}': {e.response['Error']['Code']}. CLI RC: {cli_rc}. CLI Stderr: {cli_stderr}")
+                transfer_logger.info(f"DELETED_S3_EFS_EVENT_VERIFICATION_ERROR_HEAD_OBJECT: {relative_file_path} - {e.response['Error']['Code']}")
+        except Exception as ve: monitor_logger.error(f"Unexpected error during S3 delete VERIFICATION for '{s3_target_path_key}': {ve}", exc_info=True); transfer_logger.info(f"DELETED_S3_EFS_EVENT_VERIFICATION_UNEXPECTED_ERROR: {relative_file_path}")
+
+    def process_event_for_sync(self, event_type, path, dest_path=None):
+        global efs_deleted_by_script
+        if event_type == 'moved_from':
+            if self._is_excluded(path) or (os.path.exists(path) and os.path.isdir(path)): return
+            relevant_src, relative_src_path = is_path_relevant(path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
+            if not relevant_src or not relative_src_path: return
+            monitor_logger.info(f"Event: MOVED_FROM for '{relative_src_path}'")
+            ignore_s3_del = False
+            with efs_deletion_lock:
+                if path in efs_deleted_by_script: efs_deleted_by_script.remove(path); ignore_s3_del = True
+            if not ignore_s3_del: self._handle_s3_delete(relative_src_path)
+            else: transfer_logger.info(f"SKIPPED_S3_DELETE_MOVED_FROM_BY_SCRIPT_FLAG: {relative_src_path}")
+            return
 
         current_path_to_check = dest_path if event_type == 'moved_to' else path
-
-        if self._is_excluded(current_path_to_check) or \
-           (os.path.exists(current_path_to_check) and os.path.isdir(current_path_to_check)):
-            return
-        
+        if self._is_excluded(current_path_to_check) or (os.path.exists(current_path_to_check) and os.path.isdir(current_path_to_check)): return
         relevant, relative_path = is_path_relevant(current_path_to_check, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
-        if not relevant or not relative_path:
-            return
-        
-        monitor_logger.info(f"Event: {event_type.upper()} for relevant file '{relative_path}' (full: {current_path_to_check})")
+        if not relevant or not relative_path: return
+        monitor_logger.info(f"Event: {event_type.upper()} for '{relative_path}'")
 
-        if event_type in ['created', 'modified', 'moved_to']:
-            self._handle_s3_upload(current_path_to_check, relative_path)
-        
+        if event_type in ['created', 'modified', 'moved_to']: self._handle_s3_upload(current_path_to_check, relative_path)
         elif event_type == 'deleted':
-            ignore_this_s3_deletion = False
+            ignore_s3_del = False
             with efs_deletion_lock:
-                if path in efs_deleted_by_script: 
-                    monitor_logger.info(f"EFS delete event for '{path}' was triggered by this script. Not deleting from S3.")
-                    efs_deleted_by_script.remove(path) 
-                    ignore_this_s3_deletion = True
-            
-            if not ignore_this_s3_deletion:
-                monitor_logger.info(f"EFS delete event for '{path}' was external. Proceeding with S3 delete.")
-                self._handle_s3_delete(relative_path)
-            else:
-                transfer_logger.info(f"SKIPPED_S3_DELETE_BY_SCRIPT_FLAG: {relative_path}")
+                if path in efs_deleted_by_script: efs_deleted_by_script.remove(path); ignore_s3_del = True
+            if not ignore_s3_del: self._handle_s3_delete(relative_path)
+            else: transfer_logger.info(f"SKIPPED_S3_DELETE_BY_SCRIPT_FLAG: {relative_path}")
 
     def on_created(self, event):
-        if not event.is_directory:
-            self.process_event_for_sync('created', event.src_path)
-    
+        if not event.is_directory: self.process_event_for_sync('created', event.src_path)
     def on_modified(self, event):
-        if not event.is_directory:
-            self.process_event_for_sync('modified', event.src_path)
-    
+        if not event.is_directory: self.process_event_for_sync('modified', event.src_path)
     def on_deleted(self, event):
-        if not event.is_directory:
-            self.process_event_for_sync('deleted', event.src_path)
-    
+        if not event.is_directory: self.process_event_for_sync('deleted', event.src_path)
     def on_moved(self, event):
         if not event.is_directory:
             self.process_event_for_sync('moved_from', event.src_path)
             self.process_event_for_sync('moved_to', event.src_path, dest_path=event.dest_path)
 
-# --- Initial Sync Function using 'aws s3 sync' ---
+# --- Initial Sync Function (EFS Monitor - Existing) ---
 def run_s3_sync_command(command_parts, description):
+    # (Identical to previous version)
     monitor_logger.info(f"Attempting Initial Sync for {description} with command: {' '.join(command_parts)}")
     try:
         process = subprocess.run(command_parts, capture_output=True, text=True, check=False)
         if process.returncode == 0:
-            monitor_logger.info(f"Initial Sync for {description} completed successfully.")
-            if process.stdout.strip(): monitor_logger.info(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
-            transfer_logger.info(f"INITIAL_SYNC_SUCCESS: {description}")
+            monitor_logger.info(f"Initial Sync for {description} OK."); transfer_logger.info(f"INITIAL_SYNC_SUCCESS: {description}")
             return True
-        elif process.returncode == 2: 
-            monitor_logger.warning(f"Initial Sync for {description} completed with RC 2 (some files may not have been synced). Check stderr.")
-            if process.stdout.strip(): monitor_logger.info(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
-            if process.stderr.strip(): monitor_logger.warning(f"Initial Sync for {description} stderr: {process.stderr.strip()}")
-            transfer_logger.info(f"INITIAL_SYNC_WARNING_RC2: {description} - ERR: {process.stderr.strip()}")
-            return True 
+        elif process.returncode == 2: # Some files may not have been synced
+            monitor_logger.warning(f"Initial Sync for {description} RC 2. Stderr: {process.stderr.strip()}"); transfer_logger.info(f"INITIAL_SYNC_WARNING_RC2: {description} - ERR: {process.stderr.strip()}")
+            return True
         else:
-            monitor_logger.error(f"Initial Sync for {description} FAILED. RC: {process.returncode}.")
-            if process.stdout.strip(): monitor_logger.error(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
-            if process.stderr.strip(): monitor_logger.error(f"Initial Sync for {description} stderr: {process.stderr.strip()}")
-            transfer_logger.info(f"INITIAL_SYNC_FAILED: {description} - RC={process.returncode} ERR={process.stderr.strip()}")
+            monitor_logger.error(f"Initial Sync for {description} FAILED. RC: {process.returncode}. Stderr: {process.stderr.strip()}"); transfer_logger.info(f"INITIAL_SYNC_FAILED: {description} - RC={process.returncode} ERR={process.stderr.strip()}")
             return False
-    except FileNotFoundError:
-        monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. Initial Sync for {description} failed.")
-        return False
-    except Exception as e:
-        monitor_logger.error(f"Exception during Initial Sync for {description}: {e}", exc_info=True)
-        return False
+    except FileNotFoundError: monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. Initial Sync failed."); return False
+    except Exception as e: monitor_logger.error(f"Exception during Initial Sync for {description}: {e}", exc_info=True); return False
 
 def perform_initial_sync():
-    monitor_logger.info("--- Starting Initial S3 Sync using 'aws s3 sync' commands ---")
-    if not S3_BUCKET:
-        monitor_logger.error("S3_BUCKET not configured. Skipping initial sync.")
-        return
-    if not os.path.isdir(MONITOR_DIR_BASE):
-        monitor_logger.error(f"Monitor directory '{MONITOR_DIR_BASE}' does not exist. Skipping initial sync.")
-        return
-
-    general_includes = [
-        '*.css', '*.js',
-        '*.jpg', '*.jpeg', '*.png', '*.gif',
-        '*.svg', '*.webp', '*.ico',
-        '*.woff', '*.woff2', '*.ttf',
-        '*.eot', '*.otf',
-        '*.mp4', '*.mov', '*.webm',
-        '*.avi', '*.wmv', '*.mkv', '*.flv',
-        '*.mp3', '*.wav', '*.ogg',
-        '*.aac', '*.wma', '*.flac',
-        '*.pdf', '*.doc', '*.docx',
-        '*.xls', '*.xlsx', '*.ppt', '*.pptx',
-        '*.zip', '*.txt',
-    ]
-    includes_for_sync_cmd = []
-    for item in general_includes:
-        includes_for_sync_cmd.extend(['--include', item])
-
+    # (Identical to previous version)
+    monitor_logger.info("--- Starting Initial S3 Sync ---")
+    if not S3_BUCKET or not os.path.isdir(MONITOR_DIR_BASE):
+        monitor_logger.error("S3_BUCKET not set or MONITOR_DIR_BASE not found. Skipping initial sync."); return
+    general_includes = ['*.css', '*.js', '*.jpg', '*.jpeg', '*.png', '*.gif', '*.svg', '*.webp', '*.ico', '*.woff', '*.woff2', '*.ttf', '*.eot', '*.otf', '*.mp4', '*.mov', '*.webm', '*.avi', '*.wmv', '*.mkv', '*.flv', '*.mp3', '*.wav', '*.ogg', '*.aac', '*.wma', '*.flac', '*.pdf', '*.doc', '*.docx', '*.xls', '*.xlsx', '*.ppt', '*.pptx', '*.zip', '*.txt']
+    includes_cmd = [item for sublist in [['--include', i] for i in general_includes] for item in sublist]
+    
     wp_content_path = os.path.join(MONITOR_DIR_BASE, "wp-content")
     if os.path.isdir(wp_content_path):
-        s3_sync_wp_content_cmd = [
-            AWS_CLI_PATH, 's3', 'sync', wp_content_path, f"s3://{S3_BUCKET}/wp-content/",
-            '--exclude', '*.php', 
-            '--exclude', 'wp-content/plugins/index.php', 
-            '--exclude', 'wp-content/themes/index.php',
-            '--exclude', 'wp-content/uploads/index.php',
-            '--exclude', 'wp-content/cache/*', 
-            '--exclude', 'wp-content/backups/*',
-            '--exclude', '*/.DS_Store',
-            '--exclude', '*/Thumbs.db'
-        ] + includes_for_sync_cmd + ['--exact-timestamps', '--acl', 'private'] # Removido --only-show-errors para debug
-        run_s3_sync_command(s3_sync_wp_content_cmd, "wp-content")
-    else:
-        monitor_logger.warning(f"Directory '{wp_content_path}' not found. Skipping sync for wp-content.")
-
+        cmd = [AWS_CLI_PATH, 's3', 'sync', wp_content_path, f"s3://{S3_BUCKET}/wp-content/", '--exclude', '*.php', '--exclude', '*/index.php', '--exclude', '*/cache/*', '--exclude', '*/backups/*', '--exclude', '*/.DS_Store', '--exclude', '*/Thumbs.db'] + includes_cmd + ['--exact-timestamps', '--acl', 'private']
+        run_s3_sync_command(cmd, "wp-content")
+    
     wp_includes_path = os.path.join(MONITOR_DIR_BASE, "wp-includes")
     if os.path.isdir(wp_includes_path):
-        wp_includes_assets_includes = [
-            '*.css', '*.js',
-            '*.jpg', '*.jpeg', '*.png', '*.gif',
-            '*.svg', '*.webp', '*.ico',
-        ]
-        includes_for_wp_includes_cmd = []
-        for item in wp_includes_assets_includes:
-            includes_for_wp_includes_cmd.extend(['--include', item])
+        wp_inc_assets = ['*.css', '*.js', '*.jpg', '*.jpeg', '*.png', '*.gif', '*.svg', '*.webp', '*.ico']
+        inc_wp_inc_cmd = [item for sublist in [['--include', i] for i in wp_inc_assets] for item in sublist]
+        cmd = [AWS_CLI_PATH, 's3', 'sync', wp_includes_path, f"s3://{S3_BUCKET}/wp-includes/", '--exclude', '*'] + inc_wp_inc_cmd + ['--exact-timestamps', '--acl', 'private']
+        run_s3_sync_command(cmd, "wp-includes (assets only)")
+    monitor_logger.info("--- Initial S3 Sync Attempted ---")
 
-        s3_sync_wp_includes_cmd = [
-            AWS_CLI_PATH, 's3', 'sync', wp_includes_path, f"s3://{S3_BUCKET}/wp-includes/",
-            '--exclude', '*', 
-        ] + includes_for_wp_includes_cmd + [ 
-            '--exact-timestamps', '--acl', 'private' # Removido --only-show-errors para debug
-        ]
-        run_s3_sync_command(s3_sync_wp_includes_cmd, "wp-includes (assets only)")
-    else:
-        monitor_logger.warning(f"Directory '{wp_includes_path}' not found. Skipping sync for wp-includes.")
-    
-    monitor_logger.info("--- Initial S3 Sync using 'aws s3 sync' commands Attempted ---")
 
 # --- Main Execution Block ---
+watcher_event_handler = Watcher()
+
 if __name__ == "__main__":
-    script_version_tag = "v2.3.3-EFSDeleteLogic-Final" 
-    monitor_logger.info(
-        f"Python Watchdog Monitor (EFS to S3 Sync - {script_version_tag}) starting for '{MONITOR_DIR_BASE}'.")
+    script_version_tag = "v2.5.0-SecretsManager-Full"
+    monitor_logger.info(f"Python EFS/S3 Monitor & RDS Queue Processor ({script_version_tag}) starting...")
     monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
-    monitor_logger.info(f"Relevant Patterns for Watcher (raw): {RELEVANT_PATTERNS_STR}")
-    monitor_logger.info(f"Relevant Watcher Patterns (parsed): {RELEVANT_PATTERNS}")
-    monitor_logger.info(f"Delete IMAGES from EFS after sync (watcher only): {DELETE_FROM_EFS_AFTER_SYNC}")
-    monitor_logger.info(f"Image extensions to delete from EFS: {DELETABLE_IMAGE_EXTENSIONS_FROM_EFS if DELETE_FROM_EFS_AFTER_SYNC else 'N/A'}")
-    monitor_logger.info(f"Perform initial sync using 'aws s3 sync': {PERFORM_INITIAL_SYNC}")
-    monitor_logger.info(f"CloudFront Distribution ID for Invalidation: {CLOUDFRONT_DISTRIBUTION_ID if CLOUDFRONT_DISTRIBUTION_ID else 'Not Set'}")
-    monitor_logger.info(f"CloudFront Invalidation Batch Max Size: {CF_INVALIDATION_BATCH_MAX_SIZE}")
-    monitor_logger.info(f"CloudFront Invalidation Batch Timeout (s): {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}")
+    monitor_logger.info(f"EFS Monitor Dir: {MONITOR_DIR_BASE}")
+    monitor_logger.info(f"EFS Relevant Patterns: {RELEVANT_PATTERNS}")
+    monitor_logger.info(f"EFS Delete After Sync: {DELETE_FROM_EFS_AFTER_SYNC}")
+    monitor_logger.info(f"EFS Perform Initial Sync: {PERFORM_INITIAL_SYNC}")
+    monitor_logger.info(f"CF Distribution ID: {CLOUDFRONT_DISTRIBUTION_ID or 'Not Set'}")
+
+    monitor_logger.info(f"RDS Deletion Queue Enabled: {RDS_DELETION_QUEUE_ENABLED}")
+    if RDS_DELETION_QUEUE_ENABLED:
+        monitor_logger.info(f"RDS Secret ARN/Name: {RDS_SECRET_ARN_OR_NAME or 'Not Set (will use ENV for creds)'}")
+        monitor_logger.info(f"RDS Fallback Host (ENV): {RDS_HOST_ENV or 'Not Set'}")
+        # Do not log password
+        monitor_logger.info(f"RDS Posts Table Name: {RDS_WP_POSTS_TABLE_NAME}")
+        monitor_logger.info(f"RDS Postmeta Table Name: {RDS_WP_POSTMETA_TABLE_NAME}")
+        monitor_logger.info(f"RDS Queue Table Name: {S3_DELETION_QUEUE_TABLE_NAME}")
+        monitor_logger.info(f"RDS Queue Poll Interval: {S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS}s")
+        monitor_logger.info(f"S3 Base Path for Queue Deletion: '{S3_BASE_PATH_FOR_DELETION_QUEUE}'")
 
     if not S3_BUCKET:
-        monitor_logger.critical("S3_BUCKET environment variable not set. Exiting.")
-        exit(1)
-    if not os.path.isdir(MONITOR_DIR_BASE):
-        monitor_logger.critical(f"Monitor directory '{MONITOR_DIR_BASE}' does not exist. Exiting.")
-        exit(1)
+        monitor_logger.critical("S3_BUCKET not set. Exiting."); exit(1)
 
     aws_cli_actual_path = shutil.which(AWS_CLI_PATH)
     if not aws_cli_actual_path:
-        monitor_logger.critical(f"AWS CLI not found at specified path '{AWS_CLI_PATH}' or not in system PATH. Please check WP_AWS_CLI_PATH. Exiting.")
-        exit(1)
-    else:
-        if AWS_CLI_PATH != aws_cli_actual_path: 
-             monitor_logger.info(f"Resolved AWS CLI path from '{AWS_CLI_PATH}' to '{aws_cli_actual_path}'.")
-        AWS_CLI_PATH = aws_cli_actual_path 
-        monitor_logger.info(f"Using AWS CLI at: {AWS_CLI_PATH}")
+        monitor_logger.critical(f"AWS CLI not found at '{AWS_CLI_PATH}'. Exiting."); exit(1)
+    AWS_CLI_PATH = aws_cli_actual_path; monitor_logger.info(f"Using AWS CLI at: {AWS_CLI_PATH}")
 
     try:
-        import boto3 
-        boto3.client('s3') 
-        monitor_logger.info("Boto3 library and S3 client initialized successfully.")
-    except ImportError:
-        monitor_logger.critical("Boto3 library not found. Please install it (e.g., 'sudo pip3 install boto3'). Exiting.")
-        exit(1)
-    except Exception as e: 
-        monitor_logger.critical(f"Failed to initialize Boto3 S3 client. Check AWS credentials/configuration: {e}", exc_info=True)
-        exit(1)
+        boto3.client('s3'); monitor_logger.info("Boto3 S3 client test OK.")
+    except Exception as e:
+        monitor_logger.critical(f"Boto3 S3 client init failed. Check AWS credentials/config: {e}", exc_info=True); exit(1)
 
     if PERFORM_INITIAL_SYNC:
-        monitor_logger.info("WP_PERFORM_INITIAL_SYNC is true. Calling perform_initial_sync().")
         perform_initial_sync()
-        monitor_logger.info("Call to perform_initial_sync() has completed.")
-    else:
-        monitor_logger.info("WP_PERFORM_INITIAL_SYNC is false. Skipping initial sync.")
-    
-    if not RELEVANT_PATTERNS_STR: 
-        if PERFORM_INITIAL_SYNC:
-            monitor_logger.warning("RELEVANT_PATTERNS_STR is empty, but PERFORM_INITIAL_SYNC is true. Initial sync was performed, but Watchdog will not process new file events for upload unless patterns are added.")
-        else: 
-             monitor_logger.critical("RELEVANT_PATTERNS_STR is empty and PERFORM_INITIAL_SYNC is false. Script will do nothing for EFS file changes. Exiting.")
-             exit(1)
-    elif not RELEVANT_PATTERNS: 
-        monitor_logger.critical(f"RELEVANT_PATTERNS_STR ('{RELEVANT_PATTERNS_STR}') resulted in no valid patterns for the watcher. Exiting.")
-        exit(1)
 
-    event_handler = Watcher()
-    observer = Observer()
+    observer = None
+    if RELEVANT_PATTERNS:
+        if not os.path.isdir(MONITOR_DIR_BASE):
+            monitor_logger.error(f"EFS Monitor: Dir '{MONITOR_DIR_BASE}' not found. Observer not started.")
+        else:
+            observer = Observer()
+            observer.schedule(watcher_event_handler, MONITOR_DIR_BASE, recursive=True)
+            observer.start(); monitor_logger.info("EFS Watchdog Observer started.")
+    else:
+        monitor_logger.info("No RELEVANT_PATTERNS for EFS. Watchdog Observer not started.")
+
+    rds_deletion_thread = None
+    if RDS_DELETION_QUEUE_ENABLED:
+        if not RDS_SECRET_ARN_OR_NAME and not all([RDS_HOST_ENV, RDS_USER_ENV, RDS_DB_NAME_ENV]): # Password from ENV is not strictly checked here as it's not recommended
+             monitor_logger.error("RDS Deletion Queue enabled, but RDS_SECRET_ARN_OR_NAME and fallback ENV creds are incomplete. Worker not started.")
+        else:
+            rds_deletion_thread = threading.Thread(target=s3_deletion_queue_worker_thread_func, daemon=True)
+            rds_deletion_thread.start(); monitor_logger.info("RDS S3 Deletion Queue Worker thread initiated.")
+    else:
+        monitor_logger.info("RDS Deletion Queue is disabled.")
+
     try:
-        observer.schedule(event_handler, MONITOR_DIR_BASE, recursive=True)
-        observer.start()
-        monitor_logger.info("Observer started. Monitoring for file changes based on RELEVANT_PATTERNS...")
-        while observer.is_alive(): 
-            observer.join(1) 
+        while True: # Main loop to keep script alive
+            if observer and not observer.is_alive():
+                monitor_logger.error("EFS Observer thread died.")
+                if not rds_deletion_thread or not rds_deletion_thread.is_alive(): break # Exit if both dead
+            if rds_deletion_thread and not rds_deletion_thread.is_alive() and RDS_DELETION_QUEUE_ENABLED:
+                monitor_logger.error("RDS Deletion Queue thread died.")
+                if not observer or not observer.is_alive(): break # Exit if both dead
+            if (not observer or not observer.is_alive()) and \
+               (not RDS_DELETION_QUEUE_ENABLED or (rds_deletion_thread and not rds_deletion_thread.is_alive())):
+                monitor_logger.info("No active monitoring threads. Exiting.")
+                break
+            time.sleep(5)
     except KeyboardInterrupt:
-        monitor_logger.info("Keyboard interrupt received. Stopping observer...")
+        monitor_logger.info("Keyboard interrupt. Stopping...")
         if cf_invalidation_timer and cf_invalidation_timer.is_alive():
-            monitor_logger.info("Attempting to trigger any pending CloudFront invalidation before exiting due to KeyboardInterrupt...")
-            with cf_invalidation_lock: 
-                if cf_invalidation_timer and cf_invalidation_timer.is_alive(): 
-                    cf_invalidation_timer.cancel() 
-            event_handler._trigger_batched_cloudfront_invalidation() 
+            with cf_invalidation_lock:
+                if cf_invalidation_timer and cf_invalidation_timer.is_alive(): cf_invalidation_timer.cancel()
+            watcher_event_handler._trigger_batched_cloudfront_invalidation()
     except Exception as e:
-        monitor_logger.critical(f"Critical error in observer loop: {e}", exc_info=True)
+        monitor_logger.critical(f"Critical error in main loop: {e}", exc_info=True)
     finally:
-        monitor_logger.info("Shutting down observer...")
+        monitor_logger.info("Shutting down...")
+        if rds_deletion_thread and rds_deletion_thread.is_alive():
+            s3_deletion_queue_stop_event.set()
+            rds_deletion_thread.join(timeout=S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS + 15)
+            if rds_deletion_thread.is_alive(): monitor_logger.warning("RDS Worker thread timed out on stop.")
+            else: monitor_logger.info("RDS Worker thread stopped.")
+        if observer and observer.is_alive():
+            observer.stop(); observer.join(timeout=10)
+            if observer.is_alive(): monitor_logger.warning("EFS Observer timed out on stop.")
+            else: monitor_logger.info("EFS Observer stopped.")
         with cf_invalidation_lock:
-            if cf_invalidation_timer and cf_invalidation_timer.is_alive():
-                monitor_logger.info("Cancelling active CloudFront invalidation timer during final shutdown.")
-                cf_invalidation_timer.cancel()
-        if observer.is_alive():
-            observer.stop()
-        observer.join() 
-        monitor_logger.info("Observer stopped and joined. Exiting.")
+            if cf_invalidation_timer and cf_invalidation_timer.is_alive(): cf_invalidation_timer.cancel()
+        monitor_logger.info("Script finished.")
