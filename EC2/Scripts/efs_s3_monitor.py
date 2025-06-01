@@ -7,7 +7,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import shutil  # Para shutil.which
 import boto3
-import threading # Para o temporizador de debounce da invalidação
+import threading # Para o temporizador de debounce da invalidação e locks
 
 # --- Configuration (Read from environment variables passed by systemd service) ---
 MONITOR_DIR_BASE = os.environ.get('WP_MONITOR_DIR_BASE', '/var/www/html')
@@ -43,6 +43,11 @@ cf_invalidation_paths_batch = []
 cf_invalidation_timer = None
 cf_invalidation_lock = threading.Lock()
 
+# Variáveis Globais para rastrear deleções do EFS feitas pelo script
+efs_deleted_by_script = set()
+efs_deletion_lock = threading.Lock()
+
+
 # --- Logger Setup ---
 def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(name)s - %(levelname)s - %(message)s'):
     log_dir = os.path.dirname(log_file)
@@ -52,21 +57,32 @@ def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s 
             os.chmod(log_dir, 0o755)
         except Exception as e:
             print(f"Error creating log directory {log_dir}: {e}")
-            log_file = os.path.join("/tmp", os.path.basename(log_file))
+            log_file = os.path.join("/tmp", os.path.basename(log_file)) # Fallback
             print(f"Falling back to log file: {log_file}")
+
+    # Tenta criar/tocar o arquivo de log para verificar permissões antes de configurar o handler
     try:
-        with open(log_file, 'a'):
-            os.utime(log_file, None)
-        os.chmod(log_file, 0o644)
+        # Tenta abrir em modo 'a' para criar se não existir, sem truncar
+        with open(log_file, 'a'): 
+            os.utime(log_file, None) # Atualiza timestamp ou cria se não existir (com with open)
+        os.chmod(log_file, 0o644) # Define permissões apropriadas
     except Exception as e:
         print(f"Error touching/chmod log file {log_file}: {e}")
+        # Não define um fallback aqui, pois o logger tentará criar o arquivo de qualquer forma.
+        # Se falhar, o erro será logado no console pelo FileHandler.
 
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    if not logger.hasHandlers():
-        handler = logging.FileHandler(log_file, mode='a')
+    if not logger.hasHandlers(): # Evita adicionar múltiplos handlers se a função for chamada mais de uma vez
+        handler = logging.FileHandler(log_file, mode='a') # Modo 'a' para append
         handler.setFormatter(logging.Formatter(formatter_str))
         logger.addHandler(handler)
+        
+        # Adiciona um handler para o console para logs críticos se o FileHandler falhar
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.ERROR) # Loga apenas ERRO ou CRÍTICO no console
+        console_handler.setFormatter(logging.Formatter(formatter_str))
+        logger.addHandler(console_handler)
     return logger
 
 monitor_logger = setup_logger('PY_MONITOR', LOG_FILE_MONITOR)
@@ -92,7 +108,7 @@ class Watcher(FileSystemEventHandler):
             return True
         if '/cache/' in filepath or '/.git/' in filepath or '/node_modules/' in filepath:
             return True
-        if '/uploads/sites/' in filepath:
+        if '/uploads/sites/' in filepath: # Exclui uploads de sub-sites em multisite
              monitor_logger.debug(f"Excluding Multisite sub-site upload path: {filepath}")
              return True
         return False
@@ -113,7 +129,7 @@ class Watcher(FileSystemEventHandler):
 
             if not CLOUDFRONT_DISTRIBUTION_ID:
                 monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set. Skipping batched CloudFront invalidation.")
-                cf_invalidation_paths_batch = []
+                cf_invalidation_paths_batch = [] # Limpa o lote
                 if cf_invalidation_timer:
                     cf_invalidation_timer.cancel()
                     cf_invalidation_timer = None
@@ -156,20 +172,28 @@ class Watcher(FileSystemEventHandler):
                 cf_invalidation_paths_batch.append(object_key_to_invalidate)
                 monitor_logger.info(f"Added '{object_key_to_invalidate}' to CloudFront invalidation batch. Batch size: {len(cf_invalidation_paths_batch)}")
 
-            if cf_invalidation_timer:
+            if cf_invalidation_timer: # Cancela timer existente para reiniciar a contagem
                 cf_invalidation_timer.cancel()
                 monitor_logger.debug("Cancelled existing CloudFront invalidation timer.")
 
+            # Verifica se o lote atingiu o tamanho máximo ou se o timer deve ser iniciado/reiniciado
             if len(cf_invalidation_paths_batch) >= CF_INVALIDATION_BATCH_MAX_SIZE:
                 monitor_logger.info(f"CloudFront invalidation batch reached max size ({CF_INVALIDATION_BATCH_MAX_SIZE}). Triggering invalidation now.")
-                self._trigger_batched_cloudfront_invalidation()
-            else:
+                # Chamada de _trigger_batched_cloudfront_invalidation é feita fora do lock de _add_to_cf_invalidation_batch
+                # para evitar nested locks se trigger for chamado diretamente.
+                # Mas neste caso, o lock já está adquirido, então podemos chamar internamente ou liberar e chamar.
+                # Para simplificar, o _trigger_batched_cloudfront_invalidation já lida com a aquisição do lock.
+                # No entanto, como estamos dentro do lock, precisamos liberar e re-adquirir ou chamar uma versão "unsafe"
+                # A maneira como está, com _trigger_batched_cloudfront_invalidation adquirindo seu próprio lock, é segura.
+                self._trigger_batched_cloudfront_invalidation() # Esta chamada limpa o timer se necessário.
+            elif cf_invalidation_paths_batch: # Só inicia o timer se houver itens no lote
                 cf_invalidation_timer = threading.Timer(CF_INVALIDATION_BATCH_TIMEOUT_SECONDS, self._trigger_batched_cloudfront_invalidation)
-                cf_invalidation_timer.daemon = True
+                cf_invalidation_timer.daemon = True # Permite que o programa saia mesmo se o timer estiver ativo
                 cf_invalidation_timer.start()
                 monitor_logger.debug(f"CloudFront invalidation timer (re)started for {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s. Batch size: {len(cf_invalidation_paths_batch)}")
 
     def _handle_s3_upload(self, local_path, relative_file_path, is_initial_sync=False):
+        global efs_deleted_by_script # Permite modificar a variável global
         effective_delete_from_efs = DELETE_FROM_EFS_AFTER_SYNC and not is_initial_sync
 
         current_time = time.time()
@@ -185,7 +209,7 @@ class Watcher(FileSystemEventHandler):
             process = subprocess.run(
                 [AWS_CLI_PATH, 's3', 'cp', local_path, s3_full_uri,
                  '--acl', 'private', '--only-show-errors'],
-                capture_output=True, text=True, check=False
+                capture_output=True, text=True, check=False # check=False para capturar erros manualmente
             )
 
             if process.returncode == 0:
@@ -193,9 +217,7 @@ class Watcher(FileSystemEventHandler):
                 transfer_logger.info(f"TRANSFERRED: {relative_file_path} to {s3_full_uri}")
                 last_sync_file_map[local_path] = current_time
 
-                # --- LÓGICA DE INVALIDAÇÃO DO CLOUDFRONT (Opção 1 Modificada) ---
-                # Invalida para QUALQUER upload bem-sucedido que NÃO seja parte da sincronização inicial.
-                if not is_initial_sync:
+                if not is_initial_sync: # Não invalida para sync inicial
                     monitor_logger.info(f"Adding '{relative_file_path}' to CloudFront invalidation batch due to EFS event (create/update).")
                     self._add_to_cf_invalidation_batch(relative_file_path)
                 
@@ -203,11 +225,21 @@ class Watcher(FileSystemEventHandler):
                     _, ext = os.path.splitext(local_path)
                     if ext.lower() in DELETABLE_IMAGE_EXTENSIONS_FROM_EFS:
                         try:
-                            os.remove(local_path)
+                            monitor_logger.info(f"Preparing to delete IMAGE '{local_path}' from EFS by script. Adding to ignore list for subsequent S3 delete.")
+                            with efs_deletion_lock:
+                                efs_deleted_by_script.add(local_path) # Adiciona ANTES de deletar
+                            
+                            os.remove(local_path) # Deleta do EFS
+                            
                             monitor_logger.info(f"Successfully deleted IMAGE '{local_path}' from EFS (DELETE_FROM_EFS_AFTER_SYNC=true).")
                             transfer_logger.info(f"DELETED_EFS_IMAGE: {relative_file_path}")
                         except OSError as e:
                             monitor_logger.error(f"Failed to delete IMAGE '{local_path}' from EFS: {e}")
+                            # Se a deleção falhar, remove da lista para evitar falso positivo
+                            with efs_deletion_lock:
+                                if local_path in efs_deleted_by_script:
+                                    efs_deleted_by_script.remove(local_path)
+                                    monitor_logger.info(f"Removed '{local_path}' from efs_deleted_by_script due to deletion failure.")
                     else:
                         monitor_logger.info(f"File '{local_path}' (ext: {ext.lower()}) not in DELETABLE_IMAGE_EXTENSIONS_FROM_EFS. Kept on EFS.")
             else:
@@ -220,7 +252,7 @@ class Watcher(FileSystemEventHandler):
 
     def _handle_s3_delete(self, relative_file_path):
         s3_client_boto = boto3.client('s3')
-        s3_target_path_key = relative_file_path
+        s3_target_path_key = relative_file_path # É o mesmo que relative_file_path
         s3_full_uri = self._get_s3_path(relative_file_path)
 
         monitor_logger.info(f"Attempting to delete '{s3_full_uri}' from S3 via AWS CLI...")
@@ -231,14 +263,14 @@ class Watcher(FileSystemEventHandler):
         try:
             process = subprocess.run(
                 [AWS_CLI_PATH, 's3', 'rm', s3_full_uri], # Removido --only-show-errors para debug potencial
-                capture_output=True, text=True, check=False
+                capture_output=True, text=True, check=False # check=False para capturar erros manualmente
             )
             cli_rc = process.returncode
             cli_stderr = process.stderr.strip()
 
             if cli_rc == 0:
                 monitor_logger.info(f"AWS CLI 's3 rm' for '{relative_file_path}' reported success (RC: 0).")
-                if cli_stderr: monitor_logger.info(f"CLI Stderr (RC 0): {cli_stderr}")
+                if cli_stderr: monitor_logger.info(f"CLI Stderr (RC 0): {cli_stderr}") # Loga stderr mesmo em sucesso
                 transfer_logger.info(f"DELETED_S3_CLI_OK: {relative_file_path}")
                 cli_delete_reported_success = True
             else:
@@ -247,15 +279,17 @@ class Watcher(FileSystemEventHandler):
                 transfer_logger.info(f"DELETED_S3_CLI_FAILED: {relative_file_path} - RC={cli_rc} ERR={cli_stderr}")
         except FileNotFoundError:
              monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 delete for '{relative_file_path}' failed at CLI stage.")
-             return
+             return # Não pode verificar se o CLI não foi encontrado
         except Exception as e:
             monitor_logger.error(f"Exception during AWS CLI 's3 rm' for {relative_file_path}: {e}", exc_info=True)
-            pass # Tenta a verificação mesmo assim
+            # Não retorna, tenta a verificação mesmo assim, pois o CLI pode ter tido um erro não fatal
 
+        # Verifica a deleção usando head_object, independentemente do resultado do CLI (a menos que tenha sido FileNotFoundError)
         monitor_logger.info(f"Verifying deletion of '{s3_target_path_key}' in S3 using Boto3 head_object...")
         try:
-            time.sleep(1) 
+            time.sleep(1) # Pequena pausa para consistência eventual do S3
             s3_client_boto.head_object(Bucket=S3_BUCKET, Key=s3_target_path_key)
+            # Se head_object não levantar exceção, o objeto ainda existe
             monitor_logger.error(
                 f"S3 delete VERIFICATION FAILED for '{relative_file_path}'. Object still found in S3 after 'aws s3 rm' (CLI RC: {cli_rc}). Review IAM permissions and bucket policies.")
             if cli_stderr: monitor_logger.error(f"CLI Stderr was: {cli_stderr}")
@@ -265,48 +299,98 @@ class Watcher(FileSystemEventHandler):
                 monitor_logger.info(f"S3 delete VERIFIED for '{relative_file_path}'. Object no longer found in S3 (confirmed by head_object). CLI RC: {cli_rc}.")
                 if cli_stderr and not cli_delete_reported_success: monitor_logger.info(f"CLI Stderr was (file now gone): {cli_stderr}")
                 transfer_logger.info(f"DELETED_S3_VERIFIED_NOT_FOUND: {relative_file_path}")
-                # --- LÓGICA DE INVALIDAÇÃO DO CLOUDFRONT (Opção 1 Modificada) ---
-                # Invalida para QUALQUER deleção bem-sucedida (confirmada) que NÃO seja parte da sincronização inicial.
-                # Como _handle_s3_delete só é chamado por eventos do watcher, não precisamos checar is_initial_sync.
+                
                 monitor_logger.info(f"Adding '{relative_file_path}' to CloudFront invalidation batch due to S3 delete confirmation.")
                 self._add_to_cf_invalidation_batch(relative_file_path)
-            else:
+            else: # Outro ClientError
                 monitor_logger.error(
                     f"Error during S3 delete VERIFICATION for '{relative_file_path}' using head_object: {e.response['Error']['Code']} - {e.response['Error']['Message']}. CLI RC: {cli_rc}.")
                 if cli_stderr: monitor_logger.error(f"CLI Stderr was: {cli_stderr}")
                 transfer_logger.info(f"DELETED_S3_VERIFICATION_ERROR_HEAD_OBJECT: {relative_file_path} - {e.response['Error']['Code']}")
-        except Exception as ve:
+        except Exception as ve: # Outras exceções durante a verificação
             monitor_logger.error(f"Unexpected error during S3 delete VERIFICATION for '{s3_target_path_key}': {ve}", exc_info=True)
             transfer_logger.info(f"DELETED_S3_VERIFICATION_UNEXPECTED_ERROR: {relative_file_path}")
 
-    def process_event_for_sync(self, event_type, path):
-        if self._is_excluded(path) or (os.path.exists(path) and os.path.isdir(path)):
+    def process_event_for_sync(self, event_type, path, dest_path=None): # dest_path é para 'moved'
+        global efs_deleted_by_script # Permite modificar a variável global
+
+        # Para eventos 'moved', o 'path' é o src_path e 'dest_path' é o event.dest_path
+        # Para outros eventos, 'path' é o src_path e 'dest_path' é None
+
+        # Trata a origem se for um evento 'moved'
+        if event_type == 'moved_from': # Usar 'moved_from' para clareza
+            if self._is_excluded(path) or (os.path.exists(path) and os.path.isdir(path)): # Checa src_path
+                return
+            relevant_src, relative_src_path = is_path_relevant(path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
+            if not relevant_src or not relative_src_path:
+                return
+            
+            monitor_logger.info(f"Event: MOVED_FROM (source part) for relevant file '{relative_src_path}' (full: {path})")
+            
+            ignore_s3_deletion_for_moved_src = False
+            with efs_deletion_lock:
+                if path in efs_deleted_by_script:
+                    monitor_logger.info(f"EFS MOVED_FROM event for '{path}' was likely part of script-initiated rename/process. Not deleting from S3 for source.")
+                    efs_deleted_by_script.remove(path) # Limpa da lista
+                    ignore_s3_deletion_for_moved_src = True
+            
+            if not ignore_s3_deletion_for_moved_src:
+                monitor_logger.info(f"EFS MOVED_FROM event for '{path}' was external. Proceeding with S3 delete for source.")
+                self._handle_s3_delete(relative_src_path)
+            else:
+                transfer_logger.info(f"SKIPPED_S3_DELETE_MOVED_FROM_BY_SCRIPT_FLAG: {relative_src_path}")
+            return # Fim do tratamento para 'moved_from'
+
+        # Tratamento para 'created', 'modified', 'deleted', e a parte 'moved_to' de 'moved'
+        # Se for 'moved_to', o 'path' efetivo a ser checado é 'dest_path'
+        current_path_to_check = dest_path if event_type == 'moved_to' else path
+
+        if self._is_excluded(current_path_to_check) or \
+           (os.path.exists(current_path_to_check) and os.path.isdir(current_path_to_check)):
             return
-        relevant, relative_path = is_path_relevant(path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
+        
+        relevant, relative_path = is_path_relevant(current_path_to_check, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
         if not relevant or not relative_path:
             return
-        monitor_logger.info(f"Event: {event_type.upper()} for relevant file '{relative_path}' (full: {path})")
+        
+        monitor_logger.info(f"Event: {event_type.upper()} for relevant file '{relative_path}' (full: {current_path_to_check})")
+
         if event_type in ['created', 'modified', 'moved_to']:
-            self._handle_s3_upload(path, relative_path)
+            self._handle_s3_upload(current_path_to_check, relative_path)
+        
         elif event_type == 'deleted':
-            self._handle_s3_delete(relative_path)
+            ignore_this_s3_deletion = False
+            with efs_deletion_lock:
+                if path in efs_deleted_by_script: # 'path' aqui é o src_path original do evento 'deleted'
+                    monitor_logger.info(f"EFS delete event for '{path}' was triggered by this script. Not deleting from S3.")
+                    efs_deleted_by_script.remove(path) # Limpa o path da lista
+                    ignore_this_s3_deletion = True
+            
+            if not ignore_this_s3_deletion:
+                monitor_logger.info(f"EFS delete event for '{path}' was external. Proceeding with S3 delete.")
+                self._handle_s3_delete(relative_path)
+            else:
+                transfer_logger.info(f"SKIPPED_S3_DELETE_BY_SCRIPT_FLAG: {relative_path}")
 
     def on_created(self, event):
         if not event.is_directory:
             self.process_event_for_sync('created', event.src_path)
+    
     def on_modified(self, event):
         if not event.is_directory:
             self.process_event_for_sync('modified', event.src_path)
+    
     def on_deleted(self, event):
         if not event.is_directory:
             self.process_event_for_sync('deleted', event.src_path)
+    
     def on_moved(self, event):
         if not event.is_directory:
-            relevant_src, relative_src_path = is_path_relevant(event.src_path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
-            if relevant_src and relative_src_path and not self._is_excluded(event.src_path):
-                monitor_logger.info(f"Event: MOVED (source part) for relevant file '{relative_src_path}' (full: {event.src_path})")
-                self._handle_s3_delete(relative_src_path) # A deleção do S3 (e subsequente invalidação CF) é tratada aqui
-            self.process_event_for_sync('moved_to', event.dest_path) # O upload (e subsequente invalidação CF) é tratado aqui
+            # Trata a origem do 'moved'
+            self.process_event_for_sync('moved_from', event.src_path)
+            # Trata o destino do 'moved'
+            self.process_event_for_sync('moved_to', event.src_path, dest_path=event.dest_path)
+
 
 # --- Initial Sync Function using 'aws s3 sync' ---
 def run_s3_sync_command(command_parts, description):
@@ -315,24 +399,19 @@ def run_s3_sync_command(command_parts, description):
         process = subprocess.run(command_parts, capture_output=True, text=True, check=False)
         if process.returncode == 0:
             monitor_logger.info(f"Initial Sync for {description} completed successfully.")
-            if process.stdout.strip():
-                 monitor_logger.info(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
+            if process.stdout.strip(): monitor_logger.info(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
             transfer_logger.info(f"INITIAL_SYNC_SUCCESS: {description}")
             return True
-        elif process.returncode == 2:
+        elif process.returncode == 2: # Alguns arquivos podem não ter sido sincronizados (ver stderr)
             monitor_logger.warning(f"Initial Sync for {description} completed with RC 2 (some files may not have been synced). Check stderr.")
-            if process.stdout.strip():
-                 monitor_logger.info(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
-            if process.stderr.strip():
-                monitor_logger.warning(f"Initial Sync for {description} stderr: {process.stderr.strip()}")
+            if process.stdout.strip(): monitor_logger.info(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
+            if process.stderr.strip(): monitor_logger.warning(f"Initial Sync for {description} stderr: {process.stderr.strip()}")
             transfer_logger.info(f"INITIAL_SYNC_WARNING_RC2: {description} - ERR: {process.stderr.strip()}")
-            return True
+            return True # Consideramos sucesso parcial como 'ok' para prosseguir
         else:
             monitor_logger.error(f"Initial Sync for {description} FAILED. RC: {process.returncode}.")
-            if process.stdout.strip():
-                monitor_logger.error(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
-            if process.stderr.strip():
-                monitor_logger.error(f"Initial Sync for {description} stderr: {process.stderr.strip()}")
+            if process.stdout.strip(): monitor_logger.error(f"Initial Sync for {description} stdout: {process.stdout.strip()}")
+            if process.stderr.strip(): monitor_logger.error(f"Initial Sync for {description} stderr: {process.stderr.strip()}")
             transfer_logger.info(f"INITIAL_SYNC_FAILED: {description} - RC={process.returncode} ERR={process.stderr.strip()}")
             return False
     except FileNotFoundError:
@@ -351,47 +430,72 @@ def perform_initial_sync():
         monitor_logger.error(f"Monitor directory '{MONITOR_DIR_BASE}' does not exist. Skipping initial sync.")
         return
 
+    # Definição dos includes para o sync
+    general_includes = [
+        '*.css', '*.js',
+        '*.jpg', '*.jpeg', '*.png', '*.gif',
+        '*.svg', '*.webp', '*.ico',
+        '*.woff', '*.woff2', '*.ttf',
+        '*.eot', '*.otf',
+        '*.mp4', '*.mov', '*.webm',
+        '*.avi', '*.wmv', '*.mkv', '*.flv',
+        '*.mp3', '*.wav', '*.ogg',
+        '*.aac', '*.wma', '*.flac',
+        '*.pdf', '*.doc', '*.docx',
+        '*.xls', '*.xlsx', '*.ppt', '*.pptx',
+        '*.zip', '*.txt',
+    ]
+    includes_for_sync_cmd = []
+    for item in general_includes:
+        includes_for_sync_cmd.extend(['--include', item])
+
+    # Sync para wp-content
     wp_content_path = os.path.join(MONITOR_DIR_BASE, "wp-content")
     if os.path.isdir(wp_content_path):
         s3_sync_wp_content_cmd = [
             AWS_CLI_PATH, 's3', 'sync', wp_content_path, f"s3://{S3_BUCKET}/wp-content/",
-            '--exclude', '*.php',
-            '--include', '*.css', '--include', '*.js',
-            '--include', '*.jpg', '--include', '*.jpeg', '--include', '*.png', '--include', '*.gif',
-            '--include', '*.svg', '--include', '*.webp', '--include', '*.ico',
-            '--include', '*.woff', '--include', '*.woff2', '--include', '*.ttf',
-            '--include', '*.eot', '--include', '*.otf',
-            '--include', '*.mp4', '--include', '*.mov', '--include', '*.webm',
-            '--include', '*.avi', '--include', '*.wmv', '--include', '*.mkv', '--include', '*.flv',
-            '--include', '*.mp3', '--include', '*.wav', '--include', '*.ogg',
-            '--include', '*.aac', '--include', '*.wma', '--include', '*.flac',
-            '--include', '*.pdf', '--include', '*.doc', '--include', '*.docx',
-            '--include', '*.xls', '--include', '*.xlsx', '--include', '*.ppt', '--include', '*.pptx',
-            '--include', '*.zip', '--include', '*.txt',
-            '--exact-timestamps', '--acl', 'private', '--only-show-errors'
-        ]
+            '--exclude', '*.php', # Exclui todos os PHP
+            '--exclude', 'wp-content/plugins/index.php', # Exemplo de exclusão mais específica se necessário
+            '--exclude', 'wp-content/themes/index.php',
+            '--exclude', 'wp-content/uploads/index.php',
+            '--exclude', 'wp-content/cache/*', # Exclui diretórios de cache comuns
+            '--exclude', 'wp-content/backups/*',
+            '--exclude', '*/.DS_Store',
+            '--exclude', '*/Thumbs.db'
+        ] + includes_for_sync_cmd + ['--exact-timestamps', '--acl', 'private', '--only-show-errors']
         run_s3_sync_command(s3_sync_wp_content_cmd, "wp-content")
     else:
         monitor_logger.warning(f"Directory '{wp_content_path}' not found. Skipping sync for wp-content.")
 
+    # Sync para wp-includes
     wp_includes_path = os.path.join(MONITOR_DIR_BASE, "wp-includes")
     if os.path.isdir(wp_includes_path):
+        # Para wp-includes, somos mais restritivos nos includes, focando em assets.
+        wp_includes_assets_includes = [
+            '*.css', '*.js',
+            '*.jpg', '*.jpeg', '*.png', '*.gif',
+            '*.svg', '*.webp', '*.ico',
+        ]
+        includes_for_wp_includes_cmd = []
+        for item in wp_includes_assets_includes:
+            includes_for_wp_includes_cmd.extend(['--include', item])
+
         s3_sync_wp_includes_cmd = [
             AWS_CLI_PATH, 's3', 'sync', wp_includes_path, f"s3://{S3_BUCKET}/wp-includes/",
-            '--exclude', '*.php',
-            '--include', '*.css', '--include', '*.js',
-            '--include', '*.jpg', '--include', '*.jpeg', '--include', '*.png', '--include', '*.gif',
-            '--include', '*.svg', '--include', '*.webp', '--include', '*.ico',
+            '--exclude', '*', # Exclui tudo por padrão
+        ] + includes_for_wp_includes_cmd + [ # Inclui apenas os assets especificados
             '--exact-timestamps', '--acl', 'private', '--only-show-errors'
         ]
-        run_s3_sync_command(s3_sync_wp_includes_cmd, "wp-includes")
+        run_s3_sync_command(s3_sync_wp_includes_cmd, "wp-includes (assets only)")
     else:
         monitor_logger.warning(f"Directory '{wp_includes_path}' not found. Skipping sync for wp-includes.")
+    
     monitor_logger.info("--- Initial S3 Sync using 'aws s3 sync' commands Attempted ---")
+
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    script_version_tag = "vLocalDev-CF-BatchInvalidation-Opt1Mod-Final" # Atualize para rastreamento
+    script_version_tag = "vLocalDev-CF-BatchInvalidation-EFSDeleteLogic-v2" # Atualize para rastreamento
     monitor_logger.info(
         f"Python Watchdog Monitor (EFS to S3 Sync - {script_version_tag}) starting for '{MONITOR_DIR_BASE}'.")
     monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
@@ -404,6 +508,7 @@ if __name__ == "__main__":
     monitor_logger.info(f"CloudFront Invalidation Batch Max Size: {CF_INVALIDATION_BATCH_MAX_SIZE}")
     monitor_logger.info(f"CloudFront Invalidation Batch Timeout (s): {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}")
 
+    # Validações Críticas
     if not S3_BUCKET:
         monitor_logger.critical("S3_BUCKET environment variable not set. Exiting.")
         exit(1)
@@ -411,29 +516,30 @@ if __name__ == "__main__":
         monitor_logger.critical(f"Monitor directory '{MONITOR_DIR_BASE}' does not exist. Exiting.")
         exit(1)
 
+    # Verifica AWS CLI
     aws_cli_actual_path = shutil.which(AWS_CLI_PATH)
     if not aws_cli_actual_path:
         monitor_logger.critical(f"AWS CLI not found at specified path '{AWS_CLI_PATH}' or not in system PATH. Please check WP_AWS_CLI_PATH. Exiting.")
         exit(1)
     else:
-        if AWS_CLI_PATH != aws_cli_actual_path:
+        if AWS_CLI_PATH != aws_cli_actual_path: # Se o shutil.which encontrou em outro lugar
              monitor_logger.info(f"Resolved AWS CLI path from '{AWS_CLI_PATH}' to '{aws_cli_actual_path}'.")
-        AWS_CLI_PATH = aws_cli_actual_path
+        AWS_CLI_PATH = aws_cli_actual_path # Usa o caminho resolvido
         monitor_logger.info(f"Using AWS CLI at: {AWS_CLI_PATH}")
 
-    # Verifica se o Boto3 está disponível, essencial para invalidação e head_object
+    # Verifica Boto3
     try:
-        import boto3
-        boto3.client('s3') # Tenta criar um cliente para ver se o import funcionou e as creds/config estão ok
+        import boto3 # Já importado no topo, mas re-checa aqui para ter certeza que está no contexto certo
+        boto3.client('s3') # Tenta criar um cliente para ver se credenciais/config estão ok
         monitor_logger.info("Boto3 library and S3 client initialized successfully.")
     except ImportError:
         monitor_logger.critical("Boto3 library not found. Please install it (e.g., 'sudo pip3 install boto3'). Exiting.")
         exit(1)
-    except Exception as e:
+    except Exception as e: # Captura outros erros de Boto3 (ex: credenciais)
         monitor_logger.critical(f"Failed to initialize Boto3 S3 client. Check AWS credentials/configuration: {e}", exc_info=True)
         exit(1)
 
-
+    # Executa Sync Inicial se configurado
     if PERFORM_INITIAL_SYNC:
         monitor_logger.info("WP_PERFORM_INITIAL_SYNC is true. Calling perform_initial_sync().")
         perform_initial_sync()
@@ -441,24 +547,34 @@ if __name__ == "__main__":
     else:
         monitor_logger.info("WP_PERFORM_INITIAL_SYNC is false. Skipping initial sync.")
     
-    if not RELEVANT_PATTERNS_STR and PERFORM_INITIAL_SYNC: # Se só faz sync inicial, avisa que o watcher não fará nada
-        monitor_logger.warning("RELEVANT_PATTERNS_STR is empty. Watchdog will not process new file events for upload unless patterns are added.")
-    elif not RELEVANT_PATTERNS_STR and not PERFORM_INITIAL_SYNC: # Se nenhuma das duas, não faz nada
-         monitor_logger.critical("RELEVANT_PATTERNS_STR is empty and PERFORM_INITIAL_SYNC is false. Script will do nothing for EFS file changes. Exiting.")
-         exit(1)
+    # Validação de RELEVANT_PATTERNS
+    if not RELEVANT_PATTERNS_STR: # Se a string original estiver vazia
+        if PERFORM_INITIAL_SYNC:
+            monitor_logger.warning("RELEVANT_PATTERNS_STR is empty, but PERFORM_INITIAL_SYNC is true. Initial sync was performed, but Watchdog will not process new file events for upload unless patterns are added.")
+        else: # Nem sync inicial, nem padrões para o watcher
+             monitor_logger.critical("RELEVANT_PATTERNS_STR is empty and PERFORM_INITIAL_SYNC is false. Script will do nothing for EFS file changes. Exiting.")
+             exit(1)
+    elif not RELEVANT_PATTERNS: # Se a string não estiver vazia, mas após o parse não houver padrões válidos
+        monitor_logger.critical(f"RELEVANT_PATTERNS_STR ('{RELEVANT_PATTERNS_STR}') resulted in no valid patterns for the watcher. Exiting.")
+        exit(1)
 
+
+    # Inicia o Observer
     event_handler = Watcher()
     observer = Observer()
     try:
         observer.schedule(event_handler, MONITOR_DIR_BASE, recursive=True)
         observer.start()
         monitor_logger.info("Observer started. Monitoring for file changes based on RELEVANT_PATTERNS...")
-        while observer.is_alive():
-            observer.join(1) # Espera 1 segundo, ou até o observer parar
+        while observer.is_alive(): # Mantém o script principal rodando enquanto o observer está ativo
+            observer.join(1) # Espera 1 segundo, ou até o observer parar (libera o GIL)
     except KeyboardInterrupt:
         monitor_logger.info("Keyboard interrupt received. Stopping observer...")
+        # Tenta disparar invalidações pendentes antes de sair
         if cf_invalidation_timer and cf_invalidation_timer.is_alive():
             monitor_logger.info("Attempting to trigger any pending CloudFront invalidation before exiting due to KeyboardInterrupt...")
+            # Não precisa do lock aqui, _trigger_batched_cloudfront_invalidation lida com isso.
+            # Cancelar o timer primeiro é uma boa prática se for acessá-lo diretamente.
             with cf_invalidation_lock: # Adquire lock para modificar o timer
                 if cf_invalidation_timer and cf_invalidation_timer.is_alive(): # Checa de novo dentro do lock
                     cf_invalidation_timer.cancel() 
@@ -466,6 +582,7 @@ if __name__ == "__main__":
     except Exception as e:
         monitor_logger.critical(f"Critical error in observer loop: {e}", exc_info=True)
     finally:
+        monitor_logger.info("Shutting down observer...")
         # Garante que o timer seja cancelado se ainda estiver vivo
         with cf_invalidation_lock:
             if cf_invalidation_timer and cf_invalidation_timer.is_alive():
@@ -473,5 +590,5 @@ if __name__ == "__main__":
                 cf_invalidation_timer.cancel()
         if observer.is_alive():
             observer.stop()
-        observer.join()
+        observer.join() # Espera o observer terminar completamente
         monitor_logger.info("Observer stopped and joined. Exiting.")
