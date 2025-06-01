@@ -1,28 +1,28 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.3.5-php-order-fix (Corrige ordem de instalação do PHP e Composer)
+# Versão: 2.3.6-s3-region-fix (Corrige obtenção da MEU_S3_REGION e verifica var)
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.5.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.6.sh" # VERSÃO ATUALIZADA
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.5_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.6_env_vars.sh" # VERSÃO ATUALIZADA
 
 # Script de Monitoramento Python e Serviço
-readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.3.py"
+readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.3.py" # Mantido, se não houver alteração nele
 readonly PYTHON_MONITOR_SCRIPT_PATH="/usr/local/bin/$PYTHON_MONITOR_SCRIPT_NAME"
-readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.5" # Versão do serviço
-readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.5.log"
-readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.5.log"
+readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.6" # VERSÃO ATUALIZADA DO SERVIÇO
+readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.6.log" # VERSÃO ATUALIZADA
+readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.6.log" # VERSÃO ATUALIZADA
 
 # Chave S3 para o script Python
-readonly AWS_S3_PYTHON_SCRIPT_KEY="efs_s3_monitor.py"
+readonly AWS_S3_PYTHON_SCRIPT_KEY="efs_s3_monitor.py" # Mantido
 
 # Configuração para o S3 Hook Deleter PHP
-readonly S3_HOOK_DELETER_PHP_FILENAME="s3-hook-deleter.php"
+readonly S3_HOOK_DELETER_PHP_FILENAME="s3-hook-deleter.php" # Mantido
 readonly AWS_S3_HOOK_DELETER_PHP_KEY="$S3_HOOK_DELETER_PHP_FILENAME"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.3.5.log" # Atualizar versão do log principal
+LOG_FILE="/var/log/wordpress_setup_v2.3.6.log" # VERSÃO ATUALIZADA do log principal
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -44,14 +44,15 @@ essential_vars=(
     "WPDOMAIN"
     "ACCOUNT"
     "AWS_EFS_ACCESS_POINT_TARGET_ID_0"
-    "AWS_S3_BUCKET_TARGET_NAME_0"
-    "AWS_S3_BUCKET_TARGET_NAME_SCRIPT"
-    "AWS_S3_BUCKET_TARGET_REGION_SCRIPT"
+    "AWS_S3_BUCKET_TARGET_NAME_0"          # Para o offload de mídia
+    "AWS_S3_BUCKET_TARGET_REGION_0"         # <<< ADICIONADO PARA VERIFICAÇÃO >>> Região do bucket de offload
+    "AWS_S3_BUCKET_TARGET_NAME_SCRIPT"    # Para os scripts de setup/monitor
+    "AWS_S3_BUCKET_TARGET_REGION_SCRIPT"  # Região do bucket de scripts
 )
 
 # --- Função de Auto-Instalação do Script Principal ---
 self_install_script() {
-    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.5)..."
+    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.6)..."
     local current_script_path; current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
     if ! sudo cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then echo "ERRO CRÍTICO (self_install): Falha ao copiar script. Abortando."; exit 1; fi
@@ -101,11 +102,8 @@ create_wp_config_template() {
         rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
     else echo "ERRO: Falha ao obter SALTS."; fi
     
-    local current_aws_region
-    current_aws_region=$(aws configure get region 2>/dev/null || curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/[a-z]$//' || echo "us-east-1")
-
 PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.3.5.sh
+// Gerado por wordpress_setup_v2.3.6.sh
 \$site_scheme = 'https';
 \$site_host = '$primary_wpdomain_for_fallback';
 if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
@@ -114,7 +112,7 @@ define('WP_HOME', \$site_scheme . '://' . \$site_host); define('WP_SITEURL', \$s
 define('FS_METHOD', 'direct');
 // Adiciona constantes para o S3 Hook Deleter
 if (!defined('MEU_S3_BUCKET_NAME')) { define('MEU_S3_BUCKET_NAME', '${AWS_S3_BUCKET_TARGET_NAME_0}'); }
-if (!defined('MEU_S3_REGION')) { define('MEU_S3_REGION', '${current_aws_region}'); }
+if (!defined('MEU_S3_REGION')) { define('MEU_S3_REGION', '${AWS_S3_BUCKET_TARGET_REGION_0}'); } // <<< ALTERADO PARA USAR A VAR DE AMBIENTE DIRETO
 if (!defined('MEU_S3_BASE_PATH_IN_BUCKET')) { define('MEU_S3_BASE_PATH_IN_BUCKET', 'wp-content/uploads/'); }
 
 if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') { \$_SERVER['HTTPS'] = 'on'; }
@@ -123,7 +121,7 @@ EOPHP
 )
     TEMP_DEFINES_FILE_INNER=$(mktemp /tmp/defines.XXXXXX); sudo chmod 644 "$TEMP_DEFINES_FILE_INNER"; echo -e "\n$PHP_DEFINES_BLOCK_CONTENT" >"$TEMP_DEFINES_FILE_INNER"
     if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE_INNER" "$temp_config_file"; else cat "$TEMP_DEFINES_FILE_INNER" >>"$temp_config_file"; fi
-    rm -f "$TEMP_DEFINES_FILE_INNER"; echo "INFO: Defines configurados (incluindo para S3 Hook Deleter)."
+    rm -f "$TEMP_DEFINES_FILE_INNER"; echo "INFO: Defines configurados (incluindo para S3 Hook Deleter usando AWS_S3_BUCKET_TARGET_REGION_0 para MEU_S3_REGION)."
     echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como '$APACHE_USER'..."
     if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
 }
@@ -166,7 +164,7 @@ setup_python_monitor_script() {
 
 # --- Função para Criar e Habilitar o Serviço Systemd para Python Monitor ---
 create_and_enable_python_monitor_service() {
-    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.5)..."
+    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.6)..."
     local service_file_path="/etc/systemd/system/${PYTHON_MONITOR_SERVICE_NAME}.service"
     local patterns_env_str="wp-content/uploads/*;wp-content/themes/*/*.css;wp-content/themes/*/*.js;wp-content/themes/*/*.jpg;wp-content/themes/*/*.jpeg;wp-content/themes/*/*.png;wp-content/themes/*/*.gif;wp-content/themes/*/*.svg;wp-content/themes/*/*.webp;wp-content/themes/*/*.ico;wp-content/themes/*/*.woff;wp-content/themes/*/*.woff2;wp-content/themes/*/*.ttf;wp-content/themes/*/*.eot;wp-content/themes/*/*.otf;wp-content/plugins/*/*.css;wp-content/plugins/*/*.js;wp-content/plugins/*/*.jpg;wp-content/plugins/*/*.jpeg;wp-content/plugins/*/*.png;wp-content/plugins/*/*.gif;wp-content/plugins/*/*.svg;wp-content/plugins/*/*.webp;wp-content/plugins/*/*.ico;wp-content/plugins/*/*.woff;wp-content/plugins/*/*.woff2;wp-includes/js/*;wp-includes/css/*;wp-includes/images/*"
 
@@ -185,7 +183,7 @@ create_and_enable_python_monitor_service() {
 
     sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
 [Unit]
-Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.5)
+Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.6)
 Documentation=file://$PYTHON_MONITOR_SCRIPT_PATH
 After=network.target remote-fs.target $mount_unit_name
 Requires=$mount_unit_name
@@ -288,17 +286,22 @@ install_s3_hook_deleter_php() {
 
         if [ ! -f "$MOUNT_POINT/composer.json" ]; then
             echo "INFO: composer.json não encontrado. Criando um básico."
-            sudo -u "$EFS_OWNER_USER" HOME="$efs_owner_home" bash -c "cd '$MOUNT_POINT' && composer init --no-interaction --name=wordpress/site --type=project --require=aws/aws-sdk-php:^3.0" || echo "AVISO: Falha ao inicializar composer.json"
+            if ! sudo -u "$EFS_OWNER_USER" HOME="$efs_owner_home" bash -c "cd '$MOUNT_POINT' && composer init --no-interaction --name=wordpress/site --type=project --require=aws/aws-sdk-php:^3.0"; then
+                 echo "AVISO: Falha ao inicializar composer.json. Verifique permissões em $MOUNT_POINT para o usuário $EFS_OWNER_USER."
+            fi
         fi
 
         if grep -q "aws/aws-sdk-php" "$MOUNT_POINT/composer.json"; then
             echo "INFO: AWS SDK para PHP já está no composer.json."
         else
             echo "INFO: Adicionando aws/aws-sdk-php ao composer.json..."
-            sudo -u "$EFS_OWNER_USER" HOME="$efs_owner_home" bash -c "cd '$MOUNT_POINT' && composer require aws/aws-sdk-php:^3.0" || echo "AVISO: Falha ao executar 'composer require aws/aws-sdk-php'"
+            if ! sudo -u "$EFS_OWNER_USER" HOME="$efs_owner_home" bash -c "cd '$MOUNT_POINT' && composer require aws/aws-sdk-php:^3.0"; then
+                echo "AVISO: Falha ao executar 'composer require aws/aws-sdk-php'. Verifique permissões e logs do composer."
+            fi
         fi
         
         echo "INFO: Executando 'composer install'..."
+        # Adicionar --ignore-platform-reqs pode ajudar em alguns casos, mas idealmente o ambiente deve ser compatível
         if sudo -u "$EFS_OWNER_USER" HOME="$efs_owner_home" bash -c "cd '$MOUNT_POINT' && composer install --no-dev --optimize-autoloader"; then
             echo "INFO: 'composer install' concluído. Verifique o diretório '$MOUNT_POINT/vendor'."
             if [ -d "$MOUNT_POINT/vendor" ]; then
@@ -306,12 +309,14 @@ install_s3_hook_deleter_php() {
                 sudo find "$MOUNT_POINT/vendor" -type d -exec chmod 775 {} \; 
                 sudo find "$MOUNT_POINT/vendor" -type f -exec chmod 664 {} \; 
                 echo "INFO: Permissões do diretório vendor ajustadas."
+            else
+                echo "AVISO: Diretório '$MOUNT_POINT/vendor' não encontrado após 'composer install'. O S3 Hook Deleter não funcionará."
             fi
         else
-            echo "AVISO: Falha ao executar 'composer install'. O S3 Hook Deleter pode não funcionar."
+            echo "AVISO CRÍTICO: Falha ao executar 'composer install'. O S3 Hook Deleter não funcionará. Verifique logs do composer e recursos da instância (memória)."
         fi
     else
-        echo "AVISO: Composer não encontrado. AWS SDK para PHP precisa ser instalado manualmente."
+        echo "AVISO CRÍTICO: Composer não encontrado. AWS SDK para PHP precisa ser instalado manualmente para o S3 Hook Deleter funcionar."
     fi
 }
 
@@ -319,7 +324,7 @@ install_s3_hook_deleter_php() {
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.3.5-php-order-fix) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v2.3.6-s3-region-fix) ($(date)) ---" # VERSÃO ATUALIZADA
 echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
 echo "INFO: Python Script S3 Key (Hardcoded): $AWS_S3_PYTHON_SCRIPT_KEY"
 echo "INFO: S3 Hook Deleter PHP Filename (do S3): $S3_HOOK_DELETER_PHP_FILENAME (Key: $AWS_S3_HOOK_DELETER_PHP_KEY)"
@@ -361,6 +366,7 @@ for var_name in "${essential_vars[@]}"; do
     fi
     
     echo "INFO: Var (env): $var_name_for_check = '$current_var_value_to_check'"
+    # AWS_EFS_ACCESS_POINT_TARGET_ID_0 e AWS_CLOUDFRONT_DISTRIBUTION_ID_0 são opcionais (verificar se são realmente opcionais para todas as funcionalidades)
     if [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && \
        [ "$var_name" != "AWS_CLOUDFRONT_DISTRIBUTION_ID_0" ] && \
        [ -z "$current_var_value_to_check" ]; then 
@@ -379,30 +385,16 @@ echo "INFO: Verificação de variáveis concluída."
 echo "INFO: Instalando pacotes base do sistema..."
 sudo yum update -y -q
 sudo amazon-linux-extras install -y epel -q 
-sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils wget unzip # Movido wget e unzip para cá
+sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils wget unzip
 echo "INFO: Pacotes base do sistema instalados."
 
-# --- HABILITAÇÃO E INSTALAÇÃO DO PHP PRIMEIRO ---
 PHP_VERSION_EXTRA="php7.4"
 echo "INFO: Habilitando e instalando PHP via Amazon Linux Extras ($PHP_VERSION_EXTRA)..."
 sudo amazon-linux-extras enable "$PHP_VERSION_EXTRA" -y -q
 sudo yum install -y -q \
-    php \
-    php-common \
-    php-fpm \
-    php-mysqlnd \
-    php-json \
-    php-cli \
-    php-xml \
-    php-zip \
-    php-gd \
-    php-mbstring \
-    php-soap \
-    php-opcache \
-    php-bcmath \
-    php-intl \
-    php-pear
-    # Adicione php-devel e gcc se o composer precisar compilar algo
+    php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip \
+    php-gd php-mbstring php-soap php-opcache php-bcmath php-intl php-pear \
+    php-devel gcc # Adicionado php-devel e gcc para compilação do Composer se necessário
 
 if ! sudo rpm -q php-fpm || ! sudo rpm -q php-cli || ! sudo rpm -q php-json; then 
     echo "ERRO CRÍTICO: Pacotes PHP essenciais (php-fpm, php-cli, php-json) não foram instalados corretamente com $PHP_VERSION_EXTRA."
@@ -411,10 +403,8 @@ fi
 echo "INFO: PHP ($PHP_VERSION_EXTRA) e módulos instalados."
 php -v 
 
-# --- INSTALAÇÃO DO COMPOSER (AGORA COM O PHP CORRETO JÁ INSTALADO) ---
 if ! command -v composer &> /dev/null; then
     echo "INFO: Instalando Composer..."
-    # Dependências como wget e unzip já devem estar instaladas
     EXPECTED_CHECKSUM="$(wget -q -O - https://composer.github.io/installer.sig)"
     php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
     ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
@@ -435,7 +425,6 @@ else
 fi
 composer --version 
 
-# --- INSTALAÇÃO DO PYTHON E MÓDULOS ---
 echo "INFO: Instalando Python3, pip, watchdog e boto3..."
 sudo yum install -y -q python3 python3-pip
 sudo pip3 install --upgrade pip 
@@ -443,7 +432,6 @@ sudo pip3 install watchdog boto3
 echo "INFO: Python3, pip, watchdog e boto3 instalados."
 echo "INFO: Todos os pacotes de pré-requisitos foram processados."
 
-# --- RESTANTE DO SCRIPT ---
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
 
 echo "INFO: Testando escrita EFS como '$EFS_OWNER_USER'..."
@@ -473,7 +461,6 @@ DB_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1)
 echo "INFO: Creds RDS OK (User: $DB_USER, DB: $DB_NAME_TO_USE)."
 
 echo "INFO: Verificando WP em '$MOUNT_POINT/wp-includes'..."
-# Atualiza CONFIG_SAMPLE_ON_EFS para o caso de WP ser baixado agora
 CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
 if [ -d "$MOUNT_POINT/wp-includes" ] && [ -f "$CONFIG_SAMPLE_ON_EFS" ]; then 
     echo "WARN: WP parece já existir em '$MOUNT_POINT'."
@@ -486,17 +473,14 @@ else
     cd "$WP_DOWNLOAD_DIR" || { echo "ERRO: Falha ao entrar em $WP_DOWNLOAD_DIR"; exit 1; }
     curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha download WP."; exit 1; }
     tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha extração WP."; exit 1; }
-    rm latest.tar.gz
-    cd / 
+    rm latest.tar.gz; cd / 
 
     echo "INFO: WP baixado e extraído. Copiando para EFS como '$EFS_OWNER_USER'..."
     if sudo -u "$EFS_OWNER_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"; then 
         echo "INFO: WP copiado para EFS '$MOUNT_POINT'."
-        CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php" # Garante que está correto após a cópia
+        CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
     else 
-        echo "ERRO: Falha copiar WP para EFS '$MOUNT_POINT'. Verifique permissões."
-        ls -ld "$MOUNT_POINT"
-        exit 1
+        echo "ERRO: Falha copiar WP para EFS '$MOUNT_POINT'. Verifique permissões."; ls -ld "$MOUNT_POINT"; exit 1;
     fi
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     echo "INFO: Limpeza dos diretórios temporários de download do WP OK."
@@ -508,12 +492,13 @@ if [ ! -d "$MOUNT_POINT/wp-content" ]; then
     sudo chmod 775 "$MOUNT_POINT/wp-content"
 fi
 
-install_s3_hook_deleter_php
+install_s3_hook_deleter_php # ESSENCIAL QUE O COMPOSER FUNCIONE AQUI
 
 echo "INFO: (Opcional) Salvando vars em '$ENV_VARS_FILE'..."
-ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.3.5)\n" # Atualizar versão
+ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.3.6)\n" # VERSÃO ATUALIZADA
 ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"
 ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_NAME_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_NAME_0")\n"
+ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_REGION_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_REGION_0")\n" # Adicionado para referência
 echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE."
 
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then 
@@ -521,28 +506,34 @@ if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then
     create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
 else 
     echo "WARN: '$ACTIVE_CONFIG_FILE_EFS' já existe. Verificando e adicionando defines do S3 Hook se necessário..."
-    if ! grep -q "define('MEU_S3_BUCKET_NAME'" "$ACTIVE_CONFIG_FILE_EFS"; then
-        echo "INFO: Adicionando defines para S3 Hook Deleter ao wp-config.php existente..."
-        current_aws_region_for_config=$(aws configure get region 2>/dev/null || curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/[a-z]$//' || echo "us-east-1")
+    # Verifica se MEU_S3_REGION está presente E se tem um valor (não vazio)
+    if ! grep -q "define('MEU_S3_BUCKET_NAME'" "$ACTIVE_CONFIG_FILE_EFS" || \
+       ! (grep "define('MEU_S3_REGION'" "$ACTIVE_CONFIG_FILE_EFS" | grep -qv "''"); then # Garante que MEU_S3_REGION não é ''
         
-        # Usar printf para criar o bloco de forma segura e evitar problemas com expansão de variáveis dentro do sed
-        # O bloco é escrito em um arquivo temporário e depois inserido com 'r' do sed
+        echo "INFO: Adicionando/Corrigindo defines para S3 Hook Deleter ao wp-config.php existente..."
+        # Removida a obtenção de current_aws_region_for_config, usaremos AWS_S3_BUCKET_TARGET_REGION_0
+        
         TEMP_DEFINES_S3_HOOK_FILE=$(mktemp /tmp/s3_hook_defines.XXXXXX)
-        printf "\n// Defines para S3 Hook Deleter (adicionados por script)\n" >> "$TEMP_DEFINES_S3_HOOK_FILE"
+        printf "\n// Defines para S3 Hook Deleter (adicionados/atualizados por script v2.3.6)\n" >> "$TEMP_DEFINES_S3_HOOK_FILE"
         printf "if (!defined('MEU_S3_BUCKET_NAME')) { define('MEU_S3_BUCKET_NAME', '%s'); }\n" "${AWS_S3_BUCKET_TARGET_NAME_0}" >> "$TEMP_DEFINES_S3_HOOK_FILE"
-        printf "if (!defined('MEU_S3_REGION')) { define('MEU_S3_REGION', '%s'); }\n" "${current_aws_region_for_config}" >> "$TEMP_DEFINES_S3_HOOK_FILE"
+        # Garante que MEU_S3_REGION seja definido com o valor correto se estiver ausente ou vazio
+        printf "if (!defined('MEU_S3_REGION') || !MEU_S3_REGION) { if (defined('MEU_S3_REGION')) { /* Remove old empty define if needed - advanced sed required */ } define('MEU_S3_REGION', '%s'); }\n" "${AWS_S3_BUCKET_TARGET_REGION_0}" >> "$TEMP_DEFINES_S3_HOOK_FILE"
         printf "if (!defined('MEU_S3_BASE_PATH_IN_BUCKET')) { define('MEU_S3_BASE_PATH_IN_BUCKET', 'wp-content/uploads/'); }\n" >> "$TEMP_DEFINES_S3_HOOK_FILE"
+
+        # Remover define antigo de MEU_S3_REGION se existir e estiver vazio
+        sudo sed -i "/define('MEU_S3_REGION', '');/d" "$ACTIVE_CONFIG_FILE_EFS"
+        sudo sed -i "/define('MEU_S3_REGION', \\s*'');/d" "$ACTIVE_CONFIG_FILE_EFS" # Com espaços
 
         sudo sed -i "/${MARKER_LINE_SED_PATTERN}/r ${TEMP_DEFINES_S3_HOOK_FILE}" "$ACTIVE_CONFIG_FILE_EFS"
         rm -f "$TEMP_DEFINES_S3_HOOK_FILE"
-        echo "INFO: Defines do S3 Hook adicionados ao wp-config.php existente."
+        echo "INFO: Defines do S3 Hook adicionados/corrigidos no wp-config.php existente."
     else
-        echo "INFO: Defines do S3 Hook já parecem existir no wp-config.php."
+        echo "INFO: Defines do S3 Hook já parecem existir e MEU_S3_REGION tem valor no wp-config.php."
     fi
 fi
 
 echo "INFO: Criando health check '$HEALTH_CHECK_FILE_PATH_EFS'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.5 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.6 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>" # VERSÃO ATUALIZADA
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php); sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"; echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
 if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then echo "INFO: Health check criado."; else echo "ERRO: Falha criar health check."; fi; rm -f "$TEMP_HEALTH_CHECK_FILE"
 
@@ -557,7 +548,7 @@ if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE
 echo "INFO: Permissões ajustadas (tentativa)."
 
 echo "INFO: Configurando Apache..."
-HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.5.conf" # Atualizar versão do conf
+HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.6.conf" # VERSÃO ATUALIZADA do conf
 if [ ! -f "$HTTPD_WP_CONF" ]; then 
     echo "INFO: Criando $HTTPD_WP_CONF"; 
     sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF_APACHE_CONF
@@ -576,10 +567,8 @@ else
 fi
 echo "INFO: Configuração Apache em $HTTPD_WP_CONF verificada/criada."
 
-# --- Detecção e Inicialização de PHP-FPM e HTTPD ---
 PHP_FPM_SERVICE_NAME=""
 POSSIBLE_FPM_NAMES=("php-fpm.service" "php7.4-fpm.service" "php74-php-fpm.service") 
-
 echo "INFO: Detectando nome do serviço PHP-FPM..."
 for fpm_name in "${POSSIBLE_FPM_NAMES[@]}"; do
     if sudo systemctl list-unit-files | grep -q -w "$fpm_name"; then
@@ -588,39 +577,16 @@ for fpm_name in "${POSSIBLE_FPM_NAMES[@]}"; do
         break
     fi
 done
-
-if [ -z "$PHP_FPM_SERVICE_NAME" ]; then
-    echo "ERRO CRÍTICO: Não foi possível detectar o nome do serviço PHP-FPM instalado."
-    exit 1
-fi
+if [ -z "$PHP_FPM_SERVICE_NAME" ]; then echo "ERRO CRÍTICO: Não foi possível detectar o nome do serviço PHP-FPM instalado."; exit 1; fi
 
 echo "INFO: Habilitando e reiniciando httpd e $PHP_FPM_SERVICE_NAME..."
 sudo systemctl enable httpd "$PHP_FPM_SERVICE_NAME" 
-
 php_fpm_restarted_successfully=false
-if sudo systemctl restart "$PHP_FPM_SERVICE_NAME"; then
-    echo "INFO: $PHP_FPM_SERVICE_NAME reiniciado com sucesso."
-    php_fpm_restarted_successfully=true
-else
-    echo "ERRO: Falha ao reiniciar $PHP_FPM_SERVICE_NAME."
-    sudo systemctl status "$PHP_FPM_SERVICE_NAME" -l --no-pager
-    sudo journalctl -u "$PHP_FPM_SERVICE_NAME" -n 50 --no-pager
-fi
-
+if sudo systemctl restart "$PHP_FPM_SERVICE_NAME"; then echo "INFO: $PHP_FPM_SERVICE_NAME reiniciado com sucesso."; php_fpm_restarted_successfully=true; else echo "ERRO: Falha ao reiniciar $PHP_FPM_SERVICE_NAME."; sudo systemctl status "$PHP_FPM_SERVICE_NAME" -l --no-pager; sudo journalctl -u "$PHP_FPM_SERVICE_NAME" -n 50 --no-pager; fi
 httpd_restarted_successfully=false
-if sudo systemctl restart httpd; then
-    echo "INFO: httpd reiniciado com sucesso."
-    httpd_restarted_successfully=true
-else
-    echo "ERRO CRÍTICO: Falha ao reiniciar httpd."
-    sudo apachectl configtest
-    sudo tail -n 50 /var/log/httpd/error_log
-fi
-
+if sudo systemctl restart httpd; then echo "INFO: httpd reiniciado com sucesso."; httpd_restarted_successfully=true; else echo "ERRO CRÍTICO: Falha ao reiniciar httpd."; sudo apachectl configtest; sudo tail -n 50 /var/log/httpd/error_log; fi
 sleep 3 
-
-if $httpd_restarted_successfully && $php_fpm_restarted_successfully && \
-   systemctl is-active --quiet httpd && systemctl is-active --quiet "$PHP_FPM_SERVICE_NAME"; then
+if $httpd_restarted_successfully && $php_fpm_restarted_successfully && systemctl is-active --quiet httpd && systemctl is-active --quiet "$PHP_FPM_SERVICE_NAME"; then
     echo "INFO: httpd e $PHP_FPM_SERVICE_NAME ativos."
 else
     echo "ERRO CRÍTICO: httpd ou $PHP_FPM_SERVICE_NAME não estão ativos após a tentativa de reinício."
@@ -629,13 +595,11 @@ else
     exit 1
 fi
 
-
-# --- Configuração do Monitoramento Python com Watchdog ---
 setup_python_monitor_script 
 create_and_enable_python_monitor_service 
 
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.3.5-php-order-fix) concluído! ($(date)) ---"
+echo "INFO: --- Script WordPress Setup (v2.3.6-s3-region-fix) concluído! ($(date)) ---" # VERSÃO ATUALIZADA
 echo "INFO: Sincronização com S3 Python Watchdog: ATIVA (Script: $PYTHON_MONITOR_SCRIPT_PATH, Serviço: $PYTHON_MONITOR_SERVICE_NAME)"
 if [ -f "$MOUNT_POINT/wp-content/mu-plugins/$S3_HOOK_DELETER_PHP_FILENAME" ]; then
     echo "INFO: Deleção de S3 via Hook WordPress PHP: INSTALADO (Script: $MOUNT_POINT/wp-content/mu-plugins/$S3_HOOK_DELETER_PHP_FILENAME)"
@@ -648,6 +612,7 @@ echo "INFO: Site: https://${WPDOMAIN}, Health Check: /healthcheck.php"
 echo "INFO: LEMBRE-SE de configurar o EFS Access Point com uid=48 e gid=48 (para o apache), se ainda não o fez."
 echo "INFO: LEMBRE-SE de colocar o script Python ($PYTHON_MONITOR_SCRIPT_NAME) no bucket S3 '$AWS_S3_BUCKET_TARGET_NAME_SCRIPT' com a chave '$AWS_S3_PYTHON_SCRIPT_KEY'."
 echo "INFO: LEMBRE-SE de colocar o script PHP ($S3_HOOK_DELETER_PHP_FILENAME) no bucket S3 '$AWS_S3_BUCKET_TARGET_NAME_SCRIPT' com a chave '$AWS_S3_HOOK_DELETER_PHP_KEY'."
-echo "INFO: LEMBRE-SE de que o AWS SDK para PHP deve estar funcional para o '$S3_HOOK_DELETER_PHP_FILENAME' deletar do S3."
+echo "INFO: LEMBRE-SE de que o AWS SDK para PHP deve estar funcional (vendor/autoload.php presente) para o '$S3_HOOK_DELETER_PHP_FILENAME' deletar do S3."
+echo "INFO: LEMBRE-SE de verificar se as variáveis de ambiente AWS_S3_BUCKET_TARGET_NAME_0 e AWS_S3_BUCKET_TARGET_REGION_0 estão corretas no UserData da EC2."
 echo "INFO: =================================================="
 exit 0
