@@ -1,6 +1,6 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.3.6-s3-region-fix (Corrige obtenção da MEU_S3_REGION e verifica var)
+# Versão: 2.3.7
 
 # --- Configurações Chave ---
 readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.6.sh" # VERSÃO ATUALIZADA
@@ -226,100 +226,6 @@ EOF_PY_SYSTEMD_SERVICE
         journalctl -u "$PYTHON_MONITOR_SERVICE_NAME" -n 50 --no-pager 
     fi
 }
-
-# Função para instalar o script PHP S3 Hook Deleter
-install_s3_hook_deleter_php() {
-    echo "INFO: Instalando o script PHP S3 Hook Deleter ($S3_HOOK_DELETER_PHP_FILENAME)..."
-    
-    local s3_bucket_for_php_hook="${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}"
-    local s3_region_for_php_hook="${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}"
-    local s3_key_for_php_hook="${AWS_S3_HOOK_DELETER_PHP_KEY:-}"
-
-    if [ -z "$s3_bucket_for_php_hook" ] || [ -z "$s3_region_for_php_hook" ] || [ -z "$s3_key_for_php_hook" ]; then
-        echo "AVISO: Variáveis para download do S3 Hook Deleter PHP não configuradas. Pulando instalação."
-        return 1
-    fi
-
-    local s3_php_hook_uri="s3://${s3_bucket_for_php_hook}/${s3_key_for_php_hook}"
-    local temp_php_hook_path="/tmp/${S3_HOOK_DELETER_PHP_FILENAME}"
-
-    echo "INFO: Baixando '$S3_HOOK_DELETER_PHP_FILENAME' de '$s3_php_hook_uri' para '$temp_php_hook_path'..."
-    sudo rm -f "$temp_php_hook_path"
-    if ! sudo aws s3 cp "$s3_php_hook_uri" "$temp_php_hook_path" --region "$s3_region_for_php_hook"; then
-        echo "AVISO: Falha ao baixar '$S3_HOOK_DELETER_PHP_FILENAME' do S3. Pulando instalação do hook."
-        return 1
-    fi
-
-    if [ ! -s "$temp_php_hook_path" ]; then
-        echo "AVISO: Script PHP S3 Hook Deleter baixado '$temp_php_hook_path' está vazio. Pulando instalação."
-        sudo rm -f "$temp_php_hook_path"
-        return 1
-    fi
-
-    local mu_plugins_dir="$MOUNT_POINT/wp-content/mu-plugins"
-    local target_php_path="$mu_plugins_dir/$S3_HOOK_DELETER_PHP_FILENAME"
-
-    echo "INFO: Criando diretório mu-plugins se não existir: $mu_plugins_dir"
-    if sudo -u "$APACHE_USER" mkdir -p "$mu_plugins_dir"; then
-        sudo chmod 775 "$mu_plugins_dir" 
-    else
-        echo "ERRO: Falha ao criar diretório mu-plugins '$mu_plugins_dir' como '$APACHE_USER'."
-        sudo rm -f "$temp_php_hook_path" 
-        return 1
-    fi
-    
-    echo "INFO: Copiando '$temp_php_hook_path' para '$target_php_path' como '$APACHE_USER'..."
-    if sudo -u "$APACHE_USER" cp "$temp_php_hook_path" "$target_php_path"; then
-        sudo chmod 664 "$target_php_path" 
-        echo "INFO: Script PHP S3 Hook Deleter instalado em '$target_php_path'."
-    else
-        echo "ERRO: Falha ao copiar o S3 Hook Deleter para '$target_php_path' como '$APACHE_USER'."
-        sudo rm -f "$temp_php_hook_path" 
-        return 1
-    fi
-    sudo rm -f "$temp_php_hook_path" 
-
-    if command -v composer &>/dev/null; then
-        echo "INFO: Verificando e instalando AWS SDK para PHP via Composer em '$MOUNT_POINT'..."
-        local efs_owner_home
-        efs_owner_home=$(eval echo "~$EFS_OWNER_USER")
-
-        if [ ! -f "$MOUNT_POINT/composer.json" ]; then
-            echo "INFO: composer.json não encontrado. Criando um básico."
-            if ! sudo -u "$EFS_OWNER_USER" HOME="$efs_owner_home" bash -c "cd '$MOUNT_POINT' && composer init --no-interaction --name=wordpress/site --type=project --require=aws/aws-sdk-php:^3.0"; then
-                 echo "AVISO: Falha ao inicializar composer.json. Verifique permissões em $MOUNT_POINT para o usuário $EFS_OWNER_USER."
-            fi
-        fi
-
-        if grep -q "aws/aws-sdk-php" "$MOUNT_POINT/composer.json"; then
-            echo "INFO: AWS SDK para PHP já está no composer.json."
-        else
-            echo "INFO: Adicionando aws/aws-sdk-php ao composer.json..."
-            if ! sudo -u "$EFS_OWNER_USER" HOME="$efs_owner_home" bash -c "cd '$MOUNT_POINT' && composer require aws/aws-sdk-php:^3.0"; then
-                echo "AVISO: Falha ao executar 'composer require aws/aws-sdk-php'. Verifique permissões e logs do composer."
-            fi
-        fi
-        
-        echo "INFO: Executando 'composer install'..."
-        # Adicionar --ignore-platform-reqs pode ajudar em alguns casos, mas idealmente o ambiente deve ser compatível
-        if sudo -u "$EFS_OWNER_USER" HOME="$efs_owner_home" bash -c "cd '$MOUNT_POINT' && composer install --no-dev --optimize-autoloader"; then
-            echo "INFO: 'composer install' concluído. Verifique o diretório '$MOUNT_POINT/vendor'."
-            if [ -d "$MOUNT_POINT/vendor" ]; then
-                sudo chown -R "$EFS_OWNER_USER":"$APACHE_USER" "$MOUNT_POINT/vendor" 
-                sudo find "$MOUNT_POINT/vendor" -type d -exec chmod 775 {} \; 
-                sudo find "$MOUNT_POINT/vendor" -type f -exec chmod 664 {} \; 
-                echo "INFO: Permissões do diretório vendor ajustadas."
-            else
-                echo "AVISO: Diretório '$MOUNT_POINT/vendor' não encontrado após 'composer install'. O S3 Hook Deleter não funcionará."
-            fi
-        else
-            echo "AVISO CRÍTICO: Falha ao executar 'composer install'. O S3 Hook Deleter não funcionará. Verifique logs do composer e recursos da instância (memória)."
-        fi
-    else
-        echo "AVISO CRÍTICO: Composer não encontrado. AWS SDK para PHP precisa ser instalado manualmente para o S3 Hook Deleter funcionar."
-    fi
-}
-
 
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
