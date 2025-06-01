@@ -5,24 +5,29 @@ import os
 import fnmatch
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import shutil # Para shutil.which
-import boto3 # Para interagir com S3 e CloudFront via API
+import shutil  # Para shutil.which
+import boto3
+import threading # Para o temporizador de debounce da invalidação
 
 # --- Configuration (Read from environment variables passed by systemd service) ---
 MONITOR_DIR_BASE = os.environ.get('WP_MONITOR_DIR_BASE', '/var/www/html')
 S3_BUCKET = os.environ.get('WP_S3_BUCKET')
 RELEVANT_PATTERNS_STR = os.environ.get('WP_RELEVANT_PATTERNS', '')
 LOG_FILE_MONITOR = os.environ.get(
-    'WP_PY_MONITOR_LOG_FILE', '/var/log/wp_efs_s3_py_monitor_default.log')
+    'WP_PY_MONITOR_LOG_FILE', '/var/log/wp_efs_s3_py_monitor_default.log') # O Bash script deve usar um nome de log versionado
 S3_TRANSFER_LOG = os.environ.get(
-    'WP_PY_S3_TRANSFER_LOG', '/var/log/wp_s3_py_transferred_default.log')
+    'WP_PY_S3_TRANSFER_LOG', '/var/log/wp_s3_py_transferred_default.log') # O Bash script deve usar um nome de log versionado
 SYNC_DEBOUNCE_SECONDS = int(os.environ.get('WP_SYNC_DEBOUNCE_SECONDS', '5'))
-AWS_CLI_PATH = os.environ.get('WP_AWS_CLI_PATH', 'aws')
+AWS_CLI_PATH = os.environ.get('WP_AWS_CLI_PATH', 'aws') # Definido pelo Bash Script
 
 # Novas configurações para controle fino
 DELETE_FROM_EFS_AFTER_SYNC = os.environ.get('WP_DELETE_FROM_EFS_AFTER_SYNC', 'false').lower() == 'true'
 PERFORM_INITIAL_SYNC = os.environ.get('WP_PERFORM_INITIAL_SYNC', 'true').lower() == 'true'
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get('AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0')
+
+# Novas Configurações para Invalidação em Lote
+CF_INVALIDATION_BATCH_MAX_SIZE = int(os.environ.get('CF_INVALIDATION_BATCH_MAX_SIZE', 15))
+CF_INVALIDATION_BATCH_TIMEOUT_SECONDS = int(os.environ.get('CF_INVALIDATION_BATCH_TIMEOUT_SECONDS', 20))
 
 # Lista de extensões de IMAGEM que podem ser deletadas do EFS se DELETE_FROM_EFS_AFTER_SYNC=true
 DELETABLE_IMAGE_EXTENSIONS_FROM_EFS = [
@@ -32,6 +37,11 @@ DELETABLE_IMAGE_EXTENSIONS_FROM_EFS = [
 RELEVANT_PATTERNS = [p.strip()
                      for p in RELEVANT_PATTERNS_STR.split(';') if p.strip()]
 last_sync_file_map = {}
+
+# Variáveis Globais para Invalidação em Lote
+cf_invalidation_paths_batch = []
+cf_invalidation_timer = None
+cf_invalidation_lock = threading.Lock()
 
 # --- Logger Setup ---
 def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(name)s - %(levelname)s - %(message)s'):
@@ -75,11 +85,6 @@ def is_path_relevant(path_to_check, base_dir, patterns):
 class Watcher(FileSystemEventHandler):
     def __init__(self):
         super().__init__()
-        # Inicializar clientes boto3 uma vez para reutilização, se apropriado.
-        # Ou instanciá-los dentro dos métodos se a configuração/região puder mudar
-        # ou se o script for muito curto e não houver benefício de mantê-los.
-        # Para simplicidade aqui, vamos instanciar nos métodos.
-        pass
 
     def _is_excluded(self, filepath):
         filename = os.path.basename(filepath)
@@ -95,50 +100,74 @@ class Watcher(FileSystemEventHandler):
     def _get_s3_path(self, relative_file_path):
         return f"s3://{S3_BUCKET}/{relative_file_path}"
 
-    def _check_s3_object_exists(self, s3_key):
-        """Verifica se um objeto existe no S3."""
-        s3_client_boto = boto3.client('s3')
-        try:
-            s3_client_boto.head_object(Bucket=S3_BUCKET, Key=s3_key)
-            monitor_logger.debug(f"S3 object '{s3_key}' found using head_object.")
-            return True
-        except s3_client_boto.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == '404' or e.response['Error']['Code'] == 'NoSuchKey':
-                monitor_logger.debug(f"S3 object '{s3_key}' not found (404/NoSuchKey).")
-                return False
-            else:
-                monitor_logger.error(f"ClientError checking S3 object '{s3_key}' with head_object: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
-                return False # Assumir que não existe em caso de outros erros para evitar invalidações indevidas
-        except Exception as e:
-            monitor_logger.error(f"Unexpected error checking S3 object '{s3_key}' with head_object: {e}", exc_info=True)
-            return False # Assumir que não existe
+    def _trigger_batched_cloudfront_invalidation(self):
+        global cf_invalidation_paths_batch, cf_invalidation_timer
 
-    def _invalidate_cloudfront(self, object_key_to_invalidate):
-        """Cria uma invalidação no CloudFront para o objeto especificado."""
-        if not CLOUDFRONT_DISTRIBUTION_ID:
-            monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set in environment. Skipping CloudFront invalidation.")
-            return
+        with cf_invalidation_lock:
+            if not cf_invalidation_paths_batch:
+                monitor_logger.debug("Batched CloudFront invalidation triggered, but batch is empty.")
+                if cf_invalidation_timer:
+                    cf_invalidation_timer.cancel()
+                    cf_invalidation_timer = None
+                return
 
+            if not CLOUDFRONT_DISTRIBUTION_ID:
+                monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set. Skipping batched CloudFront invalidation.")
+                cf_invalidation_paths_batch = []
+                if cf_invalidation_timer:
+                    cf_invalidation_timer.cancel()
+                    cf_invalidation_timer = None
+                return
+
+            paths_to_invalidate_now = ["/" + p for p in cf_invalidation_paths_batch]
+            current_batch_to_log = list(cf_invalidation_paths_batch) # Copia para logging antes de limpar
+            cf_invalidation_paths_batch = [] # Limpa o lote ANTES da chamada de API
+            if cf_invalidation_timer:
+                cf_invalidation_timer.cancel()
+                cf_invalidation_timer = None
+            monitor_logger.debug("CloudFront invalidation batch and timer reset before API call.")
+
+        # A chamada da API CloudFront é feita FORA do lock
+        monitor_logger.info(f"Triggering batched CloudFront invalidation for {len(paths_to_invalidate_now)} paths on {CLOUDFRONT_DISTRIBUTION_ID}: {paths_to_invalidate_now}")
         cloudfront_client_boto = boto3.client('cloudfront')
-        path_to_invalidate = '/' + object_key_to_invalidate
-        
-        monitor_logger.info(f"Attempting CloudFront invalidation for path: {path_to_invalidate} on distribution: {CLOUDFRONT_DISTRIBUTION_ID}")
         try:
             cloudfront_client_boto.create_invalidation(
                 DistributionId=CLOUDFRONT_DISTRIBUTION_ID,
                 InvalidationBatch={
                     'Paths': {
-                        'Quantity': 1,
-                        'Items': [path_to_invalidate]
+                        'Quantity': len(paths_to_invalidate_now),
+                        'Items': paths_to_invalidate_now
                     },
-                    'CallerReference': f"s3-efs-sync-{object_key_to_invalidate.replace('/', '-')}-{int(time.time())}"
+                    'CallerReference': f"s3-efs-sync-batch-{int(time.time())}-{len(paths_to_invalidate_now)}"
                 }
             )
-            monitor_logger.info(f"CloudFront invalidation request created for: {path_to_invalidate}")
-            transfer_logger.info(f"INVALIDATED_CF: {path_to_invalidate} on {CLOUDFRONT_DISTRIBUTION_ID}")
+            monitor_logger.info(f"Batched CloudFront invalidation request created for {len(paths_to_invalidate_now)} paths.")
+            transfer_logger.info(f"INVALIDATED_CF_BATCH: {len(paths_to_invalidate_now)} paths on {CLOUDFRONT_DISTRIBUTION_ID} - Paths: {', '.join(current_batch_to_log)}")
         except Exception as e:
-            monitor_logger.error(f"Failed to create CloudFront invalidation for {path_to_invalidate}: {e}", exc_info=True)
-            transfer_logger.info(f"INVALIDATION_CF_FAILED: {path_to_invalidate} - {str(e)}")
+            monitor_logger.error(f"Failed to create batched CloudFront invalidation for paths {current_batch_to_log}: {e}", exc_info=True)
+            transfer_logger.info(f"INVALIDATION_CF_BATCH_FAILED: {len(paths_to_invalidate_now)} paths - {str(e)}")
+
+
+    def _add_to_cf_invalidation_batch(self, object_key_to_invalidate):
+        global cf_invalidation_paths_batch, cf_invalidation_timer
+
+        with cf_invalidation_lock:
+            if object_key_to_invalidate not in cf_invalidation_paths_batch:
+                cf_invalidation_paths_batch.append(object_key_to_invalidate)
+                monitor_logger.info(f"Added '{object_key_to_invalidate}' to CloudFront invalidation batch. Batch size: {len(cf_invalidation_paths_batch)}")
+
+            if cf_invalidation_timer:
+                cf_invalidation_timer.cancel()
+                monitor_logger.debug("Cancelled existing CloudFront invalidation timer.")
+
+            if len(cf_invalidation_paths_batch) >= CF_INVALIDATION_BATCH_MAX_SIZE:
+                monitor_logger.info(f"CloudFront invalidation batch reached max size ({CF_INVALIDATION_BATCH_MAX_SIZE}). Triggering invalidation now.")
+                self._trigger_batched_cloudfront_invalidation()
+            else:
+                cf_invalidation_timer = threading.Timer(CF_INVALIDATION_BATCH_TIMEOUT_SECONDS, self._trigger_batched_cloudfront_invalidation)
+                cf_invalidation_timer.daemon = True
+                cf_invalidation_timer.start()
+                monitor_logger.debug(f"CloudFront invalidation timer (re)started for {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s. Batch size: {len(cf_invalidation_paths_batch)}")
 
     def _handle_s3_upload(self, local_path, relative_file_path, is_initial_sync=False):
         effective_delete_from_efs = DELETE_FROM_EFS_AFTER_SYNC and not is_initial_sync
@@ -146,16 +175,8 @@ class Watcher(FileSystemEventHandler):
         current_time = time.time()
         if not is_initial_sync and local_path in last_sync_file_map and \
            (current_time - last_sync_file_map[local_path] < SYNC_DEBOUNCE_SECONDS):
-            monitor_logger.info(f"Debounce for '{local_path}'. Skipped.")
+            monitor_logger.info(f"Debounce for '{local_path}'. Skipped upload and subsequent actions.")
             return
-
-        object_existed_before_upload = False
-        if not is_initial_sync: # Apenas para eventos do watcher
-            object_existed_before_upload = self._check_s3_object_exists(relative_file_path)
-            if object_existed_before_upload:
-                monitor_logger.info(f"Object '{relative_file_path}' already exists in S3. This will be an update, triggering CloudFront invalidation if configured.")
-            else:
-                monitor_logger.info(f"Object '{relative_file_path}' does not exist in S3. This will be a new creation. No CloudFront invalidation for new objects.")
 
         s3_full_uri = self._get_s3_path(relative_file_path)
         monitor_logger.info(f"Copying '{local_path}' to '{s3_full_uri}'...")
@@ -172,8 +193,11 @@ class Watcher(FileSystemEventHandler):
                 transfer_logger.info(f"TRANSFERRED: {relative_file_path} to {s3_full_uri}")
                 last_sync_file_map[local_path] = current_time
 
-                if not is_initial_sync and object_existed_before_upload:
-                    self._invalidate_cloudfront(relative_file_path)
+                # --- LÓGICA DE INVALIDAÇÃO DO CLOUDFRONT (Opção 1 Modificada) ---
+                # Invalida para QUALQUER upload bem-sucedido que NÃO seja parte da sincronização inicial.
+                if not is_initial_sync:
+                    monitor_logger.info(f"Adding '{relative_file_path}' to CloudFront invalidation batch due to EFS event (create/update).")
+                    self._add_to_cf_invalidation_batch(relative_file_path)
                 
                 if effective_delete_from_efs:
                     _, ext = os.path.splitext(local_path)
@@ -206,7 +230,7 @@ class Watcher(FileSystemEventHandler):
 
         try:
             process = subprocess.run(
-                [AWS_CLI_PATH, 's3', 'rm', s3_full_uri], # Removido --only-show-errors para debug
+                [AWS_CLI_PATH, 's3', 'rm', s3_full_uri], # Removido --only-show-errors para debug potencial
                 capture_output=True, text=True, check=False
             )
             cli_rc = process.returncode
@@ -214,21 +238,19 @@ class Watcher(FileSystemEventHandler):
 
             if cli_rc == 0:
                 monitor_logger.info(f"AWS CLI 's3 rm' for '{relative_file_path}' reported success (RC: 0).")
-                if cli_stderr: monitor_logger.info(f"CLI Stderr (RC 0): {cli_stderr}") # Logar stderr mesmo em sucesso
+                if cli_stderr: monitor_logger.info(f"CLI Stderr (RC 0): {cli_stderr}")
                 transfer_logger.info(f"DELETED_S3_CLI_OK: {relative_file_path}")
                 cli_delete_reported_success = True
             else:
                 monitor_logger.error(
                     f"AWS CLI 's3 rm' FAILED for '{relative_file_path}'. RC: {cli_rc}. Stderr: {cli_stderr}")
                 transfer_logger.info(f"DELETED_S3_CLI_FAILED: {relative_file_path} - RC={cli_rc} ERR={cli_stderr}")
-
         except FileNotFoundError:
              monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 delete for '{relative_file_path}' failed at CLI stage.")
              return
         except Exception as e:
             monitor_logger.error(f"Exception during AWS CLI 's3 rm' for {relative_file_path}: {e}", exc_info=True)
-            # Mesmo com exceção no CLI, vamos tentar verificar com head_object, pois o estado pode ser incerto
-            pass # Continua para a verificação
+            pass # Tenta a verificação mesmo assim
 
         monitor_logger.info(f"Verifying deletion of '{s3_target_path_key}' in S3 using Boto3 head_object...")
         try:
@@ -238,14 +260,16 @@ class Watcher(FileSystemEventHandler):
                 f"S3 delete VERIFICATION FAILED for '{relative_file_path}'. Object still found in S3 after 'aws s3 rm' (CLI RC: {cli_rc}). Review IAM permissions and bucket policies.")
             if cli_stderr: monitor_logger.error(f"CLI Stderr was: {cli_stderr}")
             transfer_logger.info(f"DELETED_S3_VERIFICATION_FAILED_STILL_EXISTS: {relative_file_path}")
-
         except s3_client_boto.exceptions.ClientError as e:
             if e.response['Error']['Code'] == '404' or e.response['Error']['Code'] == 'NoSuchKey':
                 monitor_logger.info(f"S3 delete VERIFIED for '{relative_file_path}'. Object no longer found in S3 (confirmed by head_object). CLI RC: {cli_rc}.")
                 if cli_stderr and not cli_delete_reported_success: monitor_logger.info(f"CLI Stderr was (file now gone): {cli_stderr}")
                 transfer_logger.info(f"DELETED_S3_VERIFIED_NOT_FOUND: {relative_file_path}")
-                 # Se a verificação Boto3 confirma a deleção, invalidar CloudFront
-                self._invalidate_cloudfront(relative_file_path)
+                # --- LÓGICA DE INVALIDAÇÃO DO CLOUDFRONT (Opção 1 Modificada) ---
+                # Invalida para QUALQUER deleção bem-sucedida (confirmada) que NÃO seja parte da sincronização inicial.
+                # Como _handle_s3_delete só é chamado por eventos do watcher, não precisamos checar is_initial_sync.
+                monitor_logger.info(f"Adding '{relative_file_path}' to CloudFront invalidation batch due to S3 delete confirmation.")
+                self._add_to_cf_invalidation_batch(relative_file_path)
             else:
                 monitor_logger.error(
                     f"Error during S3 delete VERIFICATION for '{relative_file_path}' using head_object: {e.response['Error']['Code']} - {e.response['Error']['Message']}. CLI RC: {cli_rc}.")
@@ -255,41 +279,34 @@ class Watcher(FileSystemEventHandler):
             monitor_logger.error(f"Unexpected error during S3 delete VERIFICATION for '{s3_target_path_key}': {ve}", exc_info=True)
             transfer_logger.info(f"DELETED_S3_VERIFICATION_UNEXPECTED_ERROR: {relative_file_path}")
 
-
     def process_event_for_sync(self, event_type, path):
         if self._is_excluded(path) or (os.path.exists(path) and os.path.isdir(path)):
             return
-
         relevant, relative_path = is_path_relevant(path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
         if not relevant or not relative_path:
             return
-
         monitor_logger.info(f"Event: {event_type.upper()} for relevant file '{relative_path}' (full: {path})")
-
         if event_type in ['created', 'modified', 'moved_to']:
             self._handle_s3_upload(path, relative_path)
         elif event_type == 'deleted':
-            self._handle_s3_delete(relative_path) # A invalidação CF para deleção acontece dentro de _handle_s3_delete após confirmação
+            self._handle_s3_delete(relative_path)
 
     def on_created(self, event):
         if not event.is_directory:
             self.process_event_for_sync('created', event.src_path)
-
     def on_modified(self, event):
         if not event.is_directory:
             self.process_event_for_sync('modified', event.src_path)
-
     def on_deleted(self, event):
         if not event.is_directory:
             self.process_event_for_sync('deleted', event.src_path)
-
     def on_moved(self, event):
         if not event.is_directory:
             relevant_src, relative_src_path = is_path_relevant(event.src_path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
             if relevant_src and relative_src_path and not self._is_excluded(event.src_path):
                 monitor_logger.info(f"Event: MOVED (source part) for relevant file '{relative_src_path}' (full: {event.src_path})")
-                self._handle_s3_delete(relative_src_path) # A invalidação CF para deleção acontece aqui dentro
-            self.process_event_for_sync('moved_to', event.dest_path) # O _handle_s3_upload lida com invalidação para updates
+                self._handle_s3_delete(relative_src_path) # A deleção do S3 (e subsequente invalidação CF) é tratada aqui
+            self.process_event_for_sync('moved_to', event.dest_path) # O upload (e subsequente invalidação CF) é tratado aqui
 
 # --- Initial Sync Function using 'aws s3 sync' ---
 def run_s3_sync_command(command_parts, description):
@@ -370,12 +387,11 @@ def perform_initial_sync():
         run_s3_sync_command(s3_sync_wp_includes_cmd, "wp-includes")
     else:
         monitor_logger.warning(f"Directory '{wp_includes_path}' not found. Skipping sync for wp-includes.")
-
     monitor_logger.info("--- Initial S3 Sync using 'aws s3 sync' commands Attempted ---")
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    script_version_tag = "vLocalDev-CF-Invalidation" # Mude conforme necessário
+    script_version_tag = "vLocalDev-CF-BatchInvalidation-Opt1Mod-Final" # Atualize para rastreamento
     monitor_logger.info(
         f"Python Watchdog Monitor (EFS to S3 Sync - {script_version_tag}) starting for '{MONITOR_DIR_BASE}'.")
     monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
@@ -385,7 +401,8 @@ if __name__ == "__main__":
     monitor_logger.info(f"Image extensions to delete from EFS: {DELETABLE_IMAGE_EXTENSIONS_FROM_EFS if DELETE_FROM_EFS_AFTER_SYNC else 'N/A'}")
     monitor_logger.info(f"Perform initial sync using 'aws s3 sync': {PERFORM_INITIAL_SYNC}")
     monitor_logger.info(f"CloudFront Distribution ID for Invalidation: {CLOUDFRONT_DISTRIBUTION_ID if CLOUDFRONT_DISTRIBUTION_ID else 'Not Set'}")
-
+    monitor_logger.info(f"CloudFront Invalidation Batch Max Size: {CF_INVALIDATION_BATCH_MAX_SIZE}")
+    monitor_logger.info(f"CloudFront Invalidation Batch Timeout (s): {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}")
 
     if not S3_BUCKET:
         monitor_logger.critical("S3_BUCKET environment variable not set. Exiting.")
@@ -404,6 +421,19 @@ if __name__ == "__main__":
         AWS_CLI_PATH = aws_cli_actual_path
         monitor_logger.info(f"Using AWS CLI at: {AWS_CLI_PATH}")
 
+    # Verifica se o Boto3 está disponível, essencial para invalidação e head_object
+    try:
+        import boto3
+        boto3.client('s3') # Tenta criar um cliente para ver se o import funcionou e as creds/config estão ok
+        monitor_logger.info("Boto3 library and S3 client initialized successfully.")
+    except ImportError:
+        monitor_logger.critical("Boto3 library not found. Please install it (e.g., 'sudo pip3 install boto3'). Exiting.")
+        exit(1)
+    except Exception as e:
+        monitor_logger.critical(f"Failed to initialize Boto3 S3 client. Check AWS credentials/configuration: {e}", exc_info=True)
+        exit(1)
+
+
     if PERFORM_INITIAL_SYNC:
         monitor_logger.info("WP_PERFORM_INITIAL_SYNC is true. Calling perform_initial_sync().")
         perform_initial_sync()
@@ -411,11 +441,11 @@ if __name__ == "__main__":
     else:
         monitor_logger.info("WP_PERFORM_INITIAL_SYNC is false. Skipping initial sync.")
     
-    if not RELEVANT_PATTERNS_STR and PERFORM_INITIAL_SYNC: # Ajuste da lógica de aviso
-        monitor_logger.warning("RELEVANT_PATTERNS_STR is empty. Watchdog will not process new file events unless patterns are added.")
-    elif not RELEVANT_PATTERNS_STR and not PERFORM_INITIAL_SYNC: # Condição crítica
-         monitor_logger.critical("RELEVANT_PATTERNS_STR is empty and PERFORM_INITIAL_SYNC is false. Script will do nothing. Exiting.")
-         exit(1) # Sai se não há nada para o script fazer
+    if not RELEVANT_PATTERNS_STR and PERFORM_INITIAL_SYNC: # Se só faz sync inicial, avisa que o watcher não fará nada
+        monitor_logger.warning("RELEVANT_PATTERNS_STR is empty. Watchdog will not process new file events for upload unless patterns are added.")
+    elif not RELEVANT_PATTERNS_STR and not PERFORM_INITIAL_SYNC: # Se nenhuma das duas, não faz nada
+         monitor_logger.critical("RELEVANT_PATTERNS_STR is empty and PERFORM_INITIAL_SYNC is false. Script will do nothing for EFS file changes. Exiting.")
+         exit(1)
 
     event_handler = Watcher()
     observer = Observer()
@@ -424,12 +454,23 @@ if __name__ == "__main__":
         observer.start()
         monitor_logger.info("Observer started. Monitoring for file changes based on RELEVANT_PATTERNS...")
         while observer.is_alive():
-            observer.join(1)
+            observer.join(1) # Espera 1 segundo, ou até o observer parar
     except KeyboardInterrupt:
         monitor_logger.info("Keyboard interrupt received. Stopping observer...")
+        if cf_invalidation_timer and cf_invalidation_timer.is_alive():
+            monitor_logger.info("Attempting to trigger any pending CloudFront invalidation before exiting due to KeyboardInterrupt...")
+            with cf_invalidation_lock: # Adquire lock para modificar o timer
+                if cf_invalidation_timer and cf_invalidation_timer.is_alive(): # Checa de novo dentro do lock
+                    cf_invalidation_timer.cancel() 
+            event_handler._trigger_batched_cloudfront_invalidation() # Tenta disparar o lote pendente
     except Exception as e:
         monitor_logger.critical(f"Critical error in observer loop: {e}", exc_info=True)
     finally:
+        # Garante que o timer seja cancelado se ainda estiver vivo
+        with cf_invalidation_lock:
+            if cf_invalidation_timer and cf_invalidation_timer.is_alive():
+                monitor_logger.info("Cancelling active CloudFront invalidation timer during final shutdown.")
+                cf_invalidation_timer.cancel()
         if observer.is_alive():
             observer.stop()
         observer.join()
