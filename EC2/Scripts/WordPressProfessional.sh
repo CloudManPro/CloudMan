@@ -267,7 +267,7 @@ echo "INFO: PHP e PHP-FPM instalados."
 echo "INFO: Instalando Python3, pip e watchdog..."
 sudo yum install -y -q python3 python3-pip
 sudo pip3 install --upgrade pip # Garante que pip está atualizado
-sudo pip3 install watchdog # Instala watchdog para Python3
+sudo pip3 install watchdog boto3 # Instala watchdog para Python3 and boto3
 echo "INFO: Python3, pip e watchdog instalados."
 echo "INFO: Todos os pacotes de pré-requisitos foram processados."
 
