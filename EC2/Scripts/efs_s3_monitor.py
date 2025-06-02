@@ -25,7 +25,7 @@ except ImportError:
 # --- Configuration (Read from environment variables) ---
 # EFS Monitor
 MONITOR_DIR_BASE = os.environ.get('WP_MONITOR_DIR_BASE', '/var/www/html')
-S3_BUCKET = os.environ.get('WP_S3_BUCKET') # Usado por ambos EFS sync e RDS queue
+S3_BUCKET = os.environ.get('WP_S3_BUCKET')
 RELEVANT_PATTERNS_STR = os.environ.get('WP_RELEVANT_PATTERNS', '')
 LOG_FILE_MONITOR = os.environ.get(
     'WP_PY_MONITOR_LOG_FILE', '/var/log/wp_efs_s3_py_monitor_default.log')
@@ -44,14 +44,15 @@ CF_INVALIDATION_BATCH_TIMEOUT_SECONDS = int(os.environ.get('CF_INVALIDATION_BATC
 
 # RDS Deletion Queue
 RDS_DELETION_QUEUE_ENABLED = os.environ.get('WP_RDS_DELETION_QUEUE_ENABLED', 'true').lower() == 'true'
-RDS_SECRET_ARN_OR_NAME = os.environ.get('WP_RDS_SECRET_ARN_OR_NAME') # ARN ou nome do segredo no Secrets Manager
-# As variáveis RDS_HOST, USER, PASSWORD, DBNAME, PORT serão obtidas do Secrets Manager se RDS_SECRET_ARN_OR_NAME for fornecido
-# Caso contrário, ou como fallback/override, podem ser lidas daqui:
-RDS_HOST_ENV = os.environ.get('WP_RDS_HOST')
-RDS_USER_ENV = os.environ.get('WP_RDS_USER')
-RDS_PASSWORD_ENV = os.environ.get('WP_RDS_PASSWORD') # Não recomendado passar via env var
-RDS_DB_NAME_ENV = os.environ.get('WP_RDS_DB_NAME')
-RDS_PORT_ENV = int(os.environ.get('WP_RDS_PORT', '3306'))
+# <<< REMOVIDO: RDS_SECRET_ARN_OR_NAME >>>
+
+# Credenciais RDS serão lidas diretamente das variáveis de ambiente passadas pelo Bash/Systemd
+RDS_HOST = os.environ.get('WP_RDS_HOST')
+RDS_USER = os.environ.get('WP_RDS_USER')
+RDS_PASSWORD = os.environ.get('WP_RDS_PASSWORD') # << IMPORTANTE: Esta agora será usada
+RDS_DB_NAME = os.environ.get('WP_RDS_DB_NAME')
+RDS_PORT = int(os.environ.get('WP_RDS_PORT', '3306'))
+RDS_ENGINE = os.environ.get('WP_RDS_ENGINE', 'mysql') # Adicionado para informação, embora não usado diretamente na conexão pymysql
 
 RDS_WP_POSTS_TABLE_NAME = os.environ.get('WP_RDS_POSTS_TABLE_NAME', 'wp_posts')
 RDS_WP_POSTMETA_TABLE_NAME = os.environ.get('WP_RDS_POSTMETA_TABLE_NAME', 'wp_postmeta')
@@ -69,10 +70,11 @@ cf_invalidation_lock = threading.Lock()
 efs_deleted_by_script = set()
 efs_deletion_lock = threading.Lock()
 s3_deletion_queue_stop_event = threading.Event()
-s3_client_boto_for_deletion_queue = None # Será inicializado na thread do RDS
-rds_credentials_global = {} # Para armazenar credenciais obtidas do Secrets Manager
+s3_client_boto_for_deletion_queue = None
+# <<< REMOVIDO: rds_credentials_global >>> (usaremos as variáveis de config diretamente)
 
 # --- Logger Setup ---
+# (Função setup_logger permanece a mesma)
 def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(levelname)s - %(name)s - %(message)s'):
     log_dir = os.path.dirname(log_file)
     if log_dir and not os.path.exists(log_dir):
@@ -101,74 +103,46 @@ def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s 
 
 monitor_logger = setup_logger('PY_MONITOR', LOG_FILE_MONITOR)
 transfer_logger = setup_logger('PY_S3_TRANSFER', S3_TRANSFER_LOG, formatter_str='%(asctime)s - %(message)s')
-rds_queue_logger = setup_logger('PY_RDS_QUEUE', LOG_FILE_MONITOR) # Log para o mesmo arquivo do monitor
+rds_queue_logger = setup_logger('PY_RDS_QUEUE', LOG_FILE_MONITOR)
 
 
-# --- Secrets Manager Function ---
-def get_rds_credentials_from_secrets_manager(secret_arn_or_name):
-    global rds_credentials_global # Vamos popular o global aqui
-    if not secret_arn_or_name:
-        rds_queue_logger.info("RDS Secret ARN or Name not provided. Will attempt to use ENV vars for RDS creds.")
-        rds_credentials_global = {
-            'host': RDS_HOST_ENV, 'port': RDS_PORT_ENV, 'user': RDS_USER_ENV,
-            'password': RDS_PASSWORD_ENV, 'dbname': RDS_DB_NAME_ENV
-        }
-        if not all(rds_credentials_global.values()): # Check if all essential fallback env vars are set
-            rds_queue_logger.error("Fallback RDS ENV vars (HOST, USER, DBNAME) are not fully configured.")
-            return False
-        rds_queue_logger.info("Using RDS credentials from environment variables (password may be missing if not set).")
-        return True
-
-
-    rds_queue_logger.info(f"Attempting to retrieve RDS credentials from Secrets Manager: {secret_arn_or_name}")
-    session = boto3.session.Session()
-    client = session.client(service_name='secretsmanager')
-    try:
-        get_secret_value_response = client.get_secret_value(SecretId=secret_arn_or_name)
-        if 'SecretString' in get_secret_value_response:
-            secret_string = get_secret_value_response['SecretString']
-            secret_data = json.loads(secret_string)
-            rds_credentials_global = {
-                'host': secret_data.get('host', RDS_HOST_ENV), # Fallback to ENV if not in secret
-                'port': int(secret_data.get('port', RDS_PORT_ENV)),
-                'user': secret_data.get('username', RDS_USER_ENV),
-                'password': secret_data.get('password'), # Password MUST come from secret
-                'dbname': secret_data.get('dbname', RDS_DB_NAME_ENV)
-            }
-            if not rds_credentials_global.get('password'):
-                rds_queue_logger.error(f"Password not found in secret '{secret_arn_or_name}'.")
-                return False
-            rds_queue_logger.info(f"Successfully retrieved and parsed RDS credentials from secret '{secret_arn_or_name}'.")
-            return True
-        else:
-            rds_queue_logger.error(f"SecretString not found in response for '{secret_arn_or_name}'.")
-            return False
-    except Exception as e:
-        rds_queue_logger.error(f"Error retrieving secret '{secret_arn_or_name}': {e}", exc_info=True)
-        return False
+# <<< REMOVIDA: Função get_rds_credentials_from_secrets_manager >>>
 
 # --- RDS Deletion Queue Functions ---
 def get_rds_connection():
-    if not rds_credentials_global or not all([rds_credentials_global.get(k) for k in ['host', 'user', 'password', 'dbname']]):
-        rds_queue_logger.error("RDS connection details are not fully configured (check Secrets Manager or ENV vars).")
+    # Verifica se as variáveis de ambiente essenciais foram carregadas
+    if not all([RDS_HOST, RDS_USER, RDS_PASSWORD, RDS_DB_NAME]):
+        rds_queue_logger.error("RDS connection details (HOST, USER, PASSWORD, DBNAME) from ENV are not fully configured.")
         return None
     try:
         conn = pymysql.connect(
-            host=rds_credentials_global['host'],
-            user=rds_credentials_global['user'],
-            password=rds_credentials_global['password'],
-            database=rds_credentials_global['dbname'],
-            port=rds_credentials_global['port'],
+            host=RDS_HOST,
+            user=RDS_USER,
+            password=RDS_PASSWORD,
+            database=RDS_DB_NAME,
+            port=RDS_PORT,
             cursorclass=pymysql.cursors.DictCursor,
             connect_timeout=10,
             charset='utf8mb4'
         )
-        rds_queue_logger.debug(f"Successfully connected to RDS: {rds_credentials_global['host']}/{rds_credentials_global['dbname']}")
+        rds_queue_logger.debug(f"Successfully connected to RDS: {RDS_HOST}/{RDS_DB_NAME}")
         return conn
     except pymysql.Error as e:
-        rds_queue_logger.error(f"Error connecting to RDS: {e}")
+        rds_queue_logger.error(f"Error connecting to RDS using ENV credentials: {e}")
         return None
 
+# Funções ensure_deletion_queue_table_exists, ensure_s3_deletion_trigger_exists,
+# get_pending_s3_deletions, update_queue_item_status, parse_s3_keys_from_data,
+# delete_s3_objects_from_queue_item, process_s3_deletion_queue
+# PERMANECEM IGUAIS à versão v2.5.0-SecretsManager-Full, pois elas já
+# utilizam a conexão `conn` que será estabelecida pela `get_rds_connection` acima.
+
+# (Cole aqui as funções que permanecem iguais da versão anterior:
+# ensure_deletion_queue_table_exists, ensure_s3_deletion_trigger_exists,
+# get_pending_s3_deletions, update_queue_item_status, parse_s3_keys_from_data,
+# delete_s3_objects_from_queue_item, process_s3_deletion_queue)
+# ... (para economizar espaço, vou omiti-las, mas elas devem estar aqui) ...
+# --- Copiando as funções inalteradas ---
 def ensure_deletion_queue_table_exists(conn):
     if not conn: return False
     try:
@@ -197,7 +171,7 @@ def ensure_deletion_queue_table_exists(conn):
 
 def ensure_s3_deletion_trigger_exists(conn):
     if not conn: return False
-    trigger_name = 'after_attachment_delete_enqueue_s3_v1'
+    trigger_name = 'after_attachment_delete_enqueue_s3_v1' # Mantendo o mesmo nome de trigger
     rds_queue_logger.info(f"Ensuring RDS trigger '{trigger_name}' exists...")
     try:
         with conn.cursor() as cursor:
@@ -207,7 +181,6 @@ def ensure_s3_deletion_trigger_exists(conn):
                 return True
 
             rds_queue_logger.info(f"Trigger '{trigger_name}' not found. Attempting to create...")
-            # User needs TRIGGER permission on the database
             sql_create_trigger = f"""
             CREATE TRIGGER `{trigger_name}`
             AFTER DELETE ON `{RDS_WP_POSTS_TABLE_NAME}`
@@ -240,7 +213,6 @@ def ensure_s3_deletion_trigger_exists(conn):
         return False
 
 def get_pending_s3_deletions(conn, batch_size):
-    # (Identical to previous version)
     if not conn: return []
     try:
         with conn.cursor() as cursor:
@@ -252,9 +224,7 @@ def get_pending_s3_deletions(conn, batch_size):
         rds_queue_logger.error(f"Error fetching pending S3 deletions: {e}")
         return []
 
-
 def update_queue_item_status(conn, item_id, status, error_msg=None):
-    # (Identical to previous version)
     if not conn: return False
     try:
         with conn.cursor() as cursor:
@@ -269,7 +239,6 @@ def update_queue_item_status(conn, item_id, status, error_msg=None):
         return False
 
 def parse_s3_keys_from_data(metadata_snapshot_str, s3_keys_json_str, post_id):
-    # (Identical to previous version, including S3_BASE_PATH_FOR_DELETION_QUEUE)
     s3_keys = []
     if s3_keys_json_str:
         try:
@@ -311,9 +280,7 @@ def parse_s3_keys_from_data(metadata_snapshot_str, s3_keys_json_str, post_id):
         rds_queue_logger.error(f"Error parsing PHP serialized metadata for post_id {post_id}: {e}", exc_info=True)
     return list(set(s3_keys))
 
-
 def delete_s3_objects_from_queue_item(s3_client, bucket_name, s3_keys):
-    # (Identical to previous version)
     if not s3_keys:
         rds_queue_logger.info("No S3 keys provided for deletion.")
         return True, None
@@ -329,7 +296,7 @@ def delete_s3_objects_from_queue_item(s3_client, bucket_name, s3_keys):
             error_messages = [f"S3 Key: {e['Key']}, Code: {e['Code']}, Message: {e['Message']}" for e in response['Errors']]
             for e in response['Errors']: transfer_logger.info(f"DELETED_S3_FROM_QUEUE_ERROR: s3://{bucket_name}/{e['Key']} - {e['Message']}")
             rds_queue_logger.error(f"S3 delete_objects reported errors: {'; '.join(error_messages)}")
-            return deleted_successfully_count > 0, "; ".join(error_messages)
+            return deleted_successfully_count > 0, "; ".join(error_messages) # True se algum foi deletado, mesmo com erros
         rds_queue_logger.info(f"Successfully submitted deletion for {deleted_successfully_count} S3 objects.")
         return True, None
     except Exception as e:
@@ -337,7 +304,6 @@ def delete_s3_objects_from_queue_item(s3_client, bucket_name, s3_keys):
         return False, str(e)
 
 def process_s3_deletion_queue(conn, s3_client):
-    # (Identical to previous version)
     if not conn or not s3_client:
         rds_queue_logger.error("RDS connection or S3 client not available for queue processing.")
         return
@@ -359,13 +325,14 @@ def process_s3_deletion_queue(conn, s3_client):
         success, error_message = delete_s3_objects_from_queue_item(s3_client, S3_BUCKET, s3_keys)
         if success:
             final_status = 'DONE'
-            if error_message: final_status = 'ERROR'
+            if error_message: final_status = 'ERROR' # Se houve erros, mesmo que parciais, marca como erro para revisão
             update_queue_item_status(conn, item_id, final_status, error_message)
-            if CLOUDFRONT_DISTRIBUTION_ID:
+            if CLOUDFRONT_DISTRIBUTION_ID: # Só invalida se a deleção S3 (mesmo parcial com erros) foi tentada
                 for cf_path_key_only in s3_keys:
                     watcher_event_handler._add_to_cf_invalidation_batch(cf_path_key_only.lstrip('/'))
-        else:
+        else: # Falha total na chamada delete_objects
             update_queue_item_status(conn, item_id, 'ERROR', error_message)
+# --- Fim das funções inalteradas ---
 
 
 def s3_deletion_queue_worker_thread_func():
@@ -373,9 +340,10 @@ def s3_deletion_queue_worker_thread_func():
     rds_queue_logger.info("S3 Deletion Queue Worker thread started.")
     rds_conn = None
 
-    if not get_rds_credentials_from_secrets_manager(RDS_SECRET_ARN_OR_NAME):
-        rds_queue_logger.critical("Failed to initialize RDS credentials. RDS queue worker will not run.")
-        return
+    # Verifica se as credenciais RDS foram carregadas do ambiente
+    if not all([RDS_HOST, RDS_USER, RDS_PASSWORD, RDS_DB_NAME]):
+        rds_queue_logger.critical("Essential RDS credentials (HOST, USER, PASSWORD, DBNAME) not found in ENV. RDS queue worker will not run.")
+        return # Impede a thread de continuar se credenciais básicas estiverem faltando
 
     try:
         s3_client_boto_for_deletion_queue = boto3.client('s3')
@@ -393,43 +361,50 @@ def s3_deletion_queue_worker_thread_func():
                 if rds_conn and not rds_conn.closed:
                     try: rds_conn.close()
                     except: pass
-                rds_conn = get_rds_connection()
+                rds_conn = get_rds_connection() # Usa as credenciais globais/de ambiente
                 if rds_conn:
-                    if not initial_setup_done: # Perform setup once per successful connection sequence
+                    if not initial_setup_done:
                         if ensure_deletion_queue_table_exists(rds_conn):
-                            if ensure_s3_deletion_trigger_exists(rds_conn): # Only if table exists
-                                initial_setup_done = True # Mark setup as done for this run
+                            if ensure_s3_deletion_trigger_exists(rds_conn):
+                                initial_setup_done = True
                             else:
                                 rds_queue_logger.error("Failed to ensure S3 deletion trigger. Processing might be impaired.")
-                                # initial_setup_done remains false, will retry on next connection
                         else:
                             rds_queue_logger.error("Failed to ensure deletion queue table. Trigger/Processing will be skipped.")
                 else:
                     rds_queue_logger.error("Failed to connect to RDS. Will retry later.")
-                    s3_deletion_queue_stop_event.wait(60)
+                    s3_deletion_queue_stop_event.wait(60) # Espera antes de tentar reconectar
                     continue
             
-            if rds_conn: # Only proceed if connection is established
+            if rds_conn: # Só prossegue se a conexão estiver estabelecida
                 try:
-                    if not rds_conn.ping(reconnect=False):
-                        rds_queue_logger.warning("RDS ping failed. Reconnecting.")
+                    if not rds_conn.ping(reconnect=False): # Verifica se a conexão está viva
+                        rds_queue_logger.warning("RDS ping failed. Will attempt to reconnect in the next cycle.")
                         try: rds_conn.close()
                         except: pass
-                        rds_conn = None; initial_setup_done = False # Reset setup flag
+                        rds_conn = None; initial_setup_done = False # Força reconexão e re-setup
                         continue
-                except (pymysql.Error, AttributeError) as pe:
-                    rds_queue_logger.warning(f"RDS ping error: {pe}. Reconnecting.")
+                except (pymysql.Error, AttributeError) as pe: # Captura erro se a conexão já estiver morta
+                    rds_queue_logger.warning(f"RDS ping error: {pe}. Will attempt to reconnect in the next cycle.")
                     try: rds_conn.close()
                     except: pass
                     rds_conn = None; initial_setup_done = False
                     continue
 
-                if initial_setup_done: # Only process if initial table/trigger setup was successful
+                if initial_setup_done:
                     rds_queue_logger.info(f"S3 Deletion Queue Worker: Polling queue.")
                     process_s3_deletion_queue(rds_conn, s3_client_boto_for_deletion_queue)
                 else:
-                    rds_queue_logger.warning("Initial RDS setup (table/trigger) not complete. Skipping queue processing cycle.")
-
+                    # Tenta o setup novamente se não foi bem sucedido antes e a conexão está OK
+                    rds_queue_logger.warning("Initial RDS setup (table/trigger) not complete. Attempting setup again.")
+                    if ensure_deletion_queue_table_exists(rds_conn):
+                        if ensure_s3_deletion_trigger_exists(rds_conn):
+                            initial_setup_done = True
+                        else:
+                            rds_queue_logger.error("Retried: Failed to ensure S3 deletion trigger.")
+                    else:
+                        rds_queue_logger.error("Retried: Failed to ensure deletion queue table.")
+                    # Não processa a fila neste ciclo se o setup ainda não estiver OK
 
         except Exception as e:
             rds_queue_logger.error(f"Unhandled error in S3 Deletion Queue Worker loop: {e}", exc_info=True)
@@ -444,20 +419,19 @@ def s3_deletion_queue_worker_thread_func():
         except pymysql.Error as e: rds_queue_logger.error(f"Error closing RDS connection: {e}")
     rds_queue_logger.info("S3 Deletion Queue Worker thread finished.")
 
+
 # --- Helper Functions (EFS Monitor - Existing) ---
+# (Função is_path_relevant permanece a mesma)
 def is_path_relevant(path_to_check, base_dir, patterns):
-    # (Identical to previous version)
     if not path_to_check.startswith(base_dir + os.path.sep): return False, None
     relative_file_path = os.path.relpath(path_to_check, base_dir)
     return any(fnmatch.fnmatch(relative_file_path, pattern) for pattern in patterns), relative_file_path
 
-
 # --- FileSystem Event Handler Class (EFS Monitor - Existing) ---
+# (Classe Watcher e suas sub-funções permanecem as mesmas da v2.5.0)
+# ... (Cole aqui a classe Watcher completa da versão anterior) ...
+# --- Copiando a classe Watcher ---
 class Watcher(FileSystemEventHandler):
-    # (Content of Watcher class identical to previous version,
-    # including _is_excluded, _get_s3_path, _trigger_batched_cloudfront_invalidation,
-    # _add_to_cf_invalidation_batch, _handle_s3_upload, _handle_s3_delete,
-    # process_event_for_sync, on_created, on_modified, on_deleted, on_moved)
     def __init__(self):
         super().__init__()
 
@@ -478,7 +452,7 @@ class Watcher(FileSystemEventHandler):
                 if cf_invalidation_timer: cf_invalidation_timer.cancel(); cf_invalidation_timer = None
                 return
             if not CLOUDFRONT_DISTRIBUTION_ID:
-                cf_invalidation_paths_batch = []; # Clear batch
+                cf_invalidation_paths_batch = []; 
                 if cf_invalidation_timer: cf_invalidation_timer.cancel(); cf_invalidation_timer = None
                 monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set. Skipping CF invalidation.")
                 return
@@ -606,17 +580,21 @@ class Watcher(FileSystemEventHandler):
         if not event.is_directory:
             self.process_event_for_sync('moved_from', event.src_path)
             self.process_event_for_sync('moved_to', event.src_path, dest_path=event.dest_path)
+# --- Fim da classe Watcher ---
+
 
 # --- Initial Sync Function (EFS Monitor - Existing) ---
+# (Função run_s3_sync_command e perform_initial_sync permanecem as mesmas da v2.5.0)
+# ... (Cole aqui as funções de initial sync) ...
+# --- Copiando funções de initial sync ---
 def run_s3_sync_command(command_parts, description):
-    # (Identical to previous version)
     monitor_logger.info(f"Attempting Initial Sync for {description} with command: {' '.join(command_parts)}")
     try:
         process = subprocess.run(command_parts, capture_output=True, text=True, check=False)
         if process.returncode == 0:
             monitor_logger.info(f"Initial Sync for {description} OK."); transfer_logger.info(f"INITIAL_SYNC_SUCCESS: {description}")
             return True
-        elif process.returncode == 2: # Some files may not have been synced
+        elif process.returncode == 2: 
             monitor_logger.warning(f"Initial Sync for {description} RC 2. Stderr: {process.stderr.strip()}"); transfer_logger.info(f"INITIAL_SYNC_WARNING_RC2: {description} - ERR: {process.stderr.strip()}")
             return True
         else:
@@ -626,7 +604,6 @@ def run_s3_sync_command(command_parts, description):
     except Exception as e: monitor_logger.error(f"Exception during Initial Sync for {description}: {e}", exc_info=True); return False
 
 def perform_initial_sync():
-    # (Identical to previous version)
     monitor_logger.info("--- Starting Initial S3 Sync ---")
     if not S3_BUCKET or not os.path.isdir(MONITOR_DIR_BASE):
         monitor_logger.error("S3_BUCKET not set or MONITOR_DIR_BASE not found. Skipping initial sync."); return
@@ -645,13 +622,13 @@ def perform_initial_sync():
         cmd = [AWS_CLI_PATH, 's3', 'sync', wp_includes_path, f"s3://{S3_BUCKET}/wp-includes/", '--exclude', '*'] + inc_wp_inc_cmd + ['--exact-timestamps', '--acl', 'private']
         run_s3_sync_command(cmd, "wp-includes (assets only)")
     monitor_logger.info("--- Initial S3 Sync Attempted ---")
-
+# --- Fim das funções de initial sync ---
 
 # --- Main Execution Block ---
-watcher_event_handler = Watcher()
+watcher_event_handler = Watcher() # Instância global para ser acessada pela thread RDS para CF invalidation
 
 if __name__ == "__main__":
-    script_version_tag = "v2.5.0-SecretsManager-Full"
+    script_version_tag = "v2.5.1-EnvCreds" # <<< NOVA VERSÃO >>>
     monitor_logger.info(f"Python EFS/S3 Monitor & RDS Queue Processor ({script_version_tag}) starting...")
     monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
     monitor_logger.info(f"EFS Monitor Dir: {MONITOR_DIR_BASE}")
@@ -662,9 +639,12 @@ if __name__ == "__main__":
 
     monitor_logger.info(f"RDS Deletion Queue Enabled: {RDS_DELETION_QUEUE_ENABLED}")
     if RDS_DELETION_QUEUE_ENABLED:
-        monitor_logger.info(f"RDS Secret ARN/Name: {RDS_SECRET_ARN_OR_NAME or 'Not Set (will use ENV for creds)'}")
-        monitor_logger.info(f"RDS Fallback Host (ENV): {RDS_HOST_ENV or 'Not Set'}")
-        # Do not log password
+        monitor_logger.info(f"RDS Host (ENV): {RDS_HOST or 'Not Set'}")
+        monitor_logger.info(f"RDS User (ENV): {RDS_USER or 'Not Set'}")
+        monitor_logger.info(f"RDS DB Name (ENV): {RDS_DB_NAME or 'Not Set'}")
+        monitor_logger.info(f"RDS Port (ENV): {RDS_PORT or 'Not Set'}")
+        # Não logar RDS_PASSWORD
+        monitor_logger.info(f"RDS Engine (ENV): {RDS_ENGINE or 'Not Set'}")
         monitor_logger.info(f"RDS Posts Table Name: {RDS_WP_POSTS_TABLE_NAME}")
         monitor_logger.info(f"RDS Postmeta Table Name: {RDS_WP_POSTMETA_TABLE_NAME}")
         monitor_logger.info(f"RDS Queue Table Name: {S3_DELETION_QUEUE_TABLE_NAME}")
@@ -681,8 +661,8 @@ if __name__ == "__main__":
 
     try:
         boto3.client('s3'); monitor_logger.info("Boto3 S3 client test OK.")
-    except Exception as e:
-        monitor_logger.critical(f"Boto3 S3 client init failed. Check AWS credentials/config: {e}", exc_info=True); exit(1)
+    except Exception as e: # Captura exceções mais amplas, incluindo NoCredentialsError
+        monitor_logger.critical(f"Boto3 S3 client init failed. Check AWS credentials/config (IAM Role, etc.): {e}", exc_info=True); exit(1)
 
     if PERFORM_INITIAL_SYNC:
         perform_initial_sync()
@@ -700,11 +680,9 @@ if __name__ == "__main__":
 
     rds_deletion_thread = None
     if RDS_DELETION_QUEUE_ENABLED:
-        if not RDS_SECRET_ARN_OR_NAME and not all([RDS_HOST_ENV, RDS_USER_ENV, RDS_DB_NAME_ENV]): # Password from ENV is not strictly checked here as it's not recommended
-             monitor_logger.error("RDS Deletion Queue enabled, but RDS_SECRET_ARN_OR_NAME and fallback ENV creds are incomplete. Worker not started.")
-        else:
-            rds_deletion_thread = threading.Thread(target=s3_deletion_queue_worker_thread_func, daemon=True)
-            rds_deletion_thread.start(); monitor_logger.info("RDS S3 Deletion Queue Worker thread initiated.")
+        # A verificação de credenciais agora é feita dentro da thread worker
+        rds_deletion_thread = threading.Thread(target=s3_deletion_queue_worker_thread_func, daemon=True)
+        rds_deletion_thread.start(); monitor_logger.info("RDS S3 Deletion Queue Worker thread initiated.")
     else:
         monitor_logger.info("RDS Deletion Queue is disabled.")
 
@@ -712,34 +690,43 @@ if __name__ == "__main__":
         while True: # Main loop to keep script alive
             if observer and not observer.is_alive():
                 monitor_logger.error("EFS Observer thread died.")
-                if not rds_deletion_thread or not rds_deletion_thread.is_alive(): break # Exit if both dead
+                if not rds_deletion_thread or not rds_deletion_thread.is_alive(): break
             if rds_deletion_thread and not rds_deletion_thread.is_alive() and RDS_DELETION_QUEUE_ENABLED:
-                monitor_logger.error("RDS Deletion Queue thread died.")
-                if not observer or not observer.is_alive(): break # Exit if both dead
-            if (not observer or not observer.is_alive()) and \
-               (not RDS_DELETION_QUEUE_ENABLED or (rds_deletion_thread and not rds_deletion_thread.is_alive())):
-                monitor_logger.info("No active monitoring threads. Exiting.")
-                break
+                # Esta condição pode ser atingida se a thread worker sair devido à falta de credenciais
+                monitor_logger.error("RDS Deletion Queue thread died or did not start properly (check logs for credential errors).")
+                if not observer or not observer.is_alive(): break
+            
+            # Condição de saída se nenhuma thread ativa estiver configurada ou rodando
+            all_threads_done_or_disabled = True
+            if RELEVANT_PATTERNS and observer and observer.is_alive():
+                all_threads_done_or_disabled = False
+            if RDS_DELETION_QUEUE_ENABLED and rds_deletion_thread and rds_deletion_thread.is_alive():
+                all_threads_done_or_disabled = False
+            
+            if all_threads_done_or_disabled:
+                 monitor_logger.info("No active monitoring threads (EFS or RDS queue) or they are disabled. Script will exit.")
+                 break
+            
             time.sleep(5)
     except KeyboardInterrupt:
         monitor_logger.info("Keyboard interrupt. Stopping...")
-        if cf_invalidation_timer and cf_invalidation_timer.is_alive():
+        if cf_invalidation_timer and cf_invalidation_timer.is_alive(): # Tratamento do timer do CF
             with cf_invalidation_lock:
                 if cf_invalidation_timer and cf_invalidation_timer.is_alive(): cf_invalidation_timer.cancel()
-            watcher_event_handler._trigger_batched_cloudfront_invalidation()
+            watcher_event_handler._trigger_batched_cloudfront_invalidation() # Tenta invalidar o que estiver no batch
     except Exception as e:
         monitor_logger.critical(f"Critical error in main loop: {e}", exc_info=True)
     finally:
         monitor_logger.info("Shutting down...")
         if rds_deletion_thread and rds_deletion_thread.is_alive():
             s3_deletion_queue_stop_event.set()
-            rds_deletion_thread.join(timeout=S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS + 15)
+            rds_deletion_thread.join(timeout=S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS + 15) # Aumenta um pouco o timeout
             if rds_deletion_thread.is_alive(): monitor_logger.warning("RDS Worker thread timed out on stop.")
             else: monitor_logger.info("RDS Worker thread stopped.")
         if observer and observer.is_alive():
             observer.stop(); observer.join(timeout=10)
             if observer.is_alive(): monitor_logger.warning("EFS Observer timed out on stop.")
             else: monitor_logger.info("EFS Observer stopped.")
-        with cf_invalidation_lock:
+        with cf_invalidation_lock: # Limpeza final do timer do CF
             if cf_invalidation_timer and cf_invalidation_timer.is_alive(): cf_invalidation_timer.cancel()
         monitor_logger.info("Script finished.")
