@@ -20,12 +20,11 @@ S3_TRANSFER_LOG = os.environ.get(
 SYNC_DEBOUNCE_SECONDS = int(os.environ.get('WP_SYNC_DEBOUNCE_SECONDS', '5'))
 AWS_CLI_PATH = os.environ.get('WP_AWS_CLI_PATH', 'aws')
 
-# Configurações para controle fino
+# Configurações para controle fino (AGORA HARDCODED)
 # AGORA SIGNIFICA: "Substituir por placeholder no EFS após sincronizar com S3"
-DELETE_FROM_EFS_AFTER_SYNC = os.environ.get(
-    'WP_DELETE_FROM_EFS_AFTER_SYNC', 'false').lower() == 'true'
-PERFORM_INITIAL_SYNC = os.environ.get(
-    'WP_PERFORM_INITIAL_SYNC', 'true').lower() == 'true'
+DELETE_FROM_EFS_AFTER_SYNC = True # HARDCODED
+PERFORM_INITIAL_SYNC = True       # HARDCODED
+
 CLOUDFRONT_DISTRIBUTION_ID = os.environ.get(
     'AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0')
 
@@ -235,6 +234,7 @@ class Watcher(FileSystemEventHandler):
 
     def _handle_s3_upload(self, local_path, relative_file_path, is_initial_sync=False):
         # effective_delete_from_efs agora significa "replace_with_placeholder"
+        # DELETE_FROM_EFS_AFTER_SYNC é sempre True
         effective_replace_with_placeholder = DELETE_FROM_EFS_AFTER_SYNC and not is_initial_sync
 
         current_time = time.time()
@@ -265,17 +265,12 @@ class Watcher(FileSystemEventHandler):
                         f"Adding '{relative_file_path}' to CloudFront invalidation batch due to EFS event (create/update).")
                     self._add_to_cf_invalidation_batch(relative_file_path)
 
-                if effective_replace_with_placeholder:
+                if effective_replace_with_placeholder: # DELETE_FROM_EFS_AFTER_SYNC é sempre True
                     _, ext = os.path.splitext(local_path)
                     if ext.lower() in PLACEHOLDER_TARGET_EXTENSIONS_EFS:
                         monitor_logger.info(
                             f"Preparing to replace EFS file '{local_path}' with placeholder (DELETE_FROM_EFS_AFTER_SYNC=true).")
                         _replace_efs_file_with_placeholder(local_path, relative_file_path)
-                        # O evento on_modified para o placeholder será tratado separadamente pelo watcher,
-                        # mas não deve ser reenviado para o S3 se o conteúdo for o placeholder.
-                        # O _is_excluded pode precisar ser ajustado se quisermos ignorar eventos em placeholders.
-                        # Por agora, a lógica de debounce e o fato de que o conteúdo do placeholder não mudará
-                        # deve evitar uploads repetidos.
                     else:
                         monitor_logger.info(
                             f"File '{local_path}' (ext: {ext.lower()}) not in PLACEHOLDER_TARGET_EXTENSIONS_EFS. Kept on EFS as is.")
@@ -371,11 +366,11 @@ class Watcher(FileSystemEventHandler):
 
 
     def process_event_for_sync(self, event_type, path, dest_path=None):
-        global efs_deleted_by_script # Ainda usado para 'moved_from'
+        global efs_deleted_by_script
 
         if event_type == 'moved_from':
             if self._is_excluded(path) or (os.path.exists(path) and os.path.isdir(path)):
-                return # Ignorar diretórios e exclusões para a origem do 'moved_from'
+                return
             relevant_src, relative_src_path = is_path_relevant(
                 path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
             if not relevant_src or not relative_src_path:
@@ -389,7 +384,7 @@ class Watcher(FileSystemEventHandler):
                 if path in efs_deleted_by_script:
                     monitor_logger.info(
                         f"EFS MOVED_FROM event for '{path}' was likely part of script-initiated rename/process (e.g., placeholder creation after a move, though unlikely). Not deleting from S3 for source.")
-                    efs_deleted_by_script.remove(path) # Limpar da lista
+                    efs_deleted_by_script.remove(path)
                     ignore_s3_deletion_for_moved_src = True
 
             if not ignore_s3_deletion_for_moved_src:
@@ -399,9 +394,8 @@ class Watcher(FileSystemEventHandler):
             else:
                 transfer_logger.info(
                     f"SKIPPED_S3_DELETE_MOVED_FROM_BY_SCRIPT_FLAG: {relative_src_path}")
-            return # Fim do tratamento de moved_from
+            return
 
-        # Para created, modified, deleted, moved_to
         current_path_to_check = dest_path if event_type == 'moved_to' else path
 
         if self._is_excluded(current_path_to_check) or \
@@ -413,7 +407,6 @@ class Watcher(FileSystemEventHandler):
         if not relevant or not relative_path:
             return
 
-        # Checagem adicional para não reenviar placeholders para o S3 em eventos de modified
         if event_type == 'modified' and os.path.exists(current_path_to_check):
             try:
                 if os.path.getsize(current_path_to_check) == len(PLACEHOLDER_CONTENT.encode('utf-8')):
@@ -421,43 +414,19 @@ class Watcher(FileSystemEventHandler):
                         content = f_check.read()
                     if content == PLACEHOLDER_CONTENT:
                         monitor_logger.info(f"Event: MODIFIED for placeholder '{relative_path}'. Skipping S3 upload.")
-                        return # Não faz nada se for um placeholder modificado (ex: touch)
+                        return
             except OSError:
-                pass # Se não conseguir ler, prossegue normalmente
+                pass
 
         monitor_logger.info(
             f"Event: {event_type.upper()} for relevant file '{relative_path}' (full: {current_path_to_check})")
 
         if event_type in ['created', 'modified', 'moved_to']:
-            # A verificação de placeholder acima deve pegar 'modified'.
-            # Se um placeholder for 'created' ou 'moved_to', algo estranho está acontecendo,
-            # mas a lógica de upload ainda tentaria enviar.
             self._handle_s3_upload(current_path_to_check, relative_path)
-
         elif event_type == 'deleted':
-            # A flag efs_deleted_by_script NÃO é mais usada aqui para pular deleções do S3
-            # porque a deleção do EFS que o script faz é uma SUBSTITUIÇÃO por placeholder.
-            # Quando o placeholder é deletado (pelo usuário/WordPress), queremos que a deleção do S3 ocorra.
-            # A flag efs_deleted_by_script é mantida para o `moved_from` se o script fizesse um `os.remove`
-            # como parte de um "move" manual, o que não é o caso aqui.
-
-            # ignore_this_s3_deletion = False # Removido o bloco com efs_deleted_by_script
-            # with efs_deletion_lock:
-            #     if path in efs_deleted_by_script:
-            #         # Este bloco não deve ser alcançado se a substituição por placeholder
-            #         # não adicionar o path a efs_deleted_by_script.
-            #         monitor_logger.info(
-            #             f"EFS delete event for '{path}' was triggered by this script (unexpected with placeholder logic). Not deleting from S3.")
-            #         efs_deleted_by_script.remove(path)
-            #         ignore_this_s3_deletion = True
-
-            # if not ignore_this_s3_deletion:
             monitor_logger.info(
                 f"EFS delete event for '{path}' (likely a placeholder). Proceeding with S3 delete.")
             self._handle_s3_delete(relative_path)
-            # else:
-            #     transfer_logger.info(
-            #         f"SKIPPED_S3_DELETE_BY_SCRIPT_FLAG: {relative_path}")
 
 
     def on_created(self, event):
@@ -476,17 +445,14 @@ class Watcher(FileSystemEventHandler):
             self.process_event_for_sync('deleted', event.src_path)
 
     def on_moved(self, event):
-        # Um 'move' é um delete do src_path e um create/modify do dest_path
-        # Se o src_path não for um diretório, tratamos sua deleção
-        if not os.path.isdir(event.src_path): # Checa se o src_path original não era diretório
+        if not os.path.isdir(event.src_path):
              monitor_logger.debug(f"ON_MOVED (src part) raw: {event.src_path}")
-             self.process_event_for_sync('moved_from', event.src_path) # Processa a parte de "deleção" da origem
+             self.process_event_for_sync('moved_from', event.src_path)
 
-        # Se o dest_path não for um diretório (novo arquivo), tratamos sua criação/modificação
-        if not event.is_directory: # event.is_directory refere-se ao dest_path
+        if not event.is_directory:
             monitor_logger.debug(f"ON_MOVED (dest part) raw: {event.dest_path}")
             self.process_event_for_sync(
-                'moved_to', event.src_path, dest_path=event.dest_path) # src_path aqui é só para log, current_path_to_check usa dest_path
+                'moved_to', event.src_path, dest_path=event.dest_path)
 
 # --- Initial Sync Function ---
 def run_s3_sync_command(command_parts, description):
@@ -503,7 +469,7 @@ def run_s3_sync_command(command_parts, description):
                     f"Initial Sync for {description} stdout: {process.stdout.strip()}")
             transfer_logger.info(f"INITIAL_SYNC_SUCCESS: {description}")
             return True
-        elif process.returncode == 2: # RC 2 significa que alguns arquivos podem não ter sido sincronizados
+        elif process.returncode == 2:
             monitor_logger.warning(
                 f"Initial Sync for {description} completed with RC 2 (some files may not have been synced). Check stderr.")
             if process.stdout.strip():
@@ -514,7 +480,7 @@ def run_s3_sync_command(command_parts, description):
                     f"Initial Sync for {description} stderr: {process.stderr.strip()}")
             transfer_logger.info(
                 f"INITIAL_SYNC_WARNING_RC2: {description} - ERR: {process.stderr.strip()}")
-            return True # Considerar sucesso parcial como OK para prosseguir
+            return True
         else:
             monitor_logger.error(
                 f"Initial Sync for {description} FAILED. RC: {process.returncode}.")
@@ -536,7 +502,7 @@ def run_s3_sync_command(command_parts, description):
             f"Exception during Initial Sync for {description}: {e}", exc_info=True)
         return False
 
-def perform_initial_sync(watcher_instance): # Passa a instância do watcher para invalidação
+def perform_initial_sync(watcher_instance):
     monitor_logger.info(
         "--- Starting Initial S3 Sync using 'aws s3 sync' commands ---")
     if not S3_BUCKET:
@@ -548,23 +514,19 @@ def perform_initial_sync(watcher_instance): # Passa a instância do watcher para
             f"Monitor directory '{MONITOR_DIR_BASE}' does not exist. Skipping initial sync.")
         return
 
-    # Definição de includes para o comando 'aws s3 sync'
-    # Estes são os tipos de arquivos que o 'aws s3 sync' tentará sincronizar.
-    # A lógica de placeholder será aplicada DEPOIS com base em PLACEHOLDER_TARGET_EXTENSIONS_EFS.
     general_sync_includes = [
         '*.css', '*.js',
         '*.jpg', '*.jpeg', '*.png', '*.gif', '*.svg', '*.webp', '*.ico',
         '*.woff', '*.woff2', '*.ttf', '*.eot', '*.otf',
         '*.mp4', '*.mov', '*.webm', '*.avi', '*.wmv', '*.mkv', '*.flv',
         '*.mp3', '*.wav', '*.ogg', '*.aac', '*.wma', '*.flac',
-        '*.pdf', '*.doc', '*.docx', '*.xls', '*.xlsx', '*.ppt', '*.pptx',
+        '*.pdf', '*.doc', '*.docx', '*.xls', '*.xlsx', '*.ppt', '.pptx',
         '*.zip', '*.txt',
     ]
     includes_for_sync_cmd = []
     for item in general_sync_includes:
         includes_for_sync_cmd.extend(['--include', item])
 
-    # Sincronizar wp-content
     wp_content_path = os.path.join(MONITOR_DIR_BASE, "wp-content")
     if os.path.isdir(wp_content_path):
         s3_sync_wp_content_cmd = [
@@ -577,24 +539,21 @@ def perform_initial_sync(watcher_instance): # Passa a instância do watcher para
             '--exclude', 'wp-content/backups/*',
             '--exclude', '*/.DS_Store',
             '--exclude', '*/Thumbs.db',
-            '--exclude', '*/node_modules/*', # Adicionado
-            '--exclude', '*/.git/*' # Adicionado
+            '--exclude', '*/node_modules/*',
+            '--exclude', '*/.git/*'
         ] + includes_for_sync_cmd + ['--exact-timestamps', '--acl', 'private', '--only-show-errors']
         run_s3_sync_command(s3_sync_wp_content_cmd, "wp-content")
     else:
         monitor_logger.warning(
             f"Directory '{wp_content_path}' not found. Skipping sync for wp-content.")
 
-    # Sincronizar wp-includes (apenas assets)
     wp_includes_path = os.path.join(MONITOR_DIR_BASE, "wp-includes")
     if os.path.isdir(wp_includes_path):
-        # Para wp-includes, geralmente só queremos CSS, JS, imagens.
-        # Não usar general_sync_includes aqui, ser mais específico.
         wp_includes_assets_includes = [
             '*.css', '*.js',
             '*.jpg', '*.jpeg', '*.png', '*.gif',
             '*.svg', '*.webp', '*.ico',
-            '*.woff', '*.woff2', '*.ttf', '*.eot', '*.otf', # Adicionado fontes
+            '*.woff', '*.woff2', '*.ttf', '*.eot', '*.otf',
         ]
         includes_for_wp_includes_cmd = []
         for item in wp_includes_assets_includes:
@@ -602,8 +561,8 @@ def perform_initial_sync(watcher_instance): # Passa a instância do watcher para
 
         s3_sync_wp_includes_cmd = [
             AWS_CLI_PATH, 's3', 'sync', wp_includes_path, f"s3://{S3_BUCKET}/wp-includes/",
-            '--exclude', '*' # Excluir tudo por padrão
-        ] + includes_for_wp_includes_cmd + [ # Então incluir seletivamente
+            '--exclude', '*'
+        ] + includes_for_wp_includes_cmd + [
             '--exact-timestamps', '--acl', 'private', '--only-show-errors'
         ]
         run_s3_sync_command(s3_sync_wp_includes_cmd, "wp-includes (assets only)")
@@ -614,10 +573,9 @@ def perform_initial_sync(watcher_instance): # Passa a instância do watcher para
     monitor_logger.info(
         "--- Initial S3 Sync using 'aws s3 sync' commands Attempted ---")
 
-    if DELETE_FROM_EFS_AFTER_SYNC:
+    if DELETE_FROM_EFS_AFTER_SYNC: # DELETE_FROM_EFS_AFTER_SYNC é sempre True
         monitor_logger.info(
             "--- Starting EFS placeholder replacement for initially synced files ---")
-        # Percorrer os diretórios que foram sincronizados
         paths_to_scan_for_placeholders = []
         if os.path.isdir(wp_content_path):
             paths_to_scan_for_placeholders.append(wp_content_path)
@@ -630,11 +588,7 @@ def perform_initial_sync(watcher_instance): # Passa a instância do watcher para
                 for filename in files:
                     local_path = os.path.join(root, filename)
                     
-                    # Verificar se o arquivo é excluído pelo watcher (ex: .git, cache, etc.)
-                    # Usamos uma instância temporária ou uma função estática se _is_excluded não depender do estado da instância
-                    # Para simplificar, vamos assumir que as exclusões de _is_excluded são principalmente para o watcher em tempo real.
-                    # Para a substituição inicial, focamos nas extensões e relevância.
-                    if watcher_instance._is_excluded(local_path): # Reutiliza a lógica de exclusão do watcher
+                    if watcher_instance._is_excluded(local_path):
                         monitor_logger.debug(f"Skipping placeholder for excluded file (initial sync): {local_path}")
                         continue
 
@@ -644,8 +598,6 @@ def perform_initial_sync(watcher_instance): # Passa a instância do watcher para
                     if is_relevant:
                         _, ext = os.path.splitext(local_path)
                         if ext.lower() in PLACEHOLDER_TARGET_EXTENSIONS_EFS:
-                            # Verificar se o arquivo não é já um placeholder
-                            # (improvável na primeira execução, mas bom para idempotência)
                             try:
                                 if os.path.getsize(local_path) == len(PLACEHOLDER_CONTENT.encode('utf-8')):
                                     with open(local_path, 'r') as f_check:
@@ -654,23 +606,16 @@ def perform_initial_sync(watcher_instance): # Passa a instância do watcher para
                                         monitor_logger.debug(f"File '{local_path}' is already a placeholder. Skipping.")
                                         continue
                             except OSError:
-                                pass # Se não conseguir ler, tenta substituir
+                                pass
 
                             monitor_logger.info(
                                 f"Initial Sync: Replacing EFS file '{local_path}' with placeholder.")
                             _replace_efs_file_with_placeholder(local_path, relative_path)
-                        # else:
-                        #     monitor_logger.debug(f"Initial Sync: File '{local_path}' ext '{ext.lower()}' not in placeholder targets.")
-                    # else:
-                    #     monitor_logger.debug(f"Initial Sync: File '{local_path}' not relevant by patterns.")
         monitor_logger.info(
             "--- EFS placeholder replacement for initially synced files Attempted ---")
 
-    # Invalidação do CloudFront após a sincronização inicial, se configurado
     if CLOUDFRONT_DISTRIBUTION_ID:
         monitor_logger.info("Initial sync complete. Triggering a full CloudFront invalidation (/*) due to potential widespread changes.")
-        # Usar o método _trigger_batched_cloudfront_invalidation da instância do watcher
-        # passando caminhos específicos para uma invalidação total.
         watcher_instance._trigger_batched_cloudfront_invalidation(paths_override=['/*'], reference_suffix_override="initial-sync-full")
     else:
         monitor_logger.info("Initial sync complete. CLOUDFRONT_DISTRIBUTION_ID not set, skipping full invalidation.")
@@ -678,7 +623,7 @@ def perform_initial_sync(watcher_instance): # Passa a instância do watcher para
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    script_version_tag = "v2.4.0-PlaceholderLogic"
+    script_version_tag = "v2.4.1-HardcodedSyncPlaceholder"
     monitor_logger.info(
         f"Python Watchdog Monitor (EFS to S3 Sync - {script_version_tag}) starting for '{MONITOR_DIR_BASE}'.")
     monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
@@ -687,11 +632,11 @@ if __name__ == "__main__":
     monitor_logger.info(
         f"Relevant Watcher Patterns (parsed): {RELEVANT_PATTERNS}")
     monitor_logger.info(
-        f"Replace EFS files with placeholders after sync: {DELETE_FROM_EFS_AFTER_SYNC}")
+        f"Replace EFS files with placeholders after sync: {DELETE_FROM_EFS_AFTER_SYNC} (Hardcoded)")
     monitor_logger.info(
         f"EFS file extensions to replace with placeholders: {PLACEHOLDER_TARGET_EXTENSIONS_EFS if DELETE_FROM_EFS_AFTER_SYNC else 'N/A'}")
     monitor_logger.info(
-        f"Perform initial sync (EFS to S3, then EFS placeholder replacement): {PERFORM_INITIAL_SYNC}")
+        f"Perform initial sync (EFS to S3, then EFS placeholder replacement): {PERFORM_INITIAL_SYNC} (Hardcoded)")
     monitor_logger.info(
         f"CloudFront Distribution ID for Invalidation: {CLOUDFRONT_DISTRIBUTION_ID if CLOUDFRONT_DISTRIBUTION_ID else 'Not Set'}")
     monitor_logger.info(
@@ -721,35 +666,34 @@ if __name__ == "__main__":
         monitor_logger.info(f"Using AWS CLI at: {AWS_CLI_PATH}")
 
     try:
-        boto3.client('s3') # Testa a capacidade de criar um cliente
+        boto3.client('s3')
         monitor_logger.info(
             "Boto3 library and S3 client can be initialized successfully.")
     except ImportError:
         monitor_logger.critical(
             "Boto3 library not found. Please install it (e.g., 'sudo pip3 install boto3'). Exiting.")
         exit(1)
-    except Exception as e: # Captura erros de credenciais/configuração do Boto3
+    except Exception as e:
         monitor_logger.critical(
             f"Failed to initialize Boto3 S3 client. Check AWS credentials/configuration: {e}", exc_info=True)
         exit(1)
 
-    event_handler = Watcher() # Criar a instância do watcher aqui
+    event_handler = Watcher()
 
-    if PERFORM_INITIAL_SYNC:
+    if PERFORM_INITIAL_SYNC: # PERFORM_INITIAL_SYNC é sempre True
         monitor_logger.info(
-            "WP_PERFORM_INITIAL_SYNC is true. Calling perform_initial_sync().")
-        perform_initial_sync(event_handler) # Passar a instância do watcher
+            "PERFORM_INITIAL_SYNC is true (Hardcoded). Calling perform_initial_sync().")
+        perform_initial_sync(event_handler)
         monitor_logger.info("Call to perform_initial_sync() has completed.")
-    else:
-        monitor_logger.info(
-            "WP_PERFORM_INITIAL_SYNC is false. Skipping initial sync and placeholder replacement.")
+    # else: # Este bloco não será mais alcançado
+    #     monitor_logger.info(
+    #         "WP_PERFORM_INITIAL_SYNC is false. Skipping initial sync and placeholder replacement.")
 
     if not RELEVANT_PATTERNS_STR:
-        monitor_logger.warning( # Mudado para warning, pois o script pode ainda ser útil para deleções se o initial sync já ocorreu.
+        monitor_logger.warning(
             "RELEVANT_PATTERNS_STR is empty. Watchdog will not process new file creations/modifications for upload/placeholder logic.")
-        if not PERFORM_INITIAL_SYNC:
-             monitor_logger.critical("RELEVANT_PATTERNS_STR is empty and PERFORM_INITIAL_SYNC is false. Script will do very little. Exiting if this is unintended.")
-             # exit(1) # Comentar se quiser que ele rode mesmo assim para pegar deleções de placeholders (se existirem)
+        # if not PERFORM_INITIAL_SYNC: # PERFORM_INITIAL_SYNC é sempre True, então este if interno não será atingido
+        #      monitor_logger.critical("RELEVANT_PATTERNS_STR is empty and PERFORM_INITIAL_SYNC is false. Script will do very little. Exiting if this is unintended.")
     elif not RELEVANT_PATTERNS:
         monitor_logger.critical(
             f"RELEVANT_PATTERNS_STR ('{RELEVANT_PATTERNS_STR}') resulted in no valid patterns for the watcher. Exiting.")
@@ -766,16 +710,15 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         monitor_logger.info(
             "Keyboard interrupt received. Stopping observer...")
-        # Tentar processar invalidações pendentes
-        if cf_invalidation_paths_batch and CLOUDFRONT_DISTRIBUTION_ID: # Somente se houver itens e ID
+        if cf_invalidation_paths_batch and CLOUDFRONT_DISTRIBUTION_ID:
             monitor_logger.info("Attempting to trigger pending CloudFront invalidations before exit...")
-            event_handler._trigger_batched_cloudfront_invalidation() # Força o que estiver no lote
+            event_handler._trigger_batched_cloudfront_invalidation()
     except Exception as e:
         monitor_logger.critical(
             f"Critical error in observer loop: {e}", exc_info=True)
     finally:
         monitor_logger.info("Shutting down observer...")
-        with cf_invalidation_lock: # Garantir que o timer seja cancelado
+        with cf_invalidation_lock:
             if cf_invalidation_timer and cf_invalidation_timer.is_alive():
                 monitor_logger.info(
                     "Cancelling active CloudFront invalidation timer during final shutdown.")
