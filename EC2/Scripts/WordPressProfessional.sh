@@ -200,9 +200,11 @@ Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
 Environment="WP_SYNC_DEBOUNCE_SECONDS=5"
 Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-# Valores "hardcoded" para as novas configurações do Python, conforme solicitado:
 Environment="WP_DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync}"
 Environment="WP_PERFORM_INITIAL_SYNC=${py_perform_initial_sync}"
+Environment="CF_INVALIDATION_BATCH_MAX_SIZE=${py_cf_invalidation_batch_max_size}"
+Environment="CF_INVALIDATION_BATCH_TIMEOUT_SECONDS=${py_cf_invalidation_batch_timeout_seconds}"
+Environment="AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0=${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}"
 
 [Install]
 WantedBy=multi-user.target
