@@ -1,6 +1,7 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
 # Versão: 2.3.4-zero-touch-s3-python-watchdog-phpfix-pyvars (Python Vars no Systemd)
+# Modificado para hardcodar comportamento de sync e placeholder no Python
 
 # --- Configurações Chave ---
 readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.4.sh" # Atualizar versão
@@ -175,9 +176,8 @@ create_and_enable_python_monitor_service() {
     local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws") # Garante que temos um caminho para o AWS CLI
     local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" # Para evitar problemas com caracteres especiais no systemd
 
-    # Valores default para as novas variáveis de ambiente do Python
-    local py_delete_from_efs_after_sync="false" # Mantenha false por segurança, a menos que explicitamente desejado
-    local py_perform_initial_sync="true"      # Recomendado manter true
+    # py_delete_from_efs_after_sync e py_perform_initial_sync foram REMOVIDAS
+    # pois serão hardcoded como True no script Python.
 
     sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
 [Unit]
@@ -200,10 +200,9 @@ Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
 Environment="WP_SYNC_DEBOUNCE_SECONDS=5"
 Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="WP_DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync}"
-Environment="WP_PERFORM_INITIAL_SYNC=${py_perform_initial_sync}"
-Environment="CF_INVALIDATION_BATCH_MAX_SIZE=${py_cf_invalidation_batch_max_size}"
-Environment="CF_INVALIDATION_BATCH_TIMEOUT_SECONDS=${py_cf_invalidation_batch_timeout_seconds}"
+# As Environments para WP_DELETE_FROM_EFS_AFTER_SYNC e WP_PERFORM_INITIAL_SYNC foram REMOVIDAS
+Environment="CF_INVALIDATION_BATCH_MAX_SIZE=${py_cf_invalidation_batch_max_size}" # Esta variável ainda pode ser útil
+Environment="CF_INVALIDATION_BATCH_TIMEOUT_SECONDS=${py_cf_invalidation_batch_timeout_seconds}" # Esta variável ainda pode ser útil
 Environment="AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0=${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}"
 
 [Install]
@@ -407,7 +406,7 @@ echo "INFO: --- Script WordPress Setup (v2.3.4) concluído! ($(date)) ---"
 echo "INFO: Sincronização com S3 agora é via Python Watchdog (script baixado do S3)."
 echo "INFO: Script de monitoramento Python: $PYTHON_MONITOR_SCRIPT_PATH"
 echo "INFO: Serviço Python: $PYTHON_MONITOR_SERVICE_NAME (Log do monitor: $PY_MONITOR_LOG_FILE, Log de transferências: $PY_S3_TRANSFER_LOG_FILE)"
-echo "INFO: Configurações do Python para EFS/S3 (no service file): DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync:-N/A}, PERFORM_INITIAL_SYNC=${py_perform_initial_sync:-N/A}"
+echo "INFO: Configurações do Python para EFS/S3: Sincronização inicial E substituição por placeholder no EFS SEMPRE ATIVAS (hardcoded no script Python)."
 echo "INFO: Logs: Principal=${LOG_FILE}"
 echo "INFO: Site: https://${WPDOMAIN}, Health Check: /healthcheck.php"
 echo "INFO: LEMBRE-SE de configurar o EFS Access Point com uid=48 e gid=48 (para o apache)."
