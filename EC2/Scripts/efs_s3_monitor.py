@@ -55,14 +55,16 @@ last_sync_file_map = {}
 
 # --- Configuração para a fila de invalidação ---
 invalidation_queue = queue.Queue()
-MAX_INVALIDATION_WORKERS = 1 # Comece com 1, pode aumentar se necessário e testado
+MAX_INVALIDATION_WORKERS = 1
 
 # Variáveis globais para o watcher
-cf_invalidation_paths_batch = [] # Lote principal antes de enfileirar
+cf_invalidation_paths_batch = []
 cf_invalidation_timer = None
-cf_invalidation_lock = threading.Lock() # Para proteger cf_invalidation_paths_batch e cf_invalidation_timer
-efs_deleted_by_script = set() # Para rastrear deleções feitas pelo script (se necessário)
-efs_deletion_lock = threading.Lock() # Para proteger efs_deleted_by_script
+# USAREMOS RLock PARA PERMITIR REENTRÂNCIA CASO UMA FUNÇÃO COM LOCK CHAME OUTRA QUE USA O MESMO LOCK
+cf_invalidation_lock = threading.RLock() # <--- MUDANÇA AQUI
+efs_deleted_by_script = set()
+efs_deletion_lock = threading.RLock()    # <--- MUDANÇA AQUI (para consistência, embora não fosse a causa do problema atual)
+
 
 # --- Logger Setup ---
 def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(name)s - %(levelname)s - %(message)s'):
@@ -70,7 +72,7 @@ def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s 
     if log_dir and not os.path.exists(log_dir):
         try:
             os.makedirs(log_dir, exist_ok=True)
-            os.chmod(log_dir, 0o777) # Permissões mais abertas para o diretório
+            os.chmod(log_dir, 0o777)
         except Exception as e:
             print(f"Error creating or setting permissions for log directory {log_dir}: {e}")
             log_file = os.path.join("/tmp", os.path.basename(log_file))
@@ -80,7 +82,7 @@ def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s 
         if not os.path.exists(log_file):
             with open(log_file, 'a'):
                 pass
-        os.chmod(log_file, 0o666) # Permissões mais abertas para o arquivo de log
+        os.chmod(log_file, 0o666)
     except Exception as e:
         print(f"Error touching/chmod log file {log_file}: {e}")
 
@@ -133,7 +135,6 @@ def _replace_efs_file_with_placeholder(local_path, relative_file_path):
 
 # --- Worker Thread para Invalidação do CloudFront ---
 def cloudfront_invalidation_worker(q, dist_id, cf_connect_timeout, cf_read_timeout):
-    """Processa itens da fila de invalidação do CloudFront."""
     worker_boto_config = Config(
         connect_timeout=cf_connect_timeout,
         read_timeout=cf_read_timeout,
@@ -145,7 +146,7 @@ def cloudfront_invalidation_worker(q, dist_id, cf_connect_timeout, cf_read_timeo
     while True:
         try:
             paths_to_invalidate_keys, caller_ref_suffix = q.get(timeout=60)
-            if paths_to_invalidate_keys is None: # Sinal para terminar
+            if paths_to_invalidate_keys is None:
                 monitor_logger.info(f"CloudFront Invalidation Worker (Thread: {threading.get_ident()}) received sentinel. Exiting.")
                 q.task_done()
                 break
@@ -173,7 +174,7 @@ def cloudfront_invalidation_worker(q, dist_id, cf_connect_timeout, cf_read_timeo
                     f"INVALIDATED_CF_REQUESTED_ASYNC: {len(paths_for_cf_api)} paths on {dist_id} - Batch: {', '.join(paths_to_invalidate_keys)}")
             except (ConnectTimeoutError, ReadTimeoutError) as e_timeout:
                 monitor_logger.error(
-                    f"[Worker-{threading.get_ident()}] Boto3 Timeout ({type(e_timeout).__name__}) during CloudFront invalidation. CallerRef: {caller_reference}. Error: {e_timeout}", exc_info=False) # exc_info=False para não poluir demais com tracebacks de timeout
+                    f"[Worker-{threading.get_ident()}] Boto3 Timeout ({type(e_timeout).__name__}) during CloudFront invalidation. CallerRef: {caller_reference}. Error: {e_timeout}", exc_info=False)
                 transfer_logger.info(
                     f"INVALIDATION_CF_BOTO_TIMEOUT_ASYNC: {len(paths_for_cf_api)} paths - {str(e_timeout)}")
             except ClientError as e_client:
@@ -193,15 +194,14 @@ def cloudfront_invalidation_worker(q, dist_id, cf_connect_timeout, cf_read_timeo
         except queue.Empty:
             monitor_logger.debug(f"CloudFront Invalidation Worker (Thread: {threading.get_ident()}) queue empty, continuing to wait.")
             continue
-        except Exception as e_worker_loop: # Captura exceções no loop do worker
+        except Exception as e_worker_loop:
             monitor_logger.critical(f"CloudFront Invalidation Worker (Thread: {threading.get_ident()}) CRITICAL error in loop: {e_worker_loop}", exc_info=True)
-            time.sleep(5) # Evita spam de logs
+            time.sleep(5)
 
 # --- FileSystem Event Handler Class ---
 class Watcher(FileSystemEventHandler):
     def __init__(self):
         super().__init__()
-        # O cliente CloudFront é usado pelos workers agora
 
     def _is_excluded(self, filepath):
         filename = os.path.basename(filepath)
@@ -220,70 +220,112 @@ class Watcher(FileSystemEventHandler):
 
     def _trigger_batched_cloudfront_invalidation(self, paths_override=None, reference_suffix_override=None):
         global cf_invalidation_paths_batch, cf_invalidation_timer, invalidation_queue
+        monitor_logger.debug(f"[TRIGGER_ENTRY] _trigger_batched_cloudfront_invalidation called. paths_override: {paths_override is not None}, current_batch_size: {len(cf_invalidation_paths_batch)}") # Adicionado
 
         paths_to_enqueue = []
         caller_ref_suffix_for_queue = ""
 
-        with cf_invalidation_lock:
+        monitor_logger.debug("[TRIGGER_LOCK] Attempting to acquire cf_invalidation_lock (RLock).") # Adicionado
+        with cf_invalidation_lock: # RLock permite aquisição reentrante
+            monitor_logger.debug("[TRIGGER_LOCK] cf_invalidation_lock (RLock) ACQUIRED.") # Adicionado
             if paths_override:
                 paths_to_enqueue = list(paths_override)
                 caller_ref_suffix_for_queue = reference_suffix_override if reference_suffix_override else f"override-batch-{len(paths_to_enqueue)}"
-                monitor_logger.info(f"Overridden CloudFront invalidation. Enqueuing {len(paths_to_enqueue)} paths with suffix '{caller_ref_suffix_for_queue}'.")
+                monitor_logger.info(f"[TRIGGER_LOGIC] Overridden CF invalidation. Enqueuing {len(paths_to_enqueue)} paths with suffix '{caller_ref_suffix_for_queue}'.")
             elif not cf_invalidation_paths_batch:
-                monitor_logger.debug("Batched CloudFront invalidation triggered (via timer or batch full), but main batch is empty.")
-                if cf_invalidation_timer:
+                monitor_logger.debug("[TRIGGER_LOGIC] Batched CF invalidation triggered, but main batch is empty. Checking timer.")
+                if cf_invalidation_timer and cf_invalidation_timer.is_alive(): # Checa se timer existe e está vivo
+                    monitor_logger.debug("[TRIGGER_TIMER] Cancelling existing timer (batch empty).")
                     cf_invalidation_timer.cancel()
-                    cf_invalidation_timer = None
+                cf_invalidation_timer = None # Garante que o timer é resetado
+                monitor_logger.debug("[TRIGGER_LOCK] Releasing cf_invalidation_lock (RLock) (batch empty).") # Adicionado
                 return
             else:
                 paths_to_enqueue = list(cf_invalidation_paths_batch)
                 caller_ref_suffix_for_queue = f"batch-{len(paths_to_enqueue)}"
                 cf_invalidation_paths_batch = []
-                monitor_logger.debug(f"CloudFront invalidation main batch (size {len(paths_to_enqueue)}) reset. Enqueuing for async processing with suffix '{caller_ref_suffix_for_queue}'.")
+                monitor_logger.debug(f"[TRIGGER_LOGIC] CF invalidation main batch (size {len(paths_to_enqueue)}) reset. Enqueuing for async processing with suffix '{caller_ref_suffix_for_queue}'.")
 
-            if cf_invalidation_timer:
+            if cf_invalidation_timer and cf_invalidation_timer.is_alive(): # Checa se timer existe e está vivo
+                monitor_logger.debug("[TRIGGER_TIMER] Cancelling existing timer (batch being enqueued/processed).")
                 cf_invalidation_timer.cancel()
-                cf_invalidation_timer = None
-                monitor_logger.debug("Cancelled CloudFront invalidation timer as batch is being enqueued.")
+            cf_invalidation_timer = None # Garante que o timer é resetado
+            monitor_logger.debug("[TRIGGER_LOCK] Releasing cf_invalidation_lock (RLock) (before enqueue logic).") # Adicionado
+        # Fim do bloco 'with cf_invalidation_lock'
 
         if not paths_to_enqueue:
-            monitor_logger.debug("No paths to enqueue for invalidation.")
+            monitor_logger.debug("[TRIGGER_ENQUEUE] No paths to enqueue for invalidation after lock release.")
             return
 
         if not CLOUDFRONT_DISTRIBUTION_ID:
             monitor_logger.warning(
-                f"CLOUDFRONT_DISTRIBUTION_ID not set. Skipping enqueueing CloudFront invalidation for: {paths_to_enqueue}")
+                f"[TRIGGER_ENQUEUE] CLOUDFRONT_DISTRIBUTION_ID not set. Skipping enqueueing for: {paths_to_enqueue}")
             return
 
+        monitor_logger.info(f"[TRIGGER_ENQUEUE] Attempting to put {len(paths_to_enqueue)} paths onto invalidation_queue (Suffix: {caller_ref_suffix_for_queue}).") # Adicionado
         try:
             invalidation_queue.put((paths_to_enqueue, caller_ref_suffix_for_queue))
-            monitor_logger.info(f"Enqueued {len(paths_to_enqueue)} paths for CloudFront invalidation (Suffix: {caller_ref_suffix_for_queue}). Current queue size: {invalidation_queue.qsize()}")
+            monitor_logger.info(f"[TRIGGER_ENQUEUE] Successfully enqueued {len(paths_to_enqueue)} paths. Current queue size: {invalidation_queue.qsize()}") # Adicionado
         except Exception as e_enqueue:
-            monitor_logger.error(f"Error enqueuing paths for CloudFront invalidation: {e_enqueue}", exc_info=True)
+            monitor_logger.error(f"[TRIGGER_ENQUEUE] Error enqueuing paths for CF invalidation: {e_enqueue}", exc_info=True)
+        
+        monitor_logger.debug(f"[TRIGGER_EXIT] _trigger_batched_cloudfront_invalidation finished for suffix {caller_ref_suffix_for_queue}.") # Adicionado
 
     def _add_to_cf_invalidation_batch(self, object_key_to_invalidate):
         global cf_invalidation_paths_batch, cf_invalidation_timer
-        with cf_invalidation_lock:
+        monitor_logger.debug(f"[ADD_BATCH_ENTRY] _add_to_cf_invalidation_batch called for '{object_key_to_invalidate}'.") # Adicionado
+
+        trigger_invalidation_now = False # Flag para chamar _trigger_batched_... fora do lock
+
+        monitor_logger.debug("[ADD_BATCH_LOCK] Attempting to acquire cf_invalidation_lock (RLock).") # Adicionado
+        with cf_invalidation_lock: # RLock permite aquisição reentrante
+            monitor_logger.debug("[ADD_BATCH_LOCK] cf_invalidation_lock (RLock) ACQUIRED.") # Adicionado
             if object_key_to_invalidate not in cf_invalidation_paths_batch:
                 cf_invalidation_paths_batch.append(object_key_to_invalidate)
                 monitor_logger.info(
-                    f"Added '{object_key_to_invalidate}' to CloudFront invalidation batch. Batch size: {len(cf_invalidation_paths_batch)}")
+                    f"[ADD_BATCH_LOGIC] Added '{object_key_to_invalidate}' to CF invalidation batch. Batch size: {len(cf_invalidation_paths_batch)}")
+            else:
+                monitor_logger.debug(f"[ADD_BATCH_LOGIC] '{object_key_to_invalidate}' already in batch. Skipping add.")
 
-            if cf_invalidation_timer:
+            if cf_invalidation_timer and cf_invalidation_timer.is_alive():
+                monitor_logger.debug("[ADD_BATCH_TIMER] Cancelling existing CF invalidation timer.")
                 cf_invalidation_timer.cancel()
-                monitor_logger.debug("Cancelled existing CloudFront invalidation timer.")
+            # Não resetar cf_invalidation_timer para None aqui, pois pode ser recriado abaixo.
 
             if len(cf_invalidation_paths_batch) >= CF_INVALIDATION_BATCH_MAX_SIZE:
                 monitor_logger.info(
-                    f"CloudFront invalidation batch reached max size ({CF_INVALIDATION_BATCH_MAX_SIZE}). Triggering (will be enqueued).")
-                self._trigger_batched_cloudfront_invalidation()
+                    f"[ADD_BATCH_LOGIC] CF invalidation batch reached max size ({CF_INVALIDATION_BATCH_MAX_SIZE}). Will trigger after lock release.")
+                trigger_invalidation_now = True
+                cf_invalidation_timer = None # Timer não é mais necessário, o lote será processado
             elif cf_invalidation_paths_batch:
+                monitor_logger.debug(f"[ADD_BATCH_TIMER] Batch size {len(cf_invalidation_paths_batch)} < max. (Re)starting timer for {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s.")
                 cf_invalidation_timer = threading.Timer(
-                    CF_INVALIDATION_BATCH_TIMEOUT_SECONDS, self._trigger_batched_cloudfront_invalidation)
+                    CF_INVALIDATION_BATCH_TIMEOUT_SECONDS, self._trigger_batched_cloudfront_invalidation_from_timer_context) # Método helper
                 cf_invalidation_timer.daemon = True
                 cf_invalidation_timer.start()
-                monitor_logger.debug(
-                    f"CloudFront invalidation timer (re)started for {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s. Batch size: {len(cf_invalidation_paths_batch)}")
+            else:
+                monitor_logger.debug("[ADD_BATCH_LOGIC] Batch is empty, no timer started/restarted.")
+                cf_invalidation_timer = None # Garante que não há timer pendente se o lote esvaziar
+
+            monitor_logger.debug("[ADD_BATCH_LOCK] Releasing cf_invalidation_lock (RLock).") # Adicionado
+        # Fim do bloco 'with cf_invalidation_lock'
+        
+        if trigger_invalidation_now:
+            monitor_logger.debug("[ADD_BATCH_TRIGGER_NOW] Calling _trigger_batched_cloudfront_invalidation due to full batch (lock released).")
+            self._trigger_batched_cloudfront_invalidation() # Chamado fora do lock
+        
+        monitor_logger.debug(f"[ADD_BATCH_EXIT] _add_to_cf_invalidation_batch finished for '{object_key_to_invalidate}'.") # Adicionado
+
+    def _trigger_batched_cloudfront_invalidation_from_timer_context(self):
+        """Helper method to be called by the timer.
+           Ensures that the call to _trigger_batched_cloudfront_invalidation
+           does not happen from within the timer's execution context if it could
+           lead to issues with lock re-acquisition by the same timer thread (though RLock handles this).
+           More importantly, it clearly demarcates the source of the trigger.
+        """
+        monitor_logger.info(f"CloudFront invalidation timer (target: {CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s) expired. Triggering batch processing.")
+        self._trigger_batched_cloudfront_invalidation()
+
 
     def _handle_s3_upload(self, local_path, relative_file_path, is_initial_sync=False):
         effective_replace_with_placeholder = DELETE_FROM_EFS_AFTER_SYNC and not is_initial_sync
@@ -390,7 +432,7 @@ class Watcher(FileSystemEventHandler):
             if not relevant_src or not relative_src_path: return
             monitor_logger.info(f"Event: MOVED_FROM for relevant file '{relative_src_path}' (full: {path})")
             ignore_s3_deletion_for_moved_src = False
-            with efs_deletion_lock:
+            with efs_deletion_lock: # Usa RLock
                 if path in efs_deleted_by_script:
                     monitor_logger.info(f"EFS MOVED_FROM for '{path}' was script-initiated. Not deleting from S3 for source.")
                     efs_deleted_by_script.remove(path)
@@ -440,10 +482,10 @@ def run_s3_sync_command(command_parts, description):
             monitor_logger.info(f"Initial Sync for {description} OK.")
             transfer_logger.info(f"INITIAL_SYNC_SUCCESS: {description}")
             return True
-        elif process.returncode == 2: # RC 2 for s3 sync can mean some files didn't sync
+        elif process.returncode == 2:
             monitor_logger.warning(f"Initial Sync for {description} RC 2 (some files may not have synced). Stderr: {process.stderr.strip()}")
             transfer_logger.info(f"INITIAL_SYNC_WARNING_RC2: {description} - ERR: {process.stderr.strip()}")
-            return True # Still proceed
+            return True
         else:
             monitor_logger.error(f"Initial Sync for {description} FAILED. RC: {process.returncode}. Stderr: {process.stderr.strip()}")
             transfer_logger.info(f"INITIAL_SYNC_FAILED: {description} - RC={process.returncode} ERR={process.stderr.strip()}")
@@ -477,8 +519,9 @@ def perform_initial_sync(watcher_instance):
     wp_content_path = os.path.join(MONITOR_DIR_BASE, "wp-content")
     if os.path.isdir(wp_content_path):
         cmd = [AWS_CLI_PATH, 's3', 'sync', wp_content_path, f"s3://{S3_BUCKET}/wp-content/",
-               '--exclude', '*.php', '--exclude', '*/index.php', '--exclude', '*/cache/*',
-               '--exclude', '*/backups/*', '--exclude', '*/.DS_Store', '--exclude', '*/Thumbs.db',
+               '--exclude', '*.php', '--exclude', '*/index.php', '--exclude', 'wp-content/cache/*', # Corrigido wp-content/cache/*
+               '--exclude', 'wp-content/backups/*', # Corrigido wp-content/backups/*
+               '--exclude', '*/.DS_Store', '--exclude', '*/Thumbs.db',
                '--exclude', '*/node_modules/*', '--exclude', '*/.git/*'] + \
               includes_for_sync_cmd + ['--exact-timestamps', '--acl', 'private', '--only-show-errors']
         run_s3_sync_command(cmd, "wp-content")
@@ -497,6 +540,7 @@ def perform_initial_sync(watcher_instance):
     if DELETE_FROM_EFS_AFTER_SYNC:
         monitor_logger.info("--- Starting EFS placeholder replacement for initially synced files ---")
         for scan_root in (p for p in (wp_content_path, wp_includes_path) if os.path.isdir(p)):
+            monitor_logger.info(f"Scanning '{scan_root}' for files to replace with placeholders...") # Log do diretório raiz
             for root, _, files in os.walk(scan_root):
                 for filename in files:
                     local_path = os.path.join(root, filename)
@@ -505,31 +549,49 @@ def perform_initial_sync(watcher_instance):
                     if is_relevant and os.path.splitext(local_path)[1].lower() in PLACEHOLDER_TARGET_EXTENSIONS_EFS:
                         try:
                             if os.path.exists(local_path) and \
-                               os.path.getsize(local_path) == len(PLACEHOLDER_CONTENT.encode('utf-8')) and \
-                               open(local_path, 'r').read() == PLACEHOLDER_CONTENT:
-                                continue # Already a placeholder
-                        except OSError: pass
-                        if os.path.exists(local_path):
+                               os.path.getsize(local_path) == len(PLACEHOLDER_CONTENT.encode('utf-8')):
+                                with open(local_path, 'r') as f_check: content = f_check.read()
+                                if content == PLACEHOLDER_CONTENT:
+                                    monitor_logger.debug(f"File '{local_path}' is already a placeholder. Skipping.")
+                                    continue
+                        except OSError: pass # Ignorar erros ao ler o arquivo, tentar substituí-lo
+                        if os.path.exists(local_path): # Checar novamente antes de tentar substituir
+                            monitor_logger.info(f"Initial Sync: Replacing EFS file '{local_path}' with placeholder.")
                             _replace_efs_file_with_placeholder(local_path, rel_path)
+                        else:
+                             monitor_logger.warning(f"Initial Sync: File '{local_path}' disappeared before placeholder replacement.")
         monitor_logger.info("--- EFS placeholder replacement Attempted ---")
 
     if CLOUDFRONT_DISTRIBUTION_ID:
         monitor_logger.info("Initial sync complete. Enqueuing full CloudFront invalidation (/*).")
         watcher_instance._trigger_batched_cloudfront_invalidation(paths_override=['/*'], reference_suffix_override="initial-sync-full")
 
-
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    script_version_tag = "v2.4.3-AsyncCFInvalidation"
+    script_version_tag = "v2.4.4-RLockFix" # Atualizar a tag da versão
     monitor_logger.info(f"Python Watchdog Monitor ({script_version_tag}) starting for '{MONITOR_DIR_BASE}'.")
-    # ... (outros logs de inicialização)
+    monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
+    monitor_logger.info(f"Relevant Patterns (raw): {RELEVANT_PATTERNS_STR}")
+    monitor_logger.info(f"Relevant Watcher Patterns (parsed): {RELEVANT_PATTERNS}")
+    monitor_logger.info(f"Replace EFS files with placeholders: {DELETE_FROM_EFS_AFTER_SYNC} (Hardcoded)")
+    monitor_logger.info(f"EFS file extensions for placeholders: {PLACEHOLDER_TARGET_EXTENSIONS_EFS}")
+    monitor_logger.info(f"Perform initial sync: {PERFORM_INITIAL_SYNC} (Hardcoded)")
+    monitor_logger.info(f"CloudFront Distribution ID: {CLOUDFRONT_DISTRIBUTION_ID if CLOUDFRONT_DISTRIBUTION_ID else 'Not Set'}")
+    monitor_logger.info(f"CF Invalidation Batch: MaxSize={CF_INVALIDATION_BATCH_MAX_SIZE}, Timeout={CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s")
+    monitor_logger.info(f"AWS CLI Timeouts: S3 CP={AWS_CLI_TIMEOUT_S3_CP}s, S3 RM={AWS_CLI_TIMEOUT_S3_RM}s")
+    monitor_logger.info(f"Boto3 CF Timeouts: Connect={BOTO3_CLOUDFRONT_CONNECT_TIMEOUT}s, Read={BOTO3_CLOUDFRONT_READ_TIMEOUT}s")
     monitor_logger.info(f"Max Invalidation Workers: {MAX_INVALIDATION_WORKERS}")
 
     if not S3_BUCKET: monitor_logger.critical("S3_BUCKET not set. Exiting."); exit(1)
     if not os.path.isdir(MONITOR_DIR_BASE): monitor_logger.critical(f"Monitor dir '{MONITOR_DIR_BASE}' not found. Exiting."); exit(1)
-    AWS_CLI_PATH = shutil.which(AWS_CLI_PATH) or AWS_CLI_PATH # Resolve para path completo se possível
-    if not shutil.which(AWS_CLI_PATH): monitor_logger.critical(f"AWS CLI at '{AWS_CLI_PATH}' not found. Exiting."); exit(1)
+    
+    resolved_cli_path = shutil.which(AWS_CLI_PATH)
+    if not resolved_cli_path:
+        monitor_logger.critical(f"AWS CLI (configured as '{AWS_CLI_PATH}') not found in PATH or as absolute path. Exiting.")
+        exit(1)
+    AWS_CLI_PATH = resolved_cli_path # Usar o caminho resolvido
     monitor_logger.info(f"Using AWS CLI at: {AWS_CLI_PATH}")
+
     try: boto3.client('s3'); monitor_logger.info("Boto3 S3 client OK.")
     except Exception as e: monitor_logger.critical(f"Boto3 S3 client init failed: {e}", exc_info=True); exit(1)
 
@@ -545,11 +607,12 @@ if __name__ == "__main__":
             invalidation_worker_threads.append(thread)
         monitor_logger.info(f"Started {len(invalidation_worker_threads)} CloudFront invalidation worker(s).")
     else:
-        monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set, workers NOT started.")
+        monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set, CloudFront invalidation workers NOT started.")
 
     event_handler = Watcher()
     if PERFORM_INITIAL_SYNC: perform_initial_sync(event_handler)
-    if not RELEVANT_PATTERNS: monitor_logger.warning("RELEVANT_PATTERNS is empty. Watcher may not process new files as expected.")
+    if not RELEVANT_PATTERNS_STR or not RELEVANT_PATTERNS:
+         monitor_logger.warning(f"RELEVANT_PATTERNS_STR ('{RELEVANT_PATTERNS_STR}') is empty or resulted in no valid patterns. Watchdog will only process initial sync and deletions if patterns were previously matched.")
 
     observer = Observer()
     observer.schedule(event_handler, MONITOR_DIR_BASE, recursive=True)
@@ -569,33 +632,44 @@ if __name__ == "__main__":
             monitor_logger.info("Stopping observer...")
             observer.stop()
         monitor_logger.info("Waiting for observer to join...")
-        observer.join()
+        observer.join() # Esperar o observer thread terminar
         monitor_logger.info("Observer stopped and joined.")
 
+        # Sinalizar e esperar workers
         if CLOUDFRONT_DISTRIBUTION_ID and invalidation_worker_threads:
             monitor_logger.info("Signaling CloudFront invalidation workers to terminate...")
             for _ in invalidation_worker_threads:
-                try: invalidation_queue.put((None, None), block=False)
+                try: invalidation_queue.put((None, None), block=False, timeout=1) # Adicionar timeout ao put
                 except queue.Full: monitor_logger.warning("Queue full while sending termination sentinels."); break
             
-            monitor_logger.info(f"Waiting for {invalidation_queue.qsize()} items in invalidation queue to be processed (max 30s)...")
+            monitor_logger.info(f"Waiting for {invalidation_queue.qsize()} items in invalidation queue to be processed (max ~{MAX_INVALIDATION_WORKERS * (BOTO3_CLOUDFRONT_READ_TIMEOUT + 5)}s)...")
             try:
-                invalidation_queue.join() # Espera que a fila seja esvaziada pelos workers
-                monitor_logger.info("Invalidation queue processed.")
-            except Exception as e_q_join: # Em Python < 3.9, join() não tem timeout, mas KeyboardInterrupt pode ocorrer
-                 monitor_logger.warning(f"Exception during invalidation_queue.join(): {e_q_join}. Some tasks might be pending.")
+                # Não há timeout no join da fila, mas os workers têm timeout no get
+                # Se a fila não esvaziar, os workers podem estar bloqueados ou mortos
+                # Vamos esperar um tempo razoável baseado no número de workers e timeout de leitura deles
+                # Esta é uma heurística, pois q.join() bloqueia indefinidamente.
+                # Alternativa seria verificar q.empty() periodicamente.
+                all_processed = False
+                timeout_join = MAX_INVALIDATION_WORKERS * (BOTO3_CLOUDFRONT_READ_TIMEOUT + 10) # Tempo extra
+                start_join_time = time.time()
+                while not invalidation_queue.empty():
+                    if time.time() - start_join_time > timeout_join:
+                        monitor_logger.warning(f"Timeout waiting for invalidation queue to empty. {invalidation_queue.qsize()} items may remain.")
+                        break
+                    time.sleep(0.5)
+                else: # Ocorre se o loop while terminar normalmente (fila vazia)
+                    all_processed = True
+                
+                if all_processed:
+                    monitor_logger.info("Invalidation queue appears processed (empty).")
+                
+                # Agora que a fila está (esperançosamente) vazia ou deu timeout, os workers devem pegar os sentinels
+                # e terminar. Se não, eles são daemon e o programa principal sairá de qualquer maneira.
 
-
-            # # Esperar os threads terminarem (opcional, pois são daemon e a fila join() deve cobrir)
-            # for t in invalidation_worker_threads:
-            #     if t.is_alive():
-            #         monitor_logger.info(f"Joining worker thread {t.name}...")
-            #         t.join(timeout=5) # Dê um pequeno timeout para o join do thread
-            #         if t.is_alive():
-            #              monitor_logger.warning(f"Worker thread {t.name} did not exit cleanly after sentinel and join.")
+            except Exception as e_q_join:
+                 monitor_logger.warning(f"Exception during invalidation_queue final processing: {e_q_join}. Some tasks might be pending.")
         
-        # Cancela o timer principal de invalidação, se ativo
-        with cf_invalidation_lock:
+        with cf_invalidation_lock: # RLock
             if cf_invalidation_timer and cf_invalidation_timer.is_alive():
                 monitor_logger.info("Cancelling main CloudFront invalidation timer.")
                 cf_invalidation_timer.cancel()
