@@ -1,58 +1,55 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.3.7
+# Versão: 2.4.1 (Remove S3 Hook Deleter PHP, suporta Python Script v2.5.0+)
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.6.sh" # VERSÃO ATUALIZADA
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.1.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.3.6_env_vars.sh" # VERSÃO ATUALIZADA
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.1_env_vars.sh"
 
 # Script de Monitoramento Python e Serviço
-readonly PYTHON_MONITOR_SCRIPT_NAME="efs_s3_monitor_v2.3.3.py" # Mantido, se não houver alteração nele
-readonly PYTHON_MONITOR_SCRIPT_PATH="/usr/local/bin/$PYTHON_MONITOR_SCRIPT_NAME"
-readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.3.6" # VERSÃO ATUALIZADA DO SERVIÇO
-readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.3.6.log" # VERSÃO ATUALIZADA
-readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.3.6.log" # VERSÃO ATUALIZADA
+readonly PYTHON_MONITOR_SCRIPT_NAME_LOCAL="efs_s3_monitor_v2.5.0.py" # Nome local do script Python
+readonly PYTHON_MONITOR_SCRIPT_PATH="/usr/local/bin/$PYTHON_MONITOR_SCRIPT_NAME_LOCAL"
+readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.4.1" # Nome do serviço systemd
+readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.4.1.log"
+readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.4.1.log"
 
-# Chave S3 para o script Python
-readonly AWS_S3_PYTHON_SCRIPT_KEY="efs_s3_monitor.py" # Mantido
-
-# Configuração para o S3 Hook Deleter PHP
-readonly S3_HOOK_DELETER_PHP_FILENAME="s3-hook-deleter.php" # Mantido
-readonly AWS_S3_HOOK_DELETER_PHP_KEY="$S3_HOOK_DELETER_PHP_FILENAME"
+# Chave S3 para o script Python (o nome do arquivo no S3 pode ser genérico)
+readonly AWS_S3_PYTHON_SCRIPT_KEY="efs_s3_monitor.py" # Nome do arquivo no S3
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.3.6.log" # VERSÃO ATUALIZADA do log principal
+LOG_FILE="/var/log/wordpress_setup_v2.4.1.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
 ACTIVE_CONFIG_FILE_EFS="$MOUNT_POINT/wp-config.php"
-CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
+CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php" # Será definido após a cópia do WP para o EFS
 HEALTH_CHECK_FILE_PATH_EFS="$MOUNT_POINT/healthcheck.php"
 MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"
 MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
-EFS_OWNER_UID=1000
+EFS_OWNER_UID=1000 # Geralmente ec2-user
 EFS_OWNER_USER="ec2-user"
 
 # --- Variáveis Essenciais (Esperadas do Ambiente, carregadas pelo UserData) ---
 essential_vars=(
     "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0"
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0"
-    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0"
-    "AWS_DB_INSTANCE_TARGET_NAME_0"
+    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0" # Região do segredo do RDS
+    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0"  # Nome do segredo do RDS
+    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0" # Endpoint do RDS (usado como fallback se não estiver no segredo)
+    "AWS_DB_INSTANCE_TARGET_NAME_0"     # Nome da instância/DB (usado como fallback)
     "WPDOMAIN"
-    "ACCOUNT"
-    "AWS_EFS_ACCESS_POINT_TARGET_ID_0"
-    "AWS_S3_BUCKET_TARGET_NAME_0"          # Para o offload de mídia
-    "AWS_S3_BUCKET_TARGET_REGION_0"         # <<< ADICIONADO PARA VERIFICAÇÃO >>> Região do bucket de offload
-    "AWS_S3_BUCKET_TARGET_NAME_SCRIPT"    # Para os scripts de setup/monitor
+    "ACCOUNT" # ID da conta AWS, usado para construir o ARN do segredo
+    "AWS_EFS_ACCESS_POINT_TARGET_ID_0" # Opcional
+    "AWS_S3_BUCKET_TARGET_NAME_0"          # Bucket de mídia
+    "AWS_S3_BUCKET_TARGET_REGION_0"        # Região do bucket de mídia
+    "AWS_S3_BUCKET_TARGET_NAME_SCRIPT"    # Bucket para scripts
     "AWS_S3_BUCKET_TARGET_REGION_SCRIPT"  # Região do bucket de scripts
+    "AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0" # Opcional para invalidação
 )
 
 # --- Função de Auto-Instalação do Script Principal ---
 self_install_script() {
-    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.3.6)..."
+    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.4.1)..."
     local current_script_path; current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
     if ! sudo cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then echo "ERRO CRÍTICO (self_install): Falha ao copiar script. Abortando."; exit 1; fi
@@ -97,54 +94,93 @@ create_wp_config_template() {
     SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
     if [ -n "$SALT" ]; then
         TEMP_SALT_FILE_INNER=$(mktemp /tmp/salts.XXXXXX); sudo chmod 644 "$TEMP_SALT_FILE_INNER"; echo "$SALT" >"$TEMP_SALT_FILE_INNER"
-        sed -i -e '/^define( *'\''AUTH_KEY'\''/d' -e '/^define( *'\''SECURE_AUTH_KEY'\''/d' -e '/^define( *'\''LOGGED_IN_KEY'\''/d' -e '/^define( *'\''NONCE_KEY'\''/d' -e '/^define( *'\''AUTH_SALT'\''/d' -e '/^define( *'\''SECURE_AUTH_SALT'\''/d' -e '/^define( *'\''LOGGED_IN_SALT'\''/d' -e '/^define( *'\''NONCE_SALT'\''/d' "$temp_config_file"
-        if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE_INNER" "$temp_config_file"; else cat "$TEMP_SALT_FILE_INNER" >>"$temp_config_file"; fi
+        # Remove existing salt definitions before inserting new ones
+        sed -i -e '/^define( *'\''AUTH_KEY'\''/d' -e '/^define( *'\''SECURE_AUTH_KEY'\''/d' \
+               -e '/^define( *'\''LOGGED_IN_KEY'\''/d' -e '/^define( *'\''NONCE_KEY'\''/d' \
+               -e '/^define( *'\''AUTH_SALT'\''/d' -e '/^define( *'\''SECURE_AUTH_SALT'\''/d' \
+               -e '/^define( *'\''LOGGED_IN_SALT'\''/d' -e '/^define( *'\''NONCE_SALT'\''/d' "$temp_config_file"
+        # Insert new salts before the marker line or at the end if marker not found
+        if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then
+            sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE_INNER" "$temp_config_file"
+        else
+            cat "$TEMP_SALT_FILE_INNER" >> "$temp_config_file"
+        fi
         rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
-    else echo "ERRO: Falha ao obter SALTS."; fi
-    
-PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.3.6.sh
-\$site_scheme = 'https';
-\$site_host = '$primary_wpdomain_for_fallback';
-if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
-if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') { \$_SERVER['HTTPS'] = 'on'; }
-define('WP_HOME', \$site_scheme . '://' . \$site_host); define('WP_SITEURL', \$site_scheme . '://' . \$site_host);
-define('FS_METHOD', 'direct');
-// Adiciona constantes para o S3 Hook Deleter
-if (!defined('MEU_S3_BUCKET_NAME')) { define('MEU_S3_BUCKET_NAME', '${AWS_S3_BUCKET_TARGET_NAME_0}'); }
-if (!defined('MEU_S3_REGION')) { define('MEU_S3_REGION', '${AWS_S3_BUCKET_TARGET_REGION_0}'); } // <<< ALTERADO PARA USAR A VAR DE AMBIENTE DIRETO
-if (!defined('MEU_S3_BASE_PATH_IN_BUCKET')) { define('MEU_S3_BASE_PATH_IN_BUCKET', 'wp-content/uploads/'); }
+    else echo "AVISO: Falha ao obter SALTS. Recomenda-se configurá-los manualmente."; fi
 
-if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') { \$_SERVER['HTTPS'] = 'on'; }
-if (isset(\$_SERVER['HTTP_X_FORWARDED_SSL']) && \$_SERVER['HTTP_X_FORWARDED_SSL'] == 'on') { \$_SERVER['HTTPS'] = 'on'; }
+PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
+// Gerado por wordpress_setup_v2.4.1.sh
+\$site_scheme = 'https';
+\$site_host = '$primary_wpdomain_for_fallback'; // Fallback, será sobrescrito por X-Forwarded-Host se presente
+
+// Tenta determinar o host real a partir dos cabeçalhos do proxy reverso (ALB)
+if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) {
+    \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']);
+    \$site_host = trim(\$hosts[0]); // Usa o primeiro host se houver múltiplos
+} elseif (!empty(\$_SERVER['HTTP_HOST'])) {
+    \$site_host = \$_SERVER['HTTP_HOST'];
+}
+
+// Determina o esquema (http ou https) com base nos cabeçalhos do proxy
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
+    \$_SERVER['HTTPS'] = 'on';
+    \$site_scheme = 'https';
+} elseif (isset(\$_SERVER['REQUEST_SCHEME']) && \$_SERVER['REQUEST_SCHEME'] === 'https') {
+    // Caso o X-Forwarded-Proto não esteja setado mas o request scheme seja https
+    \$_SERVER['HTTPS'] = 'on';
+    \$site_scheme = 'https';
+} else {
+    \$site_scheme = 'http'; // Fallback para http se nenhum cabeçalho indicar https
+}
+
+define('WP_HOME', \$site_scheme . '://' . \$site_host);
+define('WP_SITEURL', \$site_scheme . '://' . \$site_host);
+
+define('FS_METHOD', 'direct'); // Permite atualizações diretas de plugins/temas
+
+// Configurações para Proxy Reverso (ALB)
+if (isset(\$_SERVER['HTTP_X_FORWARDED_FOR'])) {
+    \$forwarded_for_ips = explode(',', \$_SERVER['HTTP_X_FORWARDED_FOR']);
+    \$_SERVER['REMOTE_ADDR'] = trim(\$forwarded_for_ips[0]); // Pega o IP original do cliente
+}
+
+// Garante que \$_SERVER['HTTPS'] esteja 'on' se X-Forwarded-Proto for https
+// (Já coberto acima, mas reforça para alguns plugins)
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https') {
+    \$_SERVER['HTTPS'] = 'on';
+}
 EOPHP
 )
     TEMP_DEFINES_FILE_INNER=$(mktemp /tmp/defines.XXXXXX); sudo chmod 644 "$TEMP_DEFINES_FILE_INNER"; echo -e "\n$PHP_DEFINES_BLOCK_CONTENT" >"$TEMP_DEFINES_FILE_INNER"
-    if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE_INNER" "$temp_config_file"; else cat "$TEMP_DEFINES_FILE_INNER" >>"$temp_config_file"; fi
-    rm -f "$TEMP_DEFINES_FILE_INNER"; echo "INFO: Defines configurados (incluindo para S3 Hook Deleter usando AWS_S3_BUCKET_TARGET_REGION_0 para MEU_S3_REGION)."
+    if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then
+        sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE_INNER" "$temp_config_file"
+    else
+        cat "$TEMP_DEFINES_FILE_INNER" >> "$temp_config_file"
+    fi
+    rm -f "$TEMP_DEFINES_FILE_INNER"; echo "INFO: Defines de WP_HOME, WP_SITEURL e FS_METHOD configurados."
     echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como '$APACHE_USER'..."
     if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
 }
 
 # --- Função para Baixar e Configurar o Script de Monitoramento Python ---
 setup_python_monitor_script() {
-    echo "INFO: Baixando e configurando script de monitoramento Python ($PYTHON_MONITOR_SCRIPT_NAME)..."
+    echo "INFO: Baixando e configurando script de monitoramento Python ($PYTHON_MONITOR_SCRIPT_NAME_LOCAL)..."
     if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] || [ -z "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}" ] || [ -z "$AWS_S3_PYTHON_SCRIPT_KEY" ]; then
-        echo "ERRO CRÍTICO: Variáveis para download do script Python não definidas."
+        echo "ERRO CRÍTICO: Variáveis para download do script Python não definidas (AWS_S3_BUCKET_TARGET_NAME_SCRIPT, AWS_S3_BUCKET_TARGET_REGION_SCRIPT, AWS_S3_PYTHON_SCRIPT_KEY)."
         exit 1
     fi
     local s3_python_script_uri="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_PYTHON_SCRIPT_KEY}"
-    local temp_python_script_path="/tmp/$(basename "$PYTHON_MONITOR_SCRIPT_PATH")_temp_download"
+    local temp_python_script_path="/tmp/$(basename "$PYTHON_MONITOR_SCRIPT_NAME_LOCAL")_temp_download"
 
     echo "INFO: Tentando baixar script Python de '$s3_python_script_uri' para '$temp_python_script_path'..."
-    sudo rm -f "$temp_python_script_path" 
+    sudo rm -f "$temp_python_script_path" # Remove se já existir
 
     if ! sudo aws s3 cp "$s3_python_script_uri" "$temp_python_script_path" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
-        echo "ERRO CRÍTICO: Falha ao baixar o script Python de '$s3_python_script_uri'."
+        echo "ERRO CRÍTICO: Falha ao baixar o script Python de '$s3_python_script_uri'. Verifique se o arquivo existe no S3 e as permissões da IAM Role."
         exit 1
     fi
 
-    if [ ! -s "$temp_python_script_path" ]; then 
+    if [ ! -s "$temp_python_script_path" ]; then
         echo "ERRO CRÍTICO: Script Python baixado '$temp_python_script_path' está vazio ou não existe."
         exit 1
     fi
@@ -164,7 +200,7 @@ setup_python_monitor_script() {
 
 # --- Função para Criar e Habilitar o Serviço Systemd para Python Monitor ---
 create_and_enable_python_monitor_service() {
-    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.3.6)..."
+    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.4.1)..."
     local service_file_path="/etc/systemd/system/${PYTHON_MONITOR_SERVICE_NAME}.service"
     local patterns_env_str="wp-content/uploads/*;wp-content/themes/*/*.css;wp-content/themes/*/*.js;wp-content/themes/*/*.jpg;wp-content/themes/*/*.jpeg;wp-content/themes/*/*.png;wp-content/themes/*/*.gif;wp-content/themes/*/*.svg;wp-content/themes/*/*.webp;wp-content/themes/*/*.ico;wp-content/themes/*/*.woff;wp-content/themes/*/*.woff2;wp-content/themes/*/*.ttf;wp-content/themes/*/*.eot;wp-content/themes/*/*.otf;wp-content/plugins/*/*.css;wp-content/plugins/*/*.js;wp-content/plugins/*/*.jpg;wp-content/plugins/*/*.jpeg;wp-content/plugins/*/*.png;wp-content/plugins/*/*.gif;wp-content/plugins/*/*.svg;wp-content/plugins/*/*.webp;wp-content/plugins/*/*.ico;wp-content/plugins/*/*.woff;wp-content/plugins/*/*.woff2;wp-includes/js/*;wp-includes/css/*;wp-includes/images/*"
 
@@ -175,65 +211,87 @@ create_and_enable_python_monitor_service() {
     echo "INFO: Limpeza de serviço systemd anterior concluída."
 
     local mount_unit_name; mount_unit_name=$(systemd-escape -p --suffix=mount "$MOUNT_POINT")
-    local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws") 
-    local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" 
+    local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws") # Tenta encontrar o aws cli
+    local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" # Para evitar problemas com caracteres especiais
 
-    local py_delete_from_efs_after_sync="true" 
-    local py_perform_initial_sync="true"      
+    local py_delete_from_efs_after_sync="true" # Configuração para o script Python
+    local py_perform_initial_sync="true"      # Configuração para o script Python
+
+    # O ARN do segredo do RDS é construído na lógica principal e passado aqui
+    local rds_secret_arn_for_service="${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-}"
 
     sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
 [Unit]
-Description=WordPress EFS to S3 Selective Sync Service (Python Watchdog v2.3.6)
+Description=WordPress EFS to S3 Sync & RDS Queue Processor (Python v2.5.0+)
 Documentation=file://$PYTHON_MONITOR_SCRIPT_PATH
 After=network.target remote-fs.target $mount_unit_name
 Requires=$mount_unit_name
 
 [Service]
 Type=simple
-User=root
+User=root # O script Python pode precisar de root para ler/escrever logs e talvez para o AWS CLI
 ExecStart=/usr/bin/python3 $PYTHON_MONITOR_SCRIPT_PATH
 Restart=on-failure
 RestartSec=15s
+Environment="PYTHONUNBUFFERED=1" # Garante que os logs do Python apareçam imediatamente no journald
+
+# Variáveis para EFS Monitor
 Environment="WP_MONITOR_DIR_BASE=$MOUNT_POINT"
-Environment="WP_S3_BUCKET=$AWS_S3_BUCKET_TARGET_NAME_0"
+Environment="WP_S3_BUCKET=$AWS_S3_BUCKET_TARGET_NAME_0" # Usado por ambas as funcionalidades
 Environment="WP_RELEVANT_PATTERNS=$escaped_patterns_env_str"
 Environment="WP_PY_MONITOR_LOG_FILE=$PY_MONITOR_LOG_FILE"
 Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
 Environment="WP_SYNC_DEBOUNCE_SECONDS=5"
 Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" # PATH para o aws cli
 Environment="WP_DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync}"
 Environment="WP_PERFORM_INITIAL_SYNC=${py_perform_initial_sync}"
-Environment="AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0=${AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0:-}" 
+Environment="AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0=${AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0:-}" # Opcional
+
+# Variáveis para a fila de deleção do RDS
+Environment="WP_RDS_DELETION_QUEUE_ENABLED=true" # Ativar por padrão
+Environment="WP_RDS_SECRET_ARN_OR_NAME=${rds_secret_arn_for_service}" # ARN do segredo
+# Fallbacks (o Python priorizará o Secrets Manager se WP_RDS_SECRET_ARN_OR_NAME estiver definido)
+Environment="WP_RDS_HOST=${DB_HOST_ENDPOINT:-}"
+Environment="WP_RDS_USER=${DB_USER:-}"
+Environment="WP_RDS_DB_NAME=${DB_NAME_TO_USE:-}"
+Environment="WP_RDS_PORT=3306" # Padrão, pode ser sobrescrito pelo segredo ou python env var
+# Nomes das tabelas do WordPress para o trigger
+Environment="WP_RDS_POSTS_TABLE_NAME=wp_posts"
+Environment="WP_RDS_POSTMETA_TABLE_NAME=wp_postmeta"
+# Configurações da tabela de fila e polling
+Environment="WP_S3_DELETION_QUEUE_TABLE_NAME=wp_s3_deletion_queue"
+Environment="WP_S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS=900" # 15 minutos
+Environment="WP_S3_DELETION_QUEUE_BATCH_SIZE=10"
+Environment="WP_S3_BASE_PATH_FOR_DELETION_QUEUE=wp-content/uploads/" # Caminho base no S3 para arquivos da fila
 
 [Install]
 WantedBy=multi-user.target
 EOF_PY_SYSTEMD_SERVICE
 
     sudo chmod 644 "$service_file_path"
-    echo "INFO: Arquivo de serviço '$service_file_path' criado."
+    echo "INFO: Arquivo de serviço '$service_file_path' criado com variáveis RDS atualizadas."
 
     echo "INFO: Recarregando daemon systemd, habilitando e iniciando o serviço $PYTHON_MONITOR_SERVICE_NAME..."
     sudo systemctl daemon-reload
     sudo systemctl enable "$PYTHON_MONITOR_SERVICE_NAME.service"
     if sudo systemctl start "$PYTHON_MONITOR_SERVICE_NAME.service"; then
         echo "INFO: Serviço Python $PYTHON_MONITOR_SERVICE_NAME iniciado com sucesso."
-        sleep 3 
+        sleep 3 # Dá um tempo para o serviço iniciar e logar algo
         sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
     else
         echo "ERRO: Falha ao iniciar o serviço Python $PYTHON_MONITOR_SERVICE_NAME."
         sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
-        journalctl -u "$PYTHON_MONITOR_SERVICE_NAME" -n 50 --no-pager 
+        journalctl -u "$PYTHON_MONITOR_SERVICE_NAME" -n 50 --no-pager # Mostra os últimos logs do serviço
     fi
 }
 
 # --- Lógica Principal de Execução ---
-exec > >(tee -a "${LOG_FILE}") 2>&1
+exec > >(tee -a "${LOG_FILE}") 2>&1 # Redireciona stdout e stderr para o arquivo de log e para o console
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.3.6-s3-region-fix) ($(date)) ---" # VERSÃO ATUALIZADA
+echo "INFO: --- Iniciando Script WordPress Setup (v2.4.1) ($(date)) ---"
 echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
-echo "INFO: Python Script S3 Key (Hardcoded): $AWS_S3_PYTHON_SCRIPT_KEY"
-echo "INFO: S3 Hook Deleter PHP Filename (do S3): $S3_HOOK_DELETER_PHP_FILENAME (Key: $AWS_S3_HOOK_DELETER_PHP_KEY)"
+echo "INFO: Python Script Local Name: $PYTHON_MONITOR_SCRIPT_NAME_LOCAL (from S3 key: $AWS_S3_PYTHON_SCRIPT_KEY)"
 echo "INFO: =================================================="
 
 if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root."; exit 1; fi
@@ -241,222 +299,210 @@ if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root.
 self_install_script
 
 echo "INFO: Verificando e imprimindo variáveis de ambiente essenciais..."
-if [ -z "${ACCOUNT:-}" ]; then 
+# Construir o ARN do Segredo do RDS (necessário para passar ao serviço Python)
+AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
+if [ -z "${ACCOUNT:-}" ]; then # Tenta obter ACCOUNT ID se não estiver definido
     ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
-    if [ -n "$ACCOUNT_STS" ]; then 
+    if [ -n "$ACCOUNT_STS" ]; then
         ACCOUNT="$ACCOUNT_STS"
         echo "INFO: ACCOUNT ID obtido via STS: $ACCOUNT"
-    else 
-        echo "AVISO: Falha obter ACCOUNT ID via STS. Será necessário para ARN do Secrets Manager."
-        ACCOUNT="" 
+    else
+        echo "AVISO: Falha obter ACCOUNT ID via STS. Será necessário para construir o ARN completo do Secrets Manager."
+        ACCOUNT="" # Garante que está vazio se a obtenção falhar
     fi
 fi
-
-AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
 if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ] && \
    [ -n "${ACCOUNT:-}" ] && \
-   [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then 
+   [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then
     AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
 fi
 
 error_found=0
-echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS E HARDCODED ---"
+echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS E CONSTRUÍDAS ---"
 for var_name in "${essential_vars[@]}"; do
-    current_var_value="${!var_name:-UNDEFINED}"
+    current_var_value="${!var_name:-UNDEFINED}" # Para mostrar UNDEFINED no log se vazia
     var_name_for_check="$var_name"
-    current_var_value_to_check="${!var_name:-}"
+    current_var_value_to_check="${!var_name:-}" # Para a verificação de -z
 
-    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then 
+    # Para o ARN do segredo, usamos a variável construída para a verificação
+    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then
         current_var_value_to_check="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"
-        var_name_for_check="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (de $var_name)"
+        var_name_for_check="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (construído de NAME, REGION, ACCOUNT)"
+        current_var_value="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" # Para o log
     fi
-    
-    echo "INFO: Var (env): $var_name_for_check = '$current_var_value_to_check'"
-    # AWS_EFS_ACCESS_POINT_TARGET_ID_0 e AWS_CLOUDFRONT_DISTRIBUTION_ID_0 são opcionais (verificar se são realmente opcionais para todas as funcionalidades)
+
+    echo "INFO: Var (env/construída): $var_name_for_check = '$current_var_value'"
+    # AWS_EFS_ACCESS_POINT_TARGET_ID_0 e AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0 são opcionais
     if [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && \
-       [ "$var_name" != "AWS_CLOUDFRONT_DISTRIBUTION_ID_0" ] && \
-       [ -z "$current_var_value_to_check" ]; then 
-        echo "ERRO: Var essencial '$var_name_for_check' vazia."
+       [ "$var_name" != "AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0" ] && \
+       [ -z "$current_var_value_to_check" ]; then
+        echo "ERRO: Var essencial '$var_name_for_check' está vazia."
         error_found=1
     fi
 done
-echo "INFO: Var (hardcoded): AWS_S3_PYTHON_SCRIPT_KEY = '$AWS_S3_PYTHON_SCRIPT_KEY'"
+echo "INFO: Var (hardcoded S3 Key): AWS_S3_PYTHON_SCRIPT_KEY = '$AWS_S3_PYTHON_SCRIPT_KEY'"
 if [ -z "$AWS_S3_PYTHON_SCRIPT_KEY" ]; then echo "ERRO CRÍTICO: Constante AWS_S3_PYTHON_SCRIPT_KEY está vazia no script!"; error_found=1; fi
-echo "INFO: Var (hardcoded): AWS_S3_HOOK_DELETER_PHP_KEY = '$AWS_S3_HOOK_DELETER_PHP_KEY'"
-if [ -z "$AWS_S3_HOOK_DELETER_PHP_KEY" ]; then echo "ERRO CRÍTICO: Constante AWS_S3_HOOK_DELETER_PHP_KEY está vazia no script!"; error_found=1; fi
 echo "INFO: --- FIM DOS VALORES DAS VARIÁVEIS ---"
 if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando ou mal configuradas. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
-echo "INFO: Instalando pacotes base do sistema..."
+echo "INFO: Instalando pacotes base do sistema (yum update, httpd, jq, aws-cli, mysql, efs-utils, wget, unzip)..."
 sudo yum update -y -q
-sudo amazon-linux-extras install -y epel -q 
+sudo amazon-linux-extras install -y epel -q # Para pacotes adicionais se necessário
 sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils wget unzip
 echo "INFO: Pacotes base do sistema instalados."
 
-PHP_VERSION_EXTRA="php7.4"
+PHP_VERSION_EXTRA="php7.4" # Ou a versão que você está usando, ex: php8.0, php8.1
 echo "INFO: Habilitando e instalando PHP via Amazon Linux Extras ($PHP_VERSION_EXTRA)..."
 sudo amazon-linux-extras enable "$PHP_VERSION_EXTRA" -y -q
 sudo yum install -y -q \
     php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip \
     php-gd php-mbstring php-soap php-opcache php-bcmath php-intl php-pear \
-    php-devel gcc # Adicionado php-devel e gcc para compilação do Composer se necessário
+    php-devel gcc # php-devel e gcc podem ser necessários para algumas extensões PECL ou compilação do Composer
 
-if ! sudo rpm -q php-fpm || ! sudo rpm -q php-cli || ! sudo rpm -q php-json; then 
+if ! sudo rpm -q php-fpm || ! sudo rpm -q php-cli || ! sudo rpm -q php-json; then
     echo "ERRO CRÍTICO: Pacotes PHP essenciais (php-fpm, php-cli, php-json) não foram instalados corretamente com $PHP_VERSION_EXTRA."
-    exit 1; 
+    exit 1;
 fi
 echo "INFO: PHP ($PHP_VERSION_EXTRA) e módulos instalados."
-php -v 
+php -v
 
-if ! command -v composer &> /dev/null; then
-    echo "INFO: Instalando Composer..."
-    EXPECTED_CHECKSUM="$(wget -q -O - https://composer.github.io/installer.sig)"
-    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
-    ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
-    
-    if [ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]; then
-        >&2 echo 'ERRO: Invalid installer checksum para Composer.'
-        rm -f composer-setup.php
-        exit 1
-    fi
-    
-    sudo php composer-setup.php --quiet --install-dir=/usr/local/bin --filename=composer 
-    RESULT=$?
-    rm -f composer-setup.php 
-    if [ $RESULT -ne 0 ]; then echo "ERRO: Falha ao executar setup do composer. Código de saída: $RESULT"; exit $RESULT; fi
-    echo "INFO: Composer instalado."
-else
-    echo "INFO: Composer já está instalado."
-fi
-composer --version 
+# A instalação do Composer é opcional se não houver mais plugins PHP que o exijam
+# if ! command -v composer &> /dev/null; then
+#     echo "INFO: Instalando Composer..."
+#     # ... (lógica de instalação do Composer) ...
+# else
+#     echo "INFO: Composer já está instalado."
+# fi
+# composer --version
 
-echo "INFO: Instalando Python3, pip, watchdog e boto3..."
+echo "INFO: Instalando Python3, pip e bibliotecas Python necessárias (watchdog, boto3, pymysql, phpserialize)..."
 sudo yum install -y -q python3 python3-pip
-sudo pip3 install --upgrade pip 
-sudo pip3 install watchdog boto3 
-echo "INFO: Python3, pip, watchdog e boto3 instalados."
+sudo pip3 install --upgrade pip
+sudo pip3 install watchdog boto3 pymysql phpserialize
+echo "INFO: Python3, pip e bibliotecas Python instalados."
 echo "INFO: Todos os pacotes de pré-requisitos foram processados."
 
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
 
 echo "INFO: Testando escrita EFS como '$EFS_OWNER_USER'..."
 TEMP_EFS_TEST_FILE="$MOUNT_POINT/efs_write_test_$(date +%s).txt"
-if sudo -u "$EFS_OWNER_USER" touch "$TEMP_EFS_TEST_FILE"; then 
+if sudo -u "$EFS_OWNER_USER" touch "$TEMP_EFS_TEST_FILE"; then
     echo "INFO: Teste escrita EFS OK."
     sudo -u "$EFS_OWNER_USER" rm "$TEMP_EFS_TEST_FILE"
-else 
+else
     echo "ERRO: Teste escrita EFS FALHOU. Verifique permissões do EFS Access Point e do mount."
     ls -ld "$MOUNT_POINT"
     exit 1
 fi
 
-echo "INFO: Obtendo creds RDS..."
+# Obtenção de credenciais RDS (DB_USER, DB_PASSWORD_FOR_WPCONFIG, DB_NAME_TO_USE, DB_HOST_ENDPOINT)
+# A senha real para o Python virá do Secrets Manager.
+# Estas são para o wp-config.php e como fallbacks para o Python.
+echo "INFO: Obtendo detalhes do RDS do Secrets Manager para wp-config.php e fallbacks Python..."
 if [ -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" ]; then
-    echo "ERRO CRÍTICO: ARN do Secrets Manager não pôde ser construído."
+    echo "ERRO CRÍTICO: ARN do Secrets Manager não pôde ser construído. Necessário para obter detalhes do RDS."
     exit 1
 fi
 SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" --query 'SecretString' --output text --region "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0")
-if [ -z "$SECRET_STRING_VALUE" ]; then echo "ERRO: Falha obter segredo RDS."; exit 1; fi
-DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username); DB_PASSWORD=$(echo "$SECRET_STRING_VALUE" | jq -r .password)
-if [ -z "$DB_USER" ]||[ "$DB_USER" == "null" ]||[ -z "$DB_PASSWORD" ]||[ "$DB_PASSWORD" == "null" ]; then echo "ERRO: Falha extrair user/pass RDS."; exit 1; fi
-DB_NAME_TO_USE="$AWS_DB_INSTANCE_TARGET_NAME_0"
-echo "INFO (DB Setup): Nome do DB será: '$DB_NAME_TO_USE' (de AWS_DB_INSTANCE_TARGET_NAME_0)"
-if [ "$DB_NAME_TO_USE" == "null" ] || [ -z "$DB_NAME_TO_USE" ]; then echo "ERRO CRÍTICO: Nome DB não determinado de AWS_DB_INSTANCE_TARGET_NAME_0 ('$AWS_DB_INSTANCE_TARGET_NAME_0')."; exit 1; fi
-DB_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1) 
-echo "INFO: Creds RDS OK (User: $DB_USER, DB: $DB_NAME_TO_USE)."
+if [ -z "$SECRET_STRING_VALUE" ]; then echo "ERRO: Falha obter segredo RDS do Secrets Manager."; exit 1; fi
 
-echo "INFO: Verificando WP em '$MOUNT_POINT/wp-includes'..."
+DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username)
+DB_PASSWORD_FOR_WPCONFIG=$(echo "$SECRET_STRING_VALUE" | jq -r .password) # Apenas para o wp-config.php
+DB_NAME_FROM_SECRET=$(echo "$SECRET_STRING_VALUE" | jq -r .dbname)
+DB_HOST_FROM_SECRET=$(echo "$SECRET_STRING_VALUE" | jq -r .host)
+
+# Prioriza valores do segredo, depois de AWS_DB_INSTANCE_TARGET_NAME_0/ENDPOINT_0 (para fallback no Python e uso no wp-config)
+DB_NAME_TO_USE="${DB_NAME_FROM_SECRET:-${AWS_DB_INSTANCE_TARGET_NAME_0}}"
+DB_HOST_ENDPOINT="${DB_HOST_FROM_SECRET:-$(echo "${AWS_DB_INSTANCE_TARGET_ENDPOINT_0:-}" | cut -d: -f1)}" # Adicionado :- para evitar erro se AWS_DB_INSTANCE_TARGET_ENDPOINT_0 for vazio
+
+if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || \
+   [ -z "$DB_PASSWORD_FOR_WPCONFIG" ] || [ "$DB_PASSWORD_FOR_WPCONFIG" == "null" ] || \
+   [ -z "$DB_NAME_TO_USE" ] || [ "$DB_NAME_TO_USE" == "null" ] || \
+   [ -z "$DB_HOST_ENDPOINT" ] || [ "$DB_HOST_ENDPOINT" == "null" ]; then
+    echo "ERRO: Falha extrair detalhes do RDS do segredo ou das variáveis de fallback (user, password para wp-config, dbname, host)."
+    echo "DB_USER: $DB_USER, DB_PASSWORD_FOR_WPCONFIG: <oculto>, DB_NAME_TO_USE: $DB_NAME_TO_USE, DB_HOST_ENDPOINT: $DB_HOST_ENDPOINT"
+    exit 1;
+fi
+echo "INFO: Detalhes RDS para wp-config.php e fallback Python OK (User: $DB_USER, DB: $DB_NAME_TO_USE, Host: $DB_HOST_ENDPOINT)."
+
+
+echo "INFO: Verificando WordPress em '$MOUNT_POINT/wp-includes'..."
 CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
-if [ -d "$MOUNT_POINT/wp-includes" ] && [ -f "$CONFIG_SAMPLE_ON_EFS" ]; then 
-    echo "WARN: WP parece já existir em '$MOUNT_POINT'."
+if [ -d "$MOUNT_POINT/wp-includes" ] && [ -f "$CONFIG_SAMPLE_ON_EFS" ]; then
+    echo "AVISO: WordPress parece já existir em '$MOUNT_POINT'."
 else
-    echo "INFO: WP não encontrado ou incompleto. Baixando e instalando..."
+    echo "INFO: WordPress não encontrado ou incompleto. Baixando e instalando..."
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-    sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR" 
-    
-    cd "$WP_DOWNLOAD_DIR" || { echo "ERRO: Falha ao entrar em $WP_DOWNLOAD_DIR"; exit 1; }
-    curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha download WP."; exit 1; }
-    tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha extração WP."; exit 1; }
-    rm latest.tar.gz; cd / 
+    sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR" # Permite que o usuário atual escreva
 
-    echo "INFO: WP baixado e extraído. Copiando para EFS como '$EFS_OWNER_USER'..."
-    if sudo -u "$EFS_OWNER_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"; then 
-        echo "INFO: WP copiado para EFS '$MOUNT_POINT'."
-        CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
-    else 
-        echo "ERRO: Falha copiar WP para EFS '$MOUNT_POINT'. Verifique permissões."; ls -ld "$MOUNT_POINT"; exit 1;
+    cd "$WP_DOWNLOAD_DIR" || { echo "ERRO: Falha ao entrar em $WP_DOWNLOAD_DIR"; exit 1; }
+    curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha no download do WordPress."; exit 1; }
+    tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha na extração do WordPress."; exit 1; }
+    rm latest.tar.gz; cd / # Retorna para o diretório raiz
+
+    echo "INFO: WordPress baixado e extraído. Copiando para EFS como '$EFS_OWNER_USER'..."
+    # Garante que o diretório de montagem EFS exista e tenha permissões adequadas para o EFS_OWNER_USER
+    sudo mkdir -p "$MOUNT_POINT"
+    # Se o EFS AP estiver configurado para root squashing, o chown pode precisar ser feito de outra forma ou o AP ajustado
+    sudo chown "$EFS_OWNER_USER":"$(id -gn "$EFS_OWNER_USER")" "$MOUNT_POINT" # Tenta dar posse ao EFS_OWNER_USER
+
+    if sudo -u "$EFS_OWNER_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"; then
+        echo "INFO: WordPress copiado para EFS '$MOUNT_POINT'."
+        CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php" # Redefine após cópia
+    else
+        echo "ERRO: Falha ao copiar WordPress para EFS '$MOUNT_POINT'. Verifique permissões."; ls -ld "$MOUNT_POINT"; exit 1;
     fi
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-    echo "INFO: Limpeza dos diretórios temporários de download do WP OK."
+    echo "INFO: Limpeza dos diretórios temporários de download do WordPress OK."
 fi
 
 if [ ! -d "$MOUNT_POINT/wp-content" ]; then
     echo "INFO: Criando diretório '$MOUNT_POINT/wp-content' como '$APACHE_USER'..."
-    sudo -u "$APACHE_USER" mkdir -p "$MOUNT_POINT/wp-content" || { echo "ERRO: Falha ao criar wp-content."; exit 1; }
+    # Tenta criar como apache, mas pode falhar dependendo das permissões do EFS Access Point.
+    # Se o EFS Access Point for para ec2-user, o ec2-user deveria criar e depois chown/chmod.
+    sudo -u "$EFS_OWNER_USER" mkdir -p "$MOUNT_POINT/wp-content" # Tenta criar como EFS_OWNER_USER
+    sudo chown "$APACHE_USER":"$APACHE_USER" "$MOUNT_POINT/wp-content"
     sudo chmod 775 "$MOUNT_POINT/wp-content"
+    if [ ! -d "$MOUNT_POINT/wp-content" ]; then echo "ERRO: Falha ao criar wp-content."; exit 1; fi
 fi
 
-install_s3_hook_deleter_php # ESSENCIAL QUE O COMPOSER FUNCIONE AQUI
-
 echo "INFO: (Opcional) Salvando vars em '$ENV_VARS_FILE'..."
-ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.3.6)\n" # VERSÃO ATUALIZADA
+ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.4.1)\n"
 ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"
 ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_NAME_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_NAME_0")\n"
-ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_REGION_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_REGION_0")\n" # Adicionado para referência
+ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_REGION_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_REGION_0")\n"
+ENV_VARS_FILE_CONTENT+="export WP_RDS_SECRET_ARN_OR_NAME=$(printf '%q' "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0")\n"
 echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE."
 
-if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then 
+
+if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then
     echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando..."
-    create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD" "$DB_HOST_ENDPOINT"
-else 
-    echo "WARN: '$ACTIVE_CONFIG_FILE_EFS' já existe. Verificando e adicionando defines do S3 Hook se necessário..."
-    # Verifica se MEU_S3_REGION está presente E se tem um valor (não vazio)
-    if ! grep -q "define('MEU_S3_BUCKET_NAME'" "$ACTIVE_CONFIG_FILE_EFS" || \
-       ! (grep "define('MEU_S3_REGION'" "$ACTIVE_CONFIG_FILE_EFS" | grep -qv "''"); then # Garante que MEU_S3_REGION não é ''
-        
-        echo "INFO: Adicionando/Corrigindo defines para S3 Hook Deleter ao wp-config.php existente..."
-        # Removida a obtenção de current_aws_region_for_config, usaremos AWS_S3_BUCKET_TARGET_REGION_0
-        
-        TEMP_DEFINES_S3_HOOK_FILE=$(mktemp /tmp/s3_hook_defines.XXXXXX)
-        printf "\n// Defines para S3 Hook Deleter (adicionados/atualizados por script v2.3.6)\n" >> "$TEMP_DEFINES_S3_HOOK_FILE"
-        printf "if (!defined('MEU_S3_BUCKET_NAME')) { define('MEU_S3_BUCKET_NAME', '%s'); }\n" "${AWS_S3_BUCKET_TARGET_NAME_0}" >> "$TEMP_DEFINES_S3_HOOK_FILE"
-        # Garante que MEU_S3_REGION seja definido com o valor correto se estiver ausente ou vazio
-        printf "if (!defined('MEU_S3_REGION') || !MEU_S3_REGION) { if (defined('MEU_S3_REGION')) { /* Remove old empty define if needed - advanced sed required */ } define('MEU_S3_REGION', '%s'); }\n" "${AWS_S3_BUCKET_TARGET_REGION_0}" >> "$TEMP_DEFINES_S3_HOOK_FILE"
-        printf "if (!defined('MEU_S3_BASE_PATH_IN_BUCKET')) { define('MEU_S3_BASE_PATH_IN_BUCKET', 'wp-content/uploads/'); }\n" >> "$TEMP_DEFINES_S3_HOOK_FILE"
-
-        # Remover define antigo de MEU_S3_REGION se existir e estiver vazio
-        sudo sed -i "/define('MEU_S3_REGION', '');/d" "$ACTIVE_CONFIG_FILE_EFS"
-        sudo sed -i "/define('MEU_S3_REGION', \\s*'');/d" "$ACTIVE_CONFIG_FILE_EFS" # Com espaços
-
-        sudo sed -i "/${MARKER_LINE_SED_PATTERN}/r ${TEMP_DEFINES_S3_HOOK_FILE}" "$ACTIVE_CONFIG_FILE_EFS"
-        rm -f "$TEMP_DEFINES_S3_HOOK_FILE"
-        echo "INFO: Defines do S3 Hook adicionados/corrigidos no wp-config.php existente."
-    else
-        echo "INFO: Defines do S3 Hook já parecem existir e MEU_S3_REGION tem valor no wp-config.php."
-    fi
+    create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD_FOR_WPCONFIG" "$DB_HOST_ENDPOINT"
+else
+    echo "AVISO: '$ACTIVE_CONFIG_FILE_EFS' já existe. Nenhuma modificação será feita nele por este script."
 fi
 
 echo "INFO: Criando health check '$HEALTH_CHECK_FILE_PATH_EFS'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.3.6 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>" # VERSÃO ATUALIZADA
+HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.4.1 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
 TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php); sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"; echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
 if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then echo "INFO: Health check criado."; else echo "ERRO: Falha criar health check."; fi; rm -f "$TEMP_HEALTH_CHECK_FILE"
 
-echo "INFO: Ajustando permissões finais em '$MOUNT_POINT' para '$APACHE_USER'..."
-if ! sudo chown -R "$APACHE_USER":"$APACHE_USER" "$MOUNT_POINT"; then 
-    echo "AVISO: Falha no chown -R para $APACHE_USER. Verifique config EFS AP."; 
-fi
-sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; 
-sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
-if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi
-if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi
+echo "INFO: Ajustando permissões finais em '$MOUNT_POINT' para '$APACHE_USER' e '$EFS_OWNER_USER'..."
+# Garante que o EFS_OWNER_USER (ec2-user) possa escrever para o Python copiar/deletar se necessário (para DELETE_FROM_EFS)
+# E que o APACHE_USER possa ler/escrever para o WordPress funcionar
+sudo chown -R "$EFS_OWNER_USER":"$APACHE_USER" "$MOUNT_POINT" # Dono ec2-user, grupo apache
+sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; # Diretorios: rwxrwx_r_x (dono e grupo podem escrever, outros leem/executam)
+sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \; # Arquivos: rw_rw_r__ (dono e grupo podem ler/escrever, outros leem)
+if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi # wp-config mais restrito (dono r, grupo r, outros nada)
+if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi # healthcheck legível por todos
 echo "INFO: Permissões ajustadas (tentativa)."
 
 echo "INFO: Configurando Apache..."
-HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.3.6.conf" # VERSÃO ATUALIZADA do conf
-if [ ! -f "$HTTPD_WP_CONF" ]; then 
-    echo "INFO: Criando $HTTPD_WP_CONF"; 
+HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.4.1.conf"
+if [ ! -f "$HTTPD_WP_CONF" ]; then
+    echo "INFO: Criando $HTTPD_WP_CONF";
     sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF_APACHE_CONF
 <Directory "${MOUNT_POINT}">
     AllowOverride All
@@ -474,7 +520,7 @@ fi
 echo "INFO: Configuração Apache em $HTTPD_WP_CONF verificada/criada."
 
 PHP_FPM_SERVICE_NAME=""
-POSSIBLE_FPM_NAMES=("php-fpm.service" "php7.4-fpm.service" "php74-php-fpm.service") 
+POSSIBLE_FPM_NAMES=("php-fpm.service" "php7.4-fpm.service" "php74-php-fpm.service") # Ajuste conforme sua versão PHP
 echo "INFO: Detectando nome do serviço PHP-FPM..."
 for fpm_name in "${POSSIBLE_FPM_NAMES[@]}"; do
     if sudo systemctl list-unit-files | grep -q -w "$fpm_name"; then
@@ -486,12 +532,12 @@ done
 if [ -z "$PHP_FPM_SERVICE_NAME" ]; then echo "ERRO CRÍTICO: Não foi possível detectar o nome do serviço PHP-FPM instalado."; exit 1; fi
 
 echo "INFO: Habilitando e reiniciando httpd e $PHP_FPM_SERVICE_NAME..."
-sudo systemctl enable httpd "$PHP_FPM_SERVICE_NAME" 
+sudo systemctl enable httpd "$PHP_FPM_SERVICE_NAME"
 php_fpm_restarted_successfully=false
 if sudo systemctl restart "$PHP_FPM_SERVICE_NAME"; then echo "INFO: $PHP_FPM_SERVICE_NAME reiniciado com sucesso."; php_fpm_restarted_successfully=true; else echo "ERRO: Falha ao reiniciar $PHP_FPM_SERVICE_NAME."; sudo systemctl status "$PHP_FPM_SERVICE_NAME" -l --no-pager; sudo journalctl -u "$PHP_FPM_SERVICE_NAME" -n 50 --no-pager; fi
 httpd_restarted_successfully=false
 if sudo systemctl restart httpd; then echo "INFO: httpd reiniciado com sucesso."; httpd_restarted_successfully=true; else echo "ERRO CRÍTICO: Falha ao reiniciar httpd."; sudo apachectl configtest; sudo tail -n 50 /var/log/httpd/error_log; fi
-sleep 3 
+sleep 3
 if $httpd_restarted_successfully && $php_fpm_restarted_successfully && systemctl is-active --quiet httpd && systemctl is-active --quiet "$PHP_FPM_SERVICE_NAME"; then
     echo "INFO: httpd e $PHP_FPM_SERVICE_NAME ativos."
 else
@@ -501,24 +547,17 @@ else
     exit 1
 fi
 
-setup_python_monitor_script 
-create_and_enable_python_monitor_service 
+setup_python_monitor_script
+create_and_enable_python_monitor_service
 
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.3.6-s3-region-fix) concluído! ($(date)) ---" # VERSÃO ATUALIZADA
-echo "INFO: Sincronização com S3 Python Watchdog: ATIVA (Script: $PYTHON_MONITOR_SCRIPT_PATH, Serviço: $PYTHON_MONITOR_SERVICE_NAME)"
-if [ -f "$MOUNT_POINT/wp-content/mu-plugins/$S3_HOOK_DELETER_PHP_FILENAME" ]; then
-    echo "INFO: Deleção de S3 via Hook WordPress PHP: INSTALADO (Script: $MOUNT_POINT/wp-content/mu-plugins/$S3_HOOK_DELETER_PHP_FILENAME)"
-else
-    echo "AVISO: Deleção de S3 via Hook WordPress PHP: NÃO INSTALADO (Verifique logs para erros no download ou cópia)."
-fi
+echo "INFO: --- Script WordPress Setup (v2.4.1) concluído! ($(date)) ---"
+echo "INFO: Sincronização EFS/S3 e Processador de Fila RDS Python: ATIVO (Script: $PYTHON_MONITOR_SCRIPT_PATH, Serviço: $PYTHON_MONITOR_SERVICE_NAME)"
 echo "INFO: Configurações do Python para EFS/S3 (no service file): DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync:-N/A}, PERFORM_INITIAL_SYNC=${py_perform_initial_sync:-N/A}"
-echo "INFO: Logs: Principal=${LOG_FILE}, Python Monitor=${PY_MONITOR_LOG_FILE}, Python Transfer=${PY_S3_TRANSFER_LOG_FILE}"
+echo "INFO: Configurações do Python para RDS Queue (no service file): WP_RDS_SECRET_ARN_OR_NAME=${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-N/A}"
+echo "INFO: Logs: Principal=${LOG_FILE}, Python Monitor/RDS Queue=${PY_MONITOR_LOG_FILE}, Python Transfer=${PY_S3_TRANSFER_LOG_FILE}"
 echo "INFO: Site: https://${WPDOMAIN}, Health Check: /healthcheck.php"
-echo "INFO: LEMBRE-SE de configurar o EFS Access Point com uid=48 e gid=48 (para o apache), se ainda não o fez."
-echo "INFO: LEMBRE-SE de colocar o script Python ($PYTHON_MONITOR_SCRIPT_NAME) no bucket S3 '$AWS_S3_BUCKET_TARGET_NAME_SCRIPT' com a chave '$AWS_S3_PYTHON_SCRIPT_KEY'."
-echo "INFO: LEMBRE-SE de colocar o script PHP ($S3_HOOK_DELETER_PHP_FILENAME) no bucket S3 '$AWS_S3_BUCKET_TARGET_NAME_SCRIPT' com a chave '$AWS_S3_HOOK_DELETER_PHP_KEY'."
-echo "INFO: LEMBRE-SE de que o AWS SDK para PHP deve estar funcional (vendor/autoload.php presente) para o '$S3_HOOK_DELETER_PHP_FILENAME' deletar do S3."
-echo "INFO: LEMBRE-SE de verificar se as variáveis de ambiente AWS_S3_BUCKET_TARGET_NAME_0 e AWS_S3_BUCKET_TARGET_REGION_0 estão corretas no UserData da EC2."
+echo "INFO: Lembre-se de que a IAM Role da EC2 deve ter permissão para ler o segredo do RDS no Secrets Manager e para as operações S3/CloudFront."
+echo "INFO: Lembre-se de que o usuário do RDS (configurado no Secrets Manager) deve ter permissão TRIGGER no banco para que o script Python crie o gatilho."
 echo "INFO: =================================================="
 exit 0
