@@ -1,563 +1,745 @@
-#!/bin/bash
-# === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.4.1 (Remove S3 Hook Deleter PHP, suporta Python Script v2.5.0+)
-
-# --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.1.sh"
-readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.1_env_vars.sh"
-
-# Script de Monitoramento Python e Serviço
-readonly PYTHON_MONITOR_SCRIPT_NAME_LOCAL="efs_s3_monitor_v2.5.0.py" # Nome local do script Python
-readonly PYTHON_MONITOR_SCRIPT_PATH="/usr/local/bin/$PYTHON_MONITOR_SCRIPT_NAME_LOCAL"
-readonly PYTHON_MONITOR_SERVICE_NAME="wp-efs-s3-pywatchdog-v2.4.1" # Nome do serviço systemd
-readonly PY_MONITOR_LOG_FILE="/var/log/wp_efs_s3_py_monitor_v2.4.1.log"
-readonly PY_S3_TRANSFER_LOG_FILE="/var/log/wp_s3_py_transferred_v2.4.1.log"
-
-# Chave S3 para o script Python (o nome do arquivo no S3 pode ser genérico)
-readonly AWS_S3_PYTHON_SCRIPT_KEY="efs_s3_monitor.py" # Nome do arquivo no S3
-
-# --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.4.1.log"
-MOUNT_POINT="/var/www/html"
-WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
-WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
-ACTIVE_CONFIG_FILE_EFS="$MOUNT_POINT/wp-config.php"
-CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php" # Será definido após a cópia do WP para o EFS
-HEALTH_CHECK_FILE_PATH_EFS="$MOUNT_POINT/healthcheck.php"
-MARKER_LINE_SED_RAW="/* That's all, stop editing! Happy publishing. */"
-MARKER_LINE_SED_PATTERN='\/\* That'\''s all, stop editing! Happy publishing\. \*\/'
-EFS_OWNER_UID=1000 # Geralmente ec2-user
-EFS_OWNER_USER="ec2-user"
-
-# --- Variáveis Essenciais (Esperadas do Ambiente, carregadas pelo UserData) ---
-essential_vars=(
-    "AWS_EFS_FILE_SYSTEM_TARGET_ID_0"
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0" # Região do segredo do RDS
-    "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0"  # Nome do segredo do RDS
-    "AWS_DB_INSTANCE_TARGET_ENDPOINT_0" # Endpoint do RDS (usado como fallback se não estiver no segredo)
-    "AWS_DB_INSTANCE_TARGET_NAME_0"     # Nome da instância/DB (usado como fallback)
-    "WPDOMAIN"
-    "ACCOUNT" # ID da conta AWS, usado para construir o ARN do segredo
-    "AWS_EFS_ACCESS_POINT_TARGET_ID_0" # Opcional
-    "AWS_S3_BUCKET_TARGET_NAME_0"          # Bucket de mídia
-    "AWS_S3_BUCKET_TARGET_REGION_0"        # Região do bucket de mídia
-    "AWS_S3_BUCKET_TARGET_NAME_SCRIPT"    # Bucket para scripts
-    "AWS_S3_BUCKET_TARGET_REGION_SCRIPT"  # Região do bucket de scripts
-    "AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0" # Opcional para invalidação
-)
-
-# --- Função de Auto-Instalação do Script Principal ---
-self_install_script() {
-    echo "INFO (self_install): Iniciando auto-instalação do script principal (v2.4.1)..."
-    local current_script_path; current_script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    echo "INFO (self_install): Copiando script de '$current_script_path' para $THIS_SCRIPT_TARGET_PATH..."
-    if ! sudo cp "$current_script_path" "$THIS_SCRIPT_TARGET_PATH"; then echo "ERRO CRÍTICO (self_install): Falha ao copiar script. Abortando."; exit 1; fi
-    sudo chmod +x "$THIS_SCRIPT_TARGET_PATH"
-    echo "INFO (self_install): Script principal instalado e executável em $THIS_SCRIPT_TARGET_PATH."
-}
-
-# --- Funções Auxiliares (mount_efs, create_wp_config_template) ---
-mount_efs() {
-    local efs_id=$1; local mount_point_arg=$2; local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}"
-    local max_retries=5; local retry_delay_seconds=15; local attempt_num=1
-    echo "INFO: Tentando montar EFS '$efs_id' em '$mount_point_arg' via AP '$efs_ap_id' (até $max_retries tentativas)..."
-    while [ $attempt_num -le $max_retries ]; do
-        echo "INFO: Tentativa de montagem EFS: $attempt_num de $max_retries..."
-        if mount | grep -q "on ${mount_point_arg} type efs"; then echo "INFO: EFS já está montado em '$mount_point_arg'."; return 0; fi
-        sudo mkdir -p "$mount_point_arg"; local mount_options="tls"; local mount_source="$efs_id:/"
-        if [ -n "$efs_ap_id" ]; then mount_options="tls,accesspoint=$efs_ap_id"; mount_source="$efs_id"; echo "INFO: Usando Access Point '$efs_ap_id'."; else echo "INFO: Não usando Access Point."; fi
-        if sudo timeout 30 mount -t efs -o "$mount_options" "$mount_source" "$mount_point_arg" -v; then
-            echo "INFO: EFS montado com sucesso em '$mount_point_arg' na tentativa $attempt_num."
-            if ! grep -q "${mount_point_arg} efs" /etc/fstab; then
-                local fstab_mount_options="_netdev,${mount_options}"; local fstab_entry="$mount_source $mount_point_arg efs $fstab_mount_options 0 0"
-                echo "$fstab_entry" | sudo tee -a /etc/fstab >/dev/null; echo "INFO: Entrada adicionada ao /etc/fstab: '$fstab_entry'"
-            fi; return 0
-        else
-            echo "AVISO: Falha ao montar EFS na tentativa $attempt_num. Código de saída: $?"
-            if [ $attempt_num -lt $max_retries ]; then echo "INFO: Aguardando $retry_delay_seconds segundos..."; sleep $retry_delay_seconds; fi
-        fi; attempt_num=$((attempt_num + 1))
-    done
-    echo "ERRO CRÍTICO: Falha ao montar EFS após $max_retries tentativas."; ip addr; dmesg | tail -n 20; exit 1
-}
-
-create_wp_config_template() {
-    local target_file_on_efs="$1"; local primary_wpdomain_for_fallback="$2"; local db_name="$3"; local db_user="$4"; local db_password="$5"; local db_host="$6"
-    local temp_config_file; temp_config_file=$(mktemp /tmp/wp-config.XXXXXX.php); sudo chmod 644 "$temp_config_file"; trap 'rm -f "$temp_config_file"' RETURN
-    echo "INFO: Criando wp-config.php em '$temp_config_file' para EFS '$target_file_on_efs'..."
-    if [ ! -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "ERRO: '$CONFIG_SAMPLE_ON_EFS' não encontrado (deveria estar em $MOUNT_POINT/wp-config-sample.php)."; exit 1; fi
-    sudo cp "$CONFIG_SAMPLE_ON_EFS" "$temp_config_file"
-    SAFE_DB_NAME=$(echo "$db_name" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g"); SAFE_DB_USER=$(echo "$db_user" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
-    SAFE_DB_PASSWORD=$(echo "$db_password" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g"); SAFE_DB_HOST=$(echo "$db_host" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
-    sed -i "s/database_name_here/$SAFE_DB_NAME/g" "$temp_config_file"; sed -i "s/username_here/$SAFE_DB_USER/g" "$temp_config_file"
-    sed -i "s/password_here/$SAFE_DB_PASSWORD/g" "$temp_config_file"; sed -i "s/localhost/$SAFE_DB_HOST/g" "$temp_config_file"
-    SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
-    if [ -n "$SALT" ]; then
-        TEMP_SALT_FILE_INNER=$(mktemp /tmp/salts.XXXXXX); sudo chmod 644 "$TEMP_SALT_FILE_INNER"; echo "$SALT" >"$TEMP_SALT_FILE_INNER"
-        # Remove existing salt definitions before inserting new ones
-        sed -i -e '/^define( *'\''AUTH_KEY'\''/d' -e '/^define( *'\''SECURE_AUTH_KEY'\''/d' \
-               -e '/^define( *'\''LOGGED_IN_KEY'\''/d' -e '/^define( *'\''NONCE_KEY'\''/d' \
-               -e '/^define( *'\''AUTH_SALT'\''/d' -e '/^define( *'\''SECURE_AUTH_SALT'\''/d' \
-               -e '/^define( *'\''LOGGED_IN_SALT'\''/d' -e '/^define( *'\''NONCE_SALT'\''/d' "$temp_config_file"
-        # Insert new salts before the marker line or at the end if marker not found
-        if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then
-            sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE_INNER" "$temp_config_file"
-        else
-            cat "$TEMP_SALT_FILE_INNER" >> "$temp_config_file"
-        fi
-        rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
-    else echo "AVISO: Falha ao obter SALTS. Recomenda-se configurá-los manualmente."; fi
-
-PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.4.1.sh
-\$site_scheme = 'https';
-\$site_host = '$primary_wpdomain_for_fallback'; // Fallback, será sobrescrito por X-Forwarded-Host se presente
-
-// Tenta determinar o host real a partir dos cabeçalhos do proxy reverso (ALB)
-if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) {
-    \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']);
-    \$site_host = trim(\$hosts[0]); // Usa o primeiro host se houver múltiplos
-} elseif (!empty(\$_SERVER['HTTP_HOST'])) {
-    \$site_host = \$_SERVER['HTTP_HOST'];
-}
-
-// Determina o esquema (http ou https) com base nos cabeçalhos do proxy
-if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
-    \$_SERVER['HTTPS'] = 'on';
-    \$site_scheme = 'https';
-} elseif (isset(\$_SERVER['REQUEST_SCHEME']) && \$_SERVER['REQUEST_SCHEME'] === 'https') {
-    // Caso o X-Forwarded-Proto não esteja setado mas o request scheme seja https
-    \$_SERVER['HTTPS'] = 'on';
-    \$site_scheme = 'https';
-} else {
-    \$site_scheme = 'http'; // Fallback para http se nenhum cabeçalho indicar https
-}
-
-define('WP_HOME', \$site_scheme . '://' . \$site_host);
-define('WP_SITEURL', \$site_scheme . '://' . \$site_host);
-
-define('FS_METHOD', 'direct'); // Permite atualizações diretas de plugins/temas
-
-// Configurações para Proxy Reverso (ALB)
-if (isset(\$_SERVER['HTTP_X_FORWARDED_FOR'])) {
-    \$forwarded_for_ips = explode(',', \$_SERVER['HTTP_X_FORWARDED_FOR']);
-    \$_SERVER['REMOTE_ADDR'] = trim(\$forwarded_for_ips[0]); // Pega o IP original do cliente
-}
-
-// Garante que \$_SERVER['HTTPS'] esteja 'on' se X-Forwarded-Proto for https
-// (Já coberto acima, mas reforça para alguns plugins)
-if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https') {
-    \$_SERVER['HTTPS'] = 'on';
-}
-EOPHP
-)
-    TEMP_DEFINES_FILE_INNER=$(mktemp /tmp/defines.XXXXXX); sudo chmod 644 "$TEMP_DEFINES_FILE_INNER"; echo -e "\n$PHP_DEFINES_BLOCK_CONTENT" >"$TEMP_DEFINES_FILE_INNER"
-    if grep -q "$MARKER_LINE_SED_PATTERN" "$temp_config_file"; then
-        sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_DEFINES_FILE_INNER" "$temp_config_file"
-    else
-        cat "$TEMP_DEFINES_FILE_INNER" >> "$temp_config_file"
-    fi
-    rm -f "$TEMP_DEFINES_FILE_INNER"; echo "INFO: Defines de WP_HOME, WP_SITEURL e FS_METHOD configurados."
-    echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como '$APACHE_USER'..."
-    if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
-}
-
-# --- Função para Baixar e Configurar o Script de Monitoramento Python ---
-setup_python_monitor_script() {
-    echo "INFO: Baixando e configurando script de monitoramento Python ($PYTHON_MONITOR_SCRIPT_NAME_LOCAL)..."
-    if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] || [ -z "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-}" ] || [ -z "$AWS_S3_PYTHON_SCRIPT_KEY" ]; then
-        echo "ERRO CRÍTICO: Variáveis para download do script Python não definidas (AWS_S3_BUCKET_TARGET_NAME_SCRIPT, AWS_S3_BUCKET_TARGET_REGION_SCRIPT, AWS_S3_PYTHON_SCRIPT_KEY)."
-        exit 1
-    fi
-    local s3_python_script_uri="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_PYTHON_SCRIPT_KEY}"
-    local temp_python_script_path="/tmp/$(basename "$PYTHON_MONITOR_SCRIPT_NAME_LOCAL")_temp_download"
-
-    echo "INFO: Tentando baixar script Python de '$s3_python_script_uri' para '$temp_python_script_path'..."
-    sudo rm -f "$temp_python_script_path" # Remove se já existir
-
-    if ! sudo aws s3 cp "$s3_python_script_uri" "$temp_python_script_path" --region "$AWS_S3_BUCKET_TARGET_REGION_SCRIPT"; then
-        echo "ERRO CRÍTICO: Falha ao baixar o script Python de '$s3_python_script_uri'. Verifique se o arquivo existe no S3 e as permissões da IAM Role."
-        exit 1
-    fi
-
-    if [ ! -s "$temp_python_script_path" ]; then
-        echo "ERRO CRÍTICO: Script Python baixado '$temp_python_script_path' está vazio ou não existe."
-        exit 1
-    fi
-
-    echo "INFO: Script Python baixado. Movendo para '$PYTHON_MONITOR_SCRIPT_PATH'."
-    if ! sudo mv "$temp_python_script_path" "$PYTHON_MONITOR_SCRIPT_PATH"; then
-        echo "ERRO CRÍTICO: Falha ao mover script Python para '$PYTHON_MONITOR_SCRIPT_PATH'."
-        exit 1
-    fi
-
-    if ! sudo chmod +x "$PYTHON_MONITOR_SCRIPT_PATH"; then
-         echo "ERRO CRÍTICO: Falha ao tornar o script Python '$PYTHON_MONITOR_SCRIPT_PATH' executável."
-        exit 1
-    fi
-    echo "INFO: Script de monitoramento Python '$PYTHON_MONITOR_SCRIPT_PATH' configurado."
-}
-
-# --- Função para Criar e Habilitar o Serviço Systemd para Python Monitor ---
-create_and_enable_python_monitor_service() {
-    echo "INFO: Criando serviço systemd para o monitoramento Python: $PYTHON_MONITOR_SERVICE_NAME (v2.4.1)..."
-    local service_file_path="/etc/systemd/system/${PYTHON_MONITOR_SERVICE_NAME}.service"
-    local patterns_env_str="wp-content/uploads/*;wp-content/themes/*/*.css;wp-content/themes/*/*.js;wp-content/themes/*/*.jpg;wp-content/themes/*/*.jpeg;wp-content/themes/*/*.png;wp-content/themes/*/*.gif;wp-content/themes/*/*.svg;wp-content/themes/*/*.webp;wp-content/themes/*/*.ico;wp-content/themes/*/*.woff;wp-content/themes/*/*.woff2;wp-content/themes/*/*.ttf;wp-content/themes/*/*.eot;wp-content/themes/*/*.otf;wp-content/plugins/*/*.css;wp-content/plugins/*/*.js;wp-content/plugins/*/*.jpg;wp-content/plugins/*/*.jpeg;wp-content/plugins/*/*.png;wp-content/plugins/*/*.gif;wp-content/plugins/*/*.svg;wp-content/plugins/*/*.webp;wp-content/plugins/*/*.ico;wp-content/plugins/*/*.woff;wp-content/plugins/*/*.woff2;wp-includes/js/*;wp-includes/css/*;wp-includes/images/*"
-
-    echo "INFO: Limpando serviço '$PYTHON_MONITOR_SERVICE_NAME' existente, se houver..."
-    if sudo systemctl is-active "$PYTHON_MONITOR_SERVICE_NAME.service" &>/dev/null; then sudo systemctl stop "$PYTHON_MONITOR_SERVICE_NAME.service"; fi
-    if sudo systemctl is-enabled "$PYTHON_MONITOR_SERVICE_NAME.service" &>/dev/null; then sudo systemctl disable "$PYTHON_MONITOR_SERVICE_NAME.service"; fi
-    sudo rm -f "$service_file_path"; sudo rm -f "/etc/systemd/system/multi-user.target.wants/${PYTHON_MONITOR_SERVICE_NAME}.service"; sudo systemctl daemon-reload
-    echo "INFO: Limpeza de serviço systemd anterior concluída."
-
-    local mount_unit_name; mount_unit_name=$(systemd-escape -p --suffix=mount "$MOUNT_POINT")
-    local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws") # Tenta encontrar o aws cli
-    local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" # Para evitar problemas com caracteres especiais
-
-    local py_delete_from_efs_after_sync="true" # Configuração para o script Python
-    local py_perform_initial_sync="true"      # Configuração para o script Python
-
-    # O ARN do segredo do RDS é construído na lógica principal e passado aqui
-    local rds_secret_arn_for_service="${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-}"
-
-    sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
-[Unit]
-Description=WordPress EFS to S3 Sync & RDS Queue Processor (Python v2.5.0+)
-Documentation=file://$PYTHON_MONITOR_SCRIPT_PATH
-After=network.target remote-fs.target $mount_unit_name
-Requires=$mount_unit_name
-
-[Service]
-Type=simple
-User=root # O script Python pode precisar de root para ler/escrever logs e talvez para o AWS CLI
-ExecStart=/usr/bin/python3 $PYTHON_MONITOR_SCRIPT_PATH
-Restart=on-failure
-RestartSec=15s
-Environment="PYTHONUNBUFFERED=1" # Garante que os logs do Python apareçam imediatamente no journald
-
-# Variáveis para EFS Monitor
-Environment="WP_MONITOR_DIR_BASE=$MOUNT_POINT"
-Environment="WP_S3_BUCKET=$AWS_S3_BUCKET_TARGET_NAME_0" # Usado por ambas as funcionalidades
-Environment="WP_RELEVANT_PATTERNS=$escaped_patterns_env_str"
-Environment="WP_PY_MONITOR_LOG_FILE=$PY_MONITOR_LOG_FILE"
-Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
-Environment="WP_SYNC_DEBOUNCE_SECONDS=5"
-Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" # PATH para o aws cli
-Environment="WP_DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync}"
-Environment="WP_PERFORM_INITIAL_SYNC=${py_perform_initial_sync}"
-Environment="AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0=${AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0:-}" # Opcional
-
-# Variáveis para a fila de deleção do RDS
-Environment="WP_RDS_DELETION_QUEUE_ENABLED=true" # Ativar por padrão
-Environment="WP_RDS_SECRET_ARN_OR_NAME=${rds_secret_arn_for_service}" # ARN do segredo
-# Fallbacks (o Python priorizará o Secrets Manager se WP_RDS_SECRET_ARN_OR_NAME estiver definido)
-Environment="WP_RDS_HOST=${DB_HOST_ENDPOINT:-}"
-Environment="WP_RDS_USER=${DB_USER:-}"
-Environment="WP_RDS_DB_NAME=${DB_NAME_TO_USE:-}"
-Environment="WP_RDS_PORT=3306" # Padrão, pode ser sobrescrito pelo segredo ou python env var
-# Nomes das tabelas do WordPress para o trigger
-Environment="WP_RDS_POSTS_TABLE_NAME=wp_posts"
-Environment="WP_RDS_POSTMETA_TABLE_NAME=wp_postmeta"
-# Configurações da tabela de fila e polling
-Environment="WP_S3_DELETION_QUEUE_TABLE_NAME=wp_s3_deletion_queue"
-Environment="WP_S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS=900" # 15 minutos
-Environment="WP_S3_DELETION_QUEUE_BATCH_SIZE=10"
-Environment="WP_S3_BASE_PATH_FOR_DELETION_QUEUE=wp-content/uploads/" # Caminho base no S3 para arquivos da fila
-
-[Install]
-WantedBy=multi-user.target
-EOF_PY_SYSTEMD_SERVICE
-
-    sudo chmod 644 "$service_file_path"
-    echo "INFO: Arquivo de serviço '$service_file_path' criado com variáveis RDS atualizadas."
-
-    echo "INFO: Recarregando daemon systemd, habilitando e iniciando o serviço $PYTHON_MONITOR_SERVICE_NAME..."
-    sudo systemctl daemon-reload
-    sudo systemctl enable "$PYTHON_MONITOR_SERVICE_NAME.service"
-    if sudo systemctl start "$PYTHON_MONITOR_SERVICE_NAME.service"; then
-        echo "INFO: Serviço Python $PYTHON_MONITOR_SERVICE_NAME iniciado com sucesso."
-        sleep 3 # Dá um tempo para o serviço iniciar e logar algo
-        sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
-    else
-        echo "ERRO: Falha ao iniciar o serviço Python $PYTHON_MONITOR_SERVICE_NAME."
-        sudo systemctl status "$PYTHON_MONITOR_SERVICE_NAME.service" --no-pager -l
-        journalctl -u "$PYTHON_MONITOR_SERVICE_NAME" -n 50 --no-pager # Mostra os últimos logs do serviço
-    fi
-}
-
-# --- Lógica Principal de Execução ---
-exec > >(tee -a "${LOG_FILE}") 2>&1 # Redireciona stdout e stderr para o arquivo de log e para o console
-echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.4.1) ($(date)) ---"
-echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
-echo "INFO: Python Script Local Name: $PYTHON_MONITOR_SCRIPT_NAME_LOCAL (from S3 key: $AWS_S3_PYTHON_SCRIPT_KEY)"
-echo "INFO: =================================================="
-
-if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root."; exit 1; fi
-
-self_install_script
-
-echo "INFO: Verificando e imprimindo variáveis de ambiente essenciais..."
-# Construir o ARN do Segredo do RDS (necessário para passar ao serviço Python)
-AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
-if [ -z "${ACCOUNT:-}" ]; then # Tenta obter ACCOUNT ID se não estiver definido
-    ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
-    if [ -n "$ACCOUNT_STS" ]; then
-        ACCOUNT="$ACCOUNT_STS"
-        echo "INFO: ACCOUNT ID obtido via STS: $ACCOUNT"
-    else
-        echo "AVISO: Falha obter ACCOUNT ID via STS. Será necessário para construir o ARN completo do Secrets Manager."
-        ACCOUNT="" # Garante que está vazio se a obtenção falhar
-    fi
-fi
-if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ] && \
-   [ -n "${ACCOUNT:-}" ] && \
-   [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then
-    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
-fi
-
-error_found=0
-echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS E CONSTRUÍDAS ---"
-for var_name in "${essential_vars[@]}"; do
-    current_var_value="${!var_name:-UNDEFINED}" # Para mostrar UNDEFINED no log se vazia
-    var_name_for_check="$var_name"
-    current_var_value_to_check="${!var_name:-}" # Para a verificação de -z
-
-    # Para o ARN do segredo, usamos a variável construída para a verificação
-    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then
-        current_var_value_to_check="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"
-        var_name_for_check="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (construído de NAME, REGION, ACCOUNT)"
-        current_var_value="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" # Para o log
-    fi
-
-    echo "INFO: Var (env/construída): $var_name_for_check = '$current_var_value'"
-    # AWS_EFS_ACCESS_POINT_TARGET_ID_0 e AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0 são opcionais
-    if [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && \
-       [ "$var_name" != "AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0" ] && \
-       [ -z "$current_var_value_to_check" ]; then
-        echo "ERRO: Var essencial '$var_name_for_check' está vazia."
-        error_found=1
-    fi
-done
-echo "INFO: Var (hardcoded S3 Key): AWS_S3_PYTHON_SCRIPT_KEY = '$AWS_S3_PYTHON_SCRIPT_KEY'"
-if [ -z "$AWS_S3_PYTHON_SCRIPT_KEY" ]; then echo "ERRO CRÍTICO: Constante AWS_S3_PYTHON_SCRIPT_KEY está vazia no script!"; error_found=1; fi
-echo "INFO: --- FIM DOS VALORES DAS VARIÁVEIS ---"
-if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando ou mal configuradas. Abortando."; exit 1; fi
-echo "INFO: Verificação de variáveis concluída."
-
-echo "INFO: Instalando pacotes base do sistema (yum update, httpd, jq, aws-cli, mysql, efs-utils, wget, unzip)..."
-sudo yum update -y -q
-sudo amazon-linux-extras install -y epel -q # Para pacotes adicionais se necessário
-sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils wget unzip
-echo "INFO: Pacotes base do sistema instalados."
-
-PHP_VERSION_EXTRA="php7.4" # Ou a versão que você está usando, ex: php8.0, php8.1
-echo "INFO: Habilitando e instalando PHP via Amazon Linux Extras ($PHP_VERSION_EXTRA)..."
-sudo amazon-linux-extras enable "$PHP_VERSION_EXTRA" -y -q
-sudo yum install -y -q \
-    php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip \
-    php-gd php-mbstring php-soap php-opcache php-bcmath php-intl php-pear \
-    php-devel gcc # php-devel e gcc podem ser necessários para algumas extensões PECL ou compilação do Composer
-
-if ! sudo rpm -q php-fpm || ! sudo rpm -q php-cli || ! sudo rpm -q php-json; then
-    echo "ERRO CRÍTICO: Pacotes PHP essenciais (php-fpm, php-cli, php-json) não foram instalados corretamente com $PHP_VERSION_EXTRA."
-    exit 1;
-fi
-echo "INFO: PHP ($PHP_VERSION_EXTRA) e módulos instalados."
-php -v
-
-# A instalação do Composer é opcional se não houver mais plugins PHP que o exijam
-# if ! command -v composer &> /dev/null; then
-#     echo "INFO: Instalando Composer..."
-#     # ... (lógica de instalação do Composer) ...
-# else
-#     echo "INFO: Composer já está instalado."
-# fi
-# composer --version
-
-echo "INFO: Instalando Python3, pip e bibliotecas Python necessárias (watchdog, boto3, pymysql, phpserialize)..."
-sudo yum install -y -q python3 python3-pip
-sudo pip3 install --upgrade pip
-sudo pip3 install watchdog boto3 pymysql phpserialize
-echo "INFO: Python3, pip e bibliotecas Python instalados."
-echo "INFO: Todos os pacotes de pré-requisitos foram processados."
-
-mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
-
-echo "INFO: Testando escrita EFS como '$EFS_OWNER_USER'..."
-TEMP_EFS_TEST_FILE="$MOUNT_POINT/efs_write_test_$(date +%s).txt"
-if sudo -u "$EFS_OWNER_USER" touch "$TEMP_EFS_TEST_FILE"; then
-    echo "INFO: Teste escrita EFS OK."
-    sudo -u "$EFS_OWNER_USER" rm "$TEMP_EFS_TEST_FILE"
-else
-    echo "ERRO: Teste escrita EFS FALHOU. Verifique permissões do EFS Access Point e do mount."
-    ls -ld "$MOUNT_POINT"
-    exit 1
-fi
-
-# Obtenção de credenciais RDS (DB_USER, DB_PASSWORD_FOR_WPCONFIG, DB_NAME_TO_USE, DB_HOST_ENDPOINT)
-# A senha real para o Python virá do Secrets Manager.
-# Estas são para o wp-config.php e como fallbacks para o Python.
-echo "INFO: Obtendo detalhes do RDS do Secrets Manager para wp-config.php e fallbacks Python..."
-if [ -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" ]; then
-    echo "ERRO CRÍTICO: ARN do Secrets Manager não pôde ser construído. Necessário para obter detalhes do RDS."
-    exit 1
-fi
-SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" --query 'SecretString' --output text --region "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0")
-if [ -z "$SECRET_STRING_VALUE" ]; then echo "ERRO: Falha obter segredo RDS do Secrets Manager."; exit 1; fi
-
-DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username)
-DB_PASSWORD_FOR_WPCONFIG=$(echo "$SECRET_STRING_VALUE" | jq -r .password) # Apenas para o wp-config.php
-DB_NAME_FROM_SECRET=$(echo "$SECRET_STRING_VALUE" | jq -r .dbname)
-DB_HOST_FROM_SECRET=$(echo "$SECRET_STRING_VALUE" | jq -r .host)
-
-# Prioriza valores do segredo, depois de AWS_DB_INSTANCE_TARGET_NAME_0/ENDPOINT_0 (para fallback no Python e uso no wp-config)
-DB_NAME_TO_USE="${DB_NAME_FROM_SECRET:-${AWS_DB_INSTANCE_TARGET_NAME_0}}"
-DB_HOST_ENDPOINT="${DB_HOST_FROM_SECRET:-$(echo "${AWS_DB_INSTANCE_TARGET_ENDPOINT_0:-}" | cut -d: -f1)}" # Adicionado :- para evitar erro se AWS_DB_INSTANCE_TARGET_ENDPOINT_0 for vazio
-
-if [ -z "$DB_USER" ] || [ "$DB_USER" == "null" ] || \
-   [ -z "$DB_PASSWORD_FOR_WPCONFIG" ] || [ "$DB_PASSWORD_FOR_WPCONFIG" == "null" ] || \
-   [ -z "$DB_NAME_TO_USE" ] || [ "$DB_NAME_TO_USE" == "null" ] || \
-   [ -z "$DB_HOST_ENDPOINT" ] || [ "$DB_HOST_ENDPOINT" == "null" ]; then
-    echo "ERRO: Falha extrair detalhes do RDS do segredo ou das variáveis de fallback (user, password para wp-config, dbname, host)."
-    echo "DB_USER: $DB_USER, DB_PASSWORD_FOR_WPCONFIG: <oculto>, DB_NAME_TO_USE: $DB_NAME_TO_USE, DB_HOST_ENDPOINT: $DB_HOST_ENDPOINT"
-    exit 1;
-fi
-echo "INFO: Detalhes RDS para wp-config.php e fallback Python OK (User: $DB_USER, DB: $DB_NAME_TO_USE, Host: $DB_HOST_ENDPOINT)."
-
-
-echo "INFO: Verificando WordPress em '$MOUNT_POINT/wp-includes'..."
-CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php"
-if [ -d "$MOUNT_POINT/wp-includes" ] && [ -f "$CONFIG_SAMPLE_ON_EFS" ]; then
-    echo "AVISO: WordPress parece já existir em '$MOUNT_POINT'."
-else
-    echo "INFO: WordPress não encontrado ou incompleto. Baixando e instalando..."
-    sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-    sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-    sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR" # Permite que o usuário atual escreva
-
-    cd "$WP_DOWNLOAD_DIR" || { echo "ERRO: Falha ao entrar em $WP_DOWNLOAD_DIR"; exit 1; }
-    curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha no download do WordPress."; exit 1; }
-    tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha na extração do WordPress."; exit 1; }
-    rm latest.tar.gz; cd / # Retorna para o diretório raiz
-
-    echo "INFO: WordPress baixado e extraído. Copiando para EFS como '$EFS_OWNER_USER'..."
-    # Garante que o diretório de montagem EFS exista e tenha permissões adequadas para o EFS_OWNER_USER
-    sudo mkdir -p "$MOUNT_POINT"
-    # Se o EFS AP estiver configurado para root squashing, o chown pode precisar ser feito de outra forma ou o AP ajustado
-    sudo chown "$EFS_OWNER_USER":"$(id -gn "$EFS_OWNER_USER")" "$MOUNT_POINT" # Tenta dar posse ao EFS_OWNER_USER
-
-    if sudo -u "$EFS_OWNER_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"; then
-        echo "INFO: WordPress copiado para EFS '$MOUNT_POINT'."
-        CONFIG_SAMPLE_ON_EFS="$MOUNT_POINT/wp-config-sample.php" # Redefine após cópia
-    else
-        echo "ERRO: Falha ao copiar WordPress para EFS '$MOUNT_POINT'. Verifique permissões."; ls -ld "$MOUNT_POINT"; exit 1;
-    fi
-    sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-    echo "INFO: Limpeza dos diretórios temporários de download do WordPress OK."
-fi
-
-if [ ! -d "$MOUNT_POINT/wp-content" ]; then
-    echo "INFO: Criando diretório '$MOUNT_POINT/wp-content' como '$APACHE_USER'..."
-    # Tenta criar como apache, mas pode falhar dependendo das permissões do EFS Access Point.
-    # Se o EFS Access Point for para ec2-user, o ec2-user deveria criar e depois chown/chmod.
-    sudo -u "$EFS_OWNER_USER" mkdir -p "$MOUNT_POINT/wp-content" # Tenta criar como EFS_OWNER_USER
-    sudo chown "$APACHE_USER":"$APACHE_USER" "$MOUNT_POINT/wp-content"
-    sudo chmod 775 "$MOUNT_POINT/wp-content"
-    if [ ! -d "$MOUNT_POINT/wp-content" ]; then echo "ERRO: Falha ao criar wp-content."; exit 1; fi
-fi
-
-echo "INFO: (Opcional) Salvando vars em '$ENV_VARS_FILE'..."
-ENV_VARS_FILE_CONTENT="#!/bin/bash\n# Vars para referência (v2.4.1)\n"
-ENV_VARS_FILE_CONTENT+="export MOUNT_POINT=$(printf '%q' "$MOUNT_POINT")\n"
-ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_NAME_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_NAME_0")\n"
-ENV_VARS_FILE_CONTENT+="export AWS_S3_BUCKET_TARGET_REGION_0=$(printf '%q' "$AWS_S3_BUCKET_TARGET_REGION_0")\n"
-ENV_VARS_FILE_CONTENT+="export WP_RDS_SECRET_ARN_OR_NAME=$(printf '%q' "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0")\n"
-echo -e "$ENV_VARS_FILE_CONTENT" | sudo tee "$ENV_VARS_FILE" > /dev/null; sudo chmod 644 "$ENV_VARS_FILE"; echo "INFO: Vars salvas em $ENV_VARS_FILE."
-
-
-if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then
-    echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando..."
-    create_wp_config_template "$ACTIVE_CONFIG_FILE_EFS" "$WPDOMAIN" "$DB_NAME_TO_USE" "$DB_USER" "$DB_PASSWORD_FOR_WPCONFIG" "$DB_HOST_ENDPOINT"
-else
-    echo "AVISO: '$ACTIVE_CONFIG_FILE_EFS' já existe. Nenhuma modificação será feita nele por este script."
-fi
-
-echo "INFO: Criando health check '$HEALTH_CHECK_FILE_PATH_EFS'..."
-HEALTH_CHECK_CONTENT="<?php http_response_code(200); header('Content-Type: text/plain; charset=utf-8'); echo 'OK - WP Health Check - v2.4.1 - '.date('Y-m-d\TH:i:s\Z'); exit; ?>"
-TEMP_HEALTH_CHECK_FILE=$(mktemp /tmp/healthcheck.XXXXXX.php); sudo chmod 644 "$TEMP_HEALTH_CHECK_FILE"; echo "$HEALTH_CHECK_CONTENT" >"$TEMP_HEALTH_CHECK_FILE"
-if sudo -u "$APACHE_USER" cp "$TEMP_HEALTH_CHECK_FILE" "$HEALTH_CHECK_FILE_PATH_EFS"; then echo "INFO: Health check criado."; else echo "ERRO: Falha criar health check."; fi; rm -f "$TEMP_HEALTH_CHECK_FILE"
-
-echo "INFO: Ajustando permissões finais em '$MOUNT_POINT' para '$APACHE_USER' e '$EFS_OWNER_USER'..."
-# Garante que o EFS_OWNER_USER (ec2-user) possa escrever para o Python copiar/deletar se necessário (para DELETE_FROM_EFS)
-# E que o APACHE_USER possa ler/escrever para o WordPress funcionar
-sudo chown -R "$EFS_OWNER_USER":"$APACHE_USER" "$MOUNT_POINT" # Dono ec2-user, grupo apache
-sudo find "$MOUNT_POINT" -type d -exec chmod 775 {} \; # Diretorios: rwxrwx_r_x (dono e grupo podem escrever, outros leem/executam)
-sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \; # Arquivos: rw_rw_r__ (dono e grupo podem ler/escrever, outros leem)
-if [ -f "$ACTIVE_CONFIG_FILE_EFS" ]; then sudo chmod 640 "$ACTIVE_CONFIG_FILE_EFS"; fi # wp-config mais restrito (dono r, grupo r, outros nada)
-if [ -f "$HEALTH_CHECK_FILE_PATH_EFS" ]; then sudo chmod 644 "$HEALTH_CHECK_FILE_PATH_EFS"; fi # healthcheck legível por todos
-echo "INFO: Permissões ajustadas (tentativa)."
-
-echo "INFO: Configurando Apache..."
-HTTPD_WP_CONF="/etc/httpd/conf.d/wordpress_v2.4.1.conf"
-if [ ! -f "$HTTPD_WP_CONF" ]; then
-    echo "INFO: Criando $HTTPD_WP_CONF";
-    sudo tee "$HTTPD_WP_CONF" >/dev/null <<EOF_APACHE_CONF
-<Directory "${MOUNT_POINT}">
-    AllowOverride All
-    Require all granted
-</Directory>
-<IfModule mod_setenvif.c>
-  SetEnvIf X-Forwarded-Proto "^https$" HTTPS=on
-</IfModule>
-EOF_APACHE_CONF
-else
-    echo "INFO: $HTTPD_WP_CONF já existe. Verificando conteúdo..."
-    if ! grep -q "AllowOverride All" "$HTTPD_WP_CONF"; then sudo sed -i '/<Directory "${MOUNT_POINT//\//\\/}">/a \    AllowOverride All' "$HTTPD_WP_CONF"; fi
-    if ! grep -q "SetEnvIf X-Forwarded-Proto" "$HTTPD_WP_CONF"; then echo -e "\n<IfModule mod_setenvif.c>\n  SetEnvIf X-Forwarded-Proto \"^https\$\" HTTPS=on\n</IfModule>" | sudo tee -a "$HTTPD_WP_CONF" > /dev/null; fi
-fi
-echo "INFO: Configuração Apache em $HTTPD_WP_CONF verificada/criada."
-
-PHP_FPM_SERVICE_NAME=""
-POSSIBLE_FPM_NAMES=("php-fpm.service" "php7.4-fpm.service" "php74-php-fpm.service") # Ajuste conforme sua versão PHP
-echo "INFO: Detectando nome do serviço PHP-FPM..."
-for fpm_name in "${POSSIBLE_FPM_NAMES[@]}"; do
-    if sudo systemctl list-unit-files | grep -q -w "$fpm_name"; then
-        PHP_FPM_SERVICE_NAME="$fpm_name"
-        echo "INFO: Nome do serviço PHP-FPM detectado: $PHP_FPM_SERVICE_NAME"
-        break
-    fi
-done
-if [ -z "$PHP_FPM_SERVICE_NAME" ]; then echo "ERRO CRÍTICO: Não foi possível detectar o nome do serviço PHP-FPM instalado."; exit 1; fi
-
-echo "INFO: Habilitando e reiniciando httpd e $PHP_FPM_SERVICE_NAME..."
-sudo systemctl enable httpd "$PHP_FPM_SERVICE_NAME"
-php_fpm_restarted_successfully=false
-if sudo systemctl restart "$PHP_FPM_SERVICE_NAME"; then echo "INFO: $PHP_FPM_SERVICE_NAME reiniciado com sucesso."; php_fpm_restarted_successfully=true; else echo "ERRO: Falha ao reiniciar $PHP_FPM_SERVICE_NAME."; sudo systemctl status "$PHP_FPM_SERVICE_NAME" -l --no-pager; sudo journalctl -u "$PHP_FPM_SERVICE_NAME" -n 50 --no-pager; fi
-httpd_restarted_successfully=false
-if sudo systemctl restart httpd; then echo "INFO: httpd reiniciado com sucesso."; httpd_restarted_successfully=true; else echo "ERRO CRÍTICO: Falha ao reiniciar httpd."; sudo apachectl configtest; sudo tail -n 50 /var/log/httpd/error_log; fi
-sleep 3
-if $httpd_restarted_successfully && $php_fpm_restarted_successfully && systemctl is-active --quiet httpd && systemctl is-active --quiet "$PHP_FPM_SERVICE_NAME"; then
-    echo "INFO: httpd e $PHP_FPM_SERVICE_NAME ativos."
-else
-    echo "ERRO CRÍTICO: httpd ou $PHP_FPM_SERVICE_NAME não estão ativos após a tentativa de reinício."
-    if ! systemctl is-active --quiet httpd; then echo "--- Status httpd DETALHADO ---"; sudo systemctl status httpd -l --no-pager; sudo tail -n 30 /var/log/httpd/error_log; fi
-    if ! systemctl is-active --quiet "$PHP_FPM_SERVICE_NAME"; then echo "--- Status $PHP_FPM_SERVICE_NAME DETALHADO ---"; sudo systemctl status "$PHP_FPM_SERVICE_NAME" -l --no-pager; sudo journalctl -u "$PHP_FPM_SERVICE_NAME" -n 30 --no-pager; fi
-    exit 1
-fi
-
-setup_python_monitor_script
-create_and_enable_python_monitor_service
-
-echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.4.1) concluído! ($(date)) ---"
-echo "INFO: Sincronização EFS/S3 e Processador de Fila RDS Python: ATIVO (Script: $PYTHON_MONITOR_SCRIPT_PATH, Serviço: $PYTHON_MONITOR_SERVICE_NAME)"
-echo "INFO: Configurações do Python para EFS/S3 (no service file): DELETE_FROM_EFS_AFTER_SYNC=${py_delete_from_efs_after_sync:-N/A}, PERFORM_INITIAL_SYNC=${py_perform_initial_sync:-N/A}"
-echo "INFO: Configurações do Python para RDS Queue (no service file): WP_RDS_SECRET_ARN_OR_NAME=${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0:-N/A}"
-echo "INFO: Logs: Principal=${LOG_FILE}, Python Monitor/RDS Queue=${PY_MONITOR_LOG_FILE}, Python Transfer=${PY_S3_TRANSFER_LOG_FILE}"
-echo "INFO: Site: https://${WPDOMAIN}, Health Check: /healthcheck.php"
-echo "INFO: Lembre-se de que a IAM Role da EC2 deve ter permissão para ler o segredo do RDS no Secrets Manager e para as operações S3/CloudFront."
-echo "INFO: Lembre-se de que o usuário do RDS (configurado no Secrets Manager) deve ter permissão TRIGGER no banco para que o script Python crie o gatilho."
-echo "INFO: =================================================="
-exit 0
+#!/usr/bin/env python3
+import time
+import logging
+import subprocess
+import os
+import fnmatch
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import shutil
+import boto3
+import threading
+import json
+
+try:
+    import pymysql
+except ImportError:
+    print("CRITICAL: pymysql library not found. Please install it: pip install pymysql")
+    exit(1)
+try:
+    from phpserialize import loads as php_loads
+except ImportError:
+    print("CRITICAL: phpserialize library not found. Please install it: pip install phpserialize")
+    exit(1)
+
+# --- Configuration (Read from environment variables) ---
+# EFS Monitor
+MONITOR_DIR_BASE = os.environ.get('WP_MONITOR_DIR_BASE', '/var/www/html')
+S3_BUCKET = os.environ.get('WP_S3_BUCKET') # Usado por ambos EFS sync e RDS queue
+RELEVANT_PATTERNS_STR = os.environ.get('WP_RELEVANT_PATTERNS', '')
+LOG_FILE_MONITOR = os.environ.get(
+    'WP_PY_MONITOR_LOG_FILE', '/var/log/wp_efs_s3_py_monitor_default.log')
+S3_TRANSFER_LOG = os.environ.get(
+    'WP_PY_S3_TRANSFER_LOG', '/var/log/wp_s3_py_transferred_default.log')
+SYNC_DEBOUNCE_SECONDS = int(os.environ.get('WP_SYNC_DEBOUNCE_SECONDS', '5'))
+AWS_CLI_PATH = os.environ.get('WP_AWS_CLI_PATH', 'aws')
+DELETE_FROM_EFS_AFTER_SYNC = os.environ.get('WP_DELETE_FROM_EFS_AFTER_SYNC', 'false').lower() == 'true'
+PERFORM_INITIAL_SYNC = os.environ.get('WP_PERFORM_INITIAL_SYNC', 'true').lower() == 'true'
+DELETABLE_IMAGE_EXTENSIONS_FROM_EFS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.ico', '.svg']
+
+# CloudFront
+CLOUDFRONT_DISTRIBUTION_ID = os.environ.get('AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0')
+CF_INVALIDATION_BATCH_MAX_SIZE = int(os.environ.get('CF_INVALIDATION_BATCH_MAX_SIZE', 15))
+CF_INVALIDATION_BATCH_TIMEOUT_SECONDS = int(os.environ.get('CF_INVALIDATION_BATCH_TIMEOUT_SECONDS', 20))
+
+# RDS Deletion Queue
+RDS_DELETION_QUEUE_ENABLED = os.environ.get('WP_RDS_DELETION_QUEUE_ENABLED', 'true').lower() == 'true'
+RDS_SECRET_ARN_OR_NAME = os.environ.get('WP_RDS_SECRET_ARN_OR_NAME') # ARN ou nome do segredo no Secrets Manager
+# As variáveis RDS_HOST, USER, PASSWORD, DBNAME, PORT serão obtidas do Secrets Manager se RDS_SECRET_ARN_OR_NAME for fornecido
+# Caso contrário, ou como fallback/override, podem ser lidas daqui:
+RDS_HOST_ENV = os.environ.get('WP_RDS_HOST')
+RDS_USER_ENV = os.environ.get('WP_RDS_USER')
+RDS_PASSWORD_ENV = os.environ.get('WP_RDS_PASSWORD') # Não recomendado passar via env var
+RDS_DB_NAME_ENV = os.environ.get('WP_RDS_DB_NAME')
+RDS_PORT_ENV = int(os.environ.get('WP_RDS_PORT', '3306'))
+
+RDS_WP_POSTS_TABLE_NAME = os.environ.get('WP_RDS_POSTS_TABLE_NAME', 'wp_posts')
+RDS_WP_POSTMETA_TABLE_NAME = os.environ.get('WP_RDS_POSTMETA_TABLE_NAME', 'wp_postmeta')
+S3_DELETION_QUEUE_TABLE_NAME = os.environ.get('WP_S3_DELETION_QUEUE_TABLE_NAME', 'wp_s3_deletion_queue')
+S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS = int(os.environ.get('WP_S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS', '900'))
+S3_DELETION_QUEUE_BATCH_SIZE = int(os.environ.get('WP_S3_DELETION_QUEUE_BATCH_SIZE', '10'))
+S3_BASE_PATH_FOR_DELETION_QUEUE = os.environ.get('WP_S3_BASE_PATH_FOR_DELETION_QUEUE', 'wp-content/uploads/')
+
+# --- Globals ---
+RELEVANT_PATTERNS = [p.strip() for p in RELEVANT_PATTERNS_STR.split(';') if p.strip()]
+last_sync_file_map = {}
+cf_invalidation_paths_batch = []
+cf_invalidation_timer = None
+cf_invalidation_lock = threading.Lock()
+efs_deleted_by_script = set()
+efs_deletion_lock = threading.Lock()
+s3_deletion_queue_stop_event = threading.Event()
+s3_client_boto_for_deletion_queue = None # Será inicializado na thread do RDS
+rds_credentials_global = {} # Para armazenar credenciais obtidas do Secrets Manager
+
+# --- Logger Setup ---
+def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s - %(levelname)s - %(name)s - %(message)s'):
+    log_dir = os.path.dirname(log_file)
+    if log_dir and not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception as e:
+            print(f"Error creating log directory {log_dir}: {e}")
+            log_file = os.path.join("/tmp", os.path.basename(log_file))
+            print(f"Falling back to log file: {log_file}")
+    try:
+        with open(log_file, 'a'): os.utime(log_file, None)
+    except Exception as e:
+        print(f"Error touching log file {log_file}: {e}")
+
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    if not logger.hasHandlers():
+        handler = logging.FileHandler(log_file, mode='a')
+        handler.setFormatter(logging.Formatter(formatter_str))
+        logger.addHandler(handler)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(logging.Formatter(formatter_str))
+        logger.addHandler(console_handler)
+    return logger
+
+monitor_logger = setup_logger('PY_MONITOR', LOG_FILE_MONITOR)
+transfer_logger = setup_logger('PY_S3_TRANSFER', S3_TRANSFER_LOG, formatter_str='%(asctime)s - %(message)s')
+rds_queue_logger = setup_logger('PY_RDS_QUEUE', LOG_FILE_MONITOR) # Log para o mesmo arquivo do monitor
+
+
+# --- Secrets Manager Function ---
+def get_rds_credentials_from_secrets_manager(secret_arn_or_name):
+    global rds_credentials_global # Vamos popular o global aqui
+    if not secret_arn_or_name:
+        rds_queue_logger.info("RDS Secret ARN or Name not provided. Will attempt to use ENV vars for RDS creds.")
+        rds_credentials_global = {
+            'host': RDS_HOST_ENV, 'port': RDS_PORT_ENV, 'user': RDS_USER_ENV,
+            'password': RDS_PASSWORD_ENV, 'dbname': RDS_DB_NAME_ENV
+        }
+        if not all(rds_credentials_global.values()): # Check if all essential fallback env vars are set
+            rds_queue_logger.error("Fallback RDS ENV vars (HOST, USER, DBNAME) are not fully configured.")
+            return False
+        rds_queue_logger.info("Using RDS credentials from environment variables (password may be missing if not set).")
+        return True
+
+
+    rds_queue_logger.info(f"Attempting to retrieve RDS credentials from Secrets Manager: {secret_arn_or_name}")
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager')
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_arn_or_name)
+        if 'SecretString' in get_secret_value_response:
+            secret_string = get_secret_value_response['SecretString']
+            secret_data = json.loads(secret_string)
+            rds_credentials_global = {
+                'host': secret_data.get('host', RDS_HOST_ENV), # Fallback to ENV if not in secret
+                'port': int(secret_data.get('port', RDS_PORT_ENV)),
+                'user': secret_data.get('username', RDS_USER_ENV),
+                'password': secret_data.get('password'), # Password MUST come from secret
+                'dbname': secret_data.get('dbname', RDS_DB_NAME_ENV)
+            }
+            if not rds_credentials_global.get('password'):
+                rds_queue_logger.error(f"Password not found in secret '{secret_arn_or_name}'.")
+                return False
+            rds_queue_logger.info(f"Successfully retrieved and parsed RDS credentials from secret '{secret_arn_or_name}'.")
+            return True
+        else:
+            rds_queue_logger.error(f"SecretString not found in response for '{secret_arn_or_name}'.")
+            return False
+    except Exception as e:
+        rds_queue_logger.error(f"Error retrieving secret '{secret_arn_or_name}': {e}", exc_info=True)
+        return False
+
+# --- RDS Deletion Queue Functions ---
+def get_rds_connection():
+    if not rds_credentials_global or not all([rds_credentials_global.get(k) for k in ['host', 'user', 'password', 'dbname']]):
+        rds_queue_logger.error("RDS connection details are not fully configured (check Secrets Manager or ENV vars).")
+        return None
+    try:
+        conn = pymysql.connect(
+            host=rds_credentials_global['host'],
+            user=rds_credentials_global['user'],
+            password=rds_credentials_global['password'],
+            database=rds_credentials_global['dbname'],
+            port=rds_credentials_global['port'],
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=10,
+            charset='utf8mb4'
+        )
+        rds_queue_logger.debug(f"Successfully connected to RDS: {rds_credentials_global['host']}/{rds_credentials_global['dbname']}")
+        return conn
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"Error connecting to RDS: {e}")
+        return None
+
+def ensure_deletion_queue_table_exists(conn):
+    if not conn: return False
+    try:
+        with conn.cursor() as cursor:
+            sql = f"""
+            CREATE TABLE IF NOT EXISTS `{S3_DELETION_QUEUE_TABLE_NAME}` (
+                `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                `post_id_deleted` BIGINT UNSIGNED NULL,
+                `attachment_metadata_snapshot` LONGTEXT NULL,
+                `s3_keys_to_delete_json` LONGTEXT NULL,
+                `status` ENUM('PENDING', 'PROCESSING', 'DONE', 'ERROR', 'NO_KEYS') NOT NULL DEFAULT 'PENDING',
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `processed_at` TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+                `error_message` TEXT NULL,
+                INDEX `idx_status_created_at` (`status`, `created_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            """
+            cursor.execute(sql)
+        conn.commit()
+        rds_queue_logger.info(f"Table '{S3_DELETION_QUEUE_TABLE_NAME}' ensured to exist.")
+        return True
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"Error ensuring table '{S3_DELETION_QUEUE_TABLE_NAME}' exists: {e}")
+        if conn.open: conn.rollback()
+        return False
+
+def ensure_s3_deletion_trigger_exists(conn):
+    if not conn: return False
+    trigger_name = 'after_attachment_delete_enqueue_s3_v1'
+    rds_queue_logger.info(f"Ensuring RDS trigger '{trigger_name}' exists...")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) as count FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME = %s;", (trigger_name,))
+            if cursor.fetchone()['count'] > 0:
+                rds_queue_logger.info(f"Trigger '{trigger_name}' already exists.")
+                return True
+
+            rds_queue_logger.info(f"Trigger '{trigger_name}' not found. Attempting to create...")
+            # User needs TRIGGER permission on the database
+            sql_create_trigger = f"""
+            CREATE TRIGGER `{trigger_name}`
+            AFTER DELETE ON `{RDS_WP_POSTS_TABLE_NAME}`
+            FOR EACH ROW
+            BEGIN
+                DECLARE v_attachment_meta LONGTEXT;
+                IF OLD.post_type = 'attachment' THEN
+                    SELECT meta_value INTO v_attachment_meta
+                    FROM `{RDS_WP_POSTMETA_TABLE_NAME}`
+                    WHERE post_id = OLD.ID AND meta_key = '_wp_attachment_metadata'
+                    LIMIT 1;
+                    INSERT INTO `{S3_DELETION_QUEUE_TABLE_NAME}`
+                        (post_id_deleted, attachment_metadata_snapshot, status)
+                    VALUES
+                        (OLD.ID, v_attachment_meta, 'PENDING');
+                END IF;
+            END
+            """
+            cursor.execute(sql_create_trigger)
+            conn.commit()
+            rds_queue_logger.info(f"Trigger '{trigger_name}' created successfully.")
+            return True
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"MySQL Error for trigger '{trigger_name}': {e.args[0]} - {e.args[1] if len(e.args) > 1 else ''}")
+        if conn.open: conn.rollback()
+        return False
+    except Exception as e_gen:
+        rds_queue_logger.error(f"Unexpected error for trigger '{trigger_name}': {e_gen}", exc_info=True)
+        if conn.open: conn.rollback()
+        return False
+
+def get_pending_s3_deletions(conn, batch_size):
+    # (Identical to previous version)
+    if not conn: return []
+    try:
+        with conn.cursor() as cursor:
+            sql = f"SELECT id, post_id_deleted, attachment_metadata_snapshot, s3_keys_to_delete_json FROM `{S3_DELETION_QUEUE_TABLE_NAME}` WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT %s;"
+            cursor.execute(sql, (batch_size,))
+            items = cursor.fetchall()
+            return items if items else []
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"Error fetching pending S3 deletions: {e}")
+        return []
+
+
+def update_queue_item_status(conn, item_id, status, error_msg=None):
+    # (Identical to previous version)
+    if not conn: return False
+    try:
+        with conn.cursor() as cursor:
+            sql = f"UPDATE `{S3_DELETION_QUEUE_TABLE_NAME}` SET status = %s, error_message = %s WHERE id = %s;"
+            cursor.execute(sql, (status, error_msg, item_id))
+        conn.commit()
+        rds_queue_logger.debug(f"Updated item {item_id} to status {status}.")
+        return True
+    except pymysql.Error as e:
+        rds_queue_logger.error(f"Error updating status for item {item_id} to {status}: {e}")
+        if conn.open: conn.rollback()
+        return False
+
+def parse_s3_keys_from_data(metadata_snapshot_str, s3_keys_json_str, post_id):
+    # (Identical to previous version, including S3_BASE_PATH_FOR_DELETION_QUEUE)
+    s3_keys = []
+    if s3_keys_json_str:
+        try:
+            keys = json.loads(s3_keys_json_str)
+            if isinstance(keys, list) and all(isinstance(k, str) for k in keys):
+                s3_keys.extend(keys)
+                rds_queue_logger.info(f"Using pre-calculated S3 keys from JSON for post_id {post_id}: {len(keys)} keys.")
+                return list(set(s3_keys))
+        except json.JSONDecodeError as e:
+            rds_queue_logger.warning(f"Failed to parse s3_keys_to_delete_json for post_id {post_id}: {e}. Will try metadata_snapshot.")
+
+    if not metadata_snapshot_str:
+        rds_queue_logger.warning(f"No metadata_snapshot_str or valid s3_keys_json for post_id {post_id}.")
+        return []
+    try:
+        metadata = php_loads(metadata_snapshot_str.encode('utf-8'), decode_strings=True)
+        if not isinstance(metadata, dict):
+            rds_queue_logger.error(f"Parsed metadata for post_id {post_id} is not a dictionary.")
+            return []
+        main_file_relative_path = metadata.get('file')
+        if main_file_relative_path:
+            full_s3_key_main = S3_BASE_PATH_FOR_DELETION_QUEUE.rstrip('/') + '/' + main_file_relative_path.lstrip('/')
+            s3_keys.append(full_s3_key_main)
+            main_file_dir_relative = os.path.dirname(main_file_relative_path)
+            sizes = metadata.get('sizes')
+            if isinstance(sizes, dict):
+                for size_info in sizes.values():
+                    if isinstance(size_info, dict) and 'file' in size_info:
+                        thumb_filename = size_info['file']
+                        if main_file_dir_relative and main_file_dir_relative != '.':
+                            thumb_relative_path_to_uploads = os.path.join(main_file_dir_relative, thumb_filename)
+                        else:
+                            thumb_relative_path_to_uploads = thumb_filename
+                        full_s3_key_thumb = S3_BASE_PATH_FOR_DELETION_QUEUE.rstrip('/') + '/' + thumb_relative_path_to_uploads.lstrip('/')
+                        s3_keys.append(full_s3_key_thumb)
+        else:
+            rds_queue_logger.warning(f"Metadata for post_id {post_id} does not contain 'file' key.")
+    except Exception as e:
+        rds_queue_logger.error(f"Error parsing PHP serialized metadata for post_id {post_id}: {e}", exc_info=True)
+    return list(set(s3_keys))
+
+
+def delete_s3_objects_from_queue_item(s3_client, bucket_name, s3_keys):
+    # (Identical to previous version)
+    if not s3_keys:
+        rds_queue_logger.info("No S3 keys provided for deletion.")
+        return True, None
+    objects_to_delete_s3_format = [{'Key': key.lstrip('/')} for key in s3_keys]
+    rds_queue_logger.info(f"Attempting to delete {len(objects_to_delete_s3_format)} objects from S3 bucket '{bucket_name}'.")
+    rds_queue_logger.debug(f"Objects to delete: {objects_to_delete_s3_format}")
+    try:
+        response = s3_client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects_to_delete_s3_format, 'Quiet': False})
+        deleted_successfully_count = len(response.get('Deleted', []))
+        for d_obj in response.get('Deleted', []):
+            transfer_logger.info(f"DELETED_S3_FROM_QUEUE: s3://{bucket_name}/{d_obj['Key']}")
+        if 'Errors' in response and response['Errors']:
+            error_messages = [f"S3 Key: {e['Key']}, Code: {e['Code']}, Message: {e['Message']}" for e in response['Errors']]
+            for e in response['Errors']: transfer_logger.info(f"DELETED_S3_FROM_QUEUE_ERROR: s3://{bucket_name}/{e['Key']} - {e['Message']}")
+            rds_queue_logger.error(f"S3 delete_objects reported errors: {'; '.join(error_messages)}")
+            return deleted_successfully_count > 0, "; ".join(error_messages)
+        rds_queue_logger.info(f"Successfully submitted deletion for {deleted_successfully_count} S3 objects.")
+        return True, None
+    except Exception as e:
+        rds_queue_logger.error(f"Exception during S3 delete_objects: {e}", exc_info=True)
+        return False, str(e)
+
+def process_s3_deletion_queue(conn, s3_client):
+    # (Identical to previous version)
+    if not conn or not s3_client:
+        rds_queue_logger.error("RDS connection or S3 client not available for queue processing.")
+        return
+    pending_items = get_pending_s3_deletions(conn, S3_DELETION_QUEUE_BATCH_SIZE)
+    if not pending_items:
+        rds_queue_logger.debug("No pending items in S3 deletion queue.")
+        return
+    rds_queue_logger.info(f"Found {len(pending_items)} items in S3 deletion queue to process.")
+    for item in pending_items:
+        item_id = item['id']; post_id = item.get('post_id_deleted', 'N/A')
+        metadata_snapshot = item.get('attachment_metadata_snapshot'); s3_keys_json = item.get('s3_keys_to_delete_json')
+        rds_queue_logger.info(f"Processing queue item ID: {item_id}, Post ID: {post_id}")
+        update_queue_item_status(conn, item_id, 'PROCESSING')
+        s3_keys = parse_s3_keys_from_data(metadata_snapshot, s3_keys_json, post_id)
+        if not s3_keys:
+            rds_queue_logger.warning(f"No S3 keys for item ID {item_id}. Marking as NO_KEYS.")
+            update_queue_item_status(conn, item_id, 'NO_KEYS', "Could not determine S3 keys.")
+            continue
+        success, error_message = delete_s3_objects_from_queue_item(s3_client, S3_BUCKET, s3_keys)
+        if success:
+            final_status = 'DONE'
+            if error_message: final_status = 'ERROR'
+            update_queue_item_status(conn, item_id, final_status, error_message)
+            if CLOUDFRONT_DISTRIBUTION_ID:
+                for cf_path_key_only in s3_keys:
+                    watcher_event_handler._add_to_cf_invalidation_batch(cf_path_key_only.lstrip('/'))
+        else:
+            update_queue_item_status(conn, item_id, 'ERROR', error_message)
+
+
+def s3_deletion_queue_worker_thread_func():
+    global s3_client_boto_for_deletion_queue
+    rds_queue_logger.info("S3 Deletion Queue Worker thread started.")
+    rds_conn = None
+
+    if not get_rds_credentials_from_secrets_manager(RDS_SECRET_ARN_OR_NAME):
+        rds_queue_logger.critical("Failed to initialize RDS credentials. RDS queue worker will not run.")
+        return
+
+    try:
+        s3_client_boto_for_deletion_queue = boto3.client('s3')
+        rds_queue_logger.info("Boto3 S3 client initialized for Deletion Queue Worker.")
+    except Exception as e:
+        rds_queue_logger.critical(f"Failed to initialize Boto3 S3 client for Deletion Queue Worker: {e}. Thread exiting.", exc_info=True)
+        return
+
+    initial_setup_done = False
+
+    while not s3_deletion_queue_stop_event.is_set():
+        try:
+            if not rds_conn or rds_conn.closed:
+                rds_queue_logger.info("RDS connection closed or not established. Attempting to (re)connect.")
+                if rds_conn and not rds_conn.closed:
+                    try: rds_conn.close()
+                    except: pass
+                rds_conn = get_rds_connection()
+                if rds_conn:
+                    if not initial_setup_done: # Perform setup once per successful connection sequence
+                        if ensure_deletion_queue_table_exists(rds_conn):
+                            if ensure_s3_deletion_trigger_exists(rds_conn): # Only if table exists
+                                initial_setup_done = True # Mark setup as done for this run
+                            else:
+                                rds_queue_logger.error("Failed to ensure S3 deletion trigger. Processing might be impaired.")
+                                # initial_setup_done remains false, will retry on next connection
+                        else:
+                            rds_queue_logger.error("Failed to ensure deletion queue table. Trigger/Processing will be skipped.")
+                else:
+                    rds_queue_logger.error("Failed to connect to RDS. Will retry later.")
+                    s3_deletion_queue_stop_event.wait(60)
+                    continue
+            
+            if rds_conn: # Only proceed if connection is established
+                try:
+                    if not rds_conn.ping(reconnect=False):
+                        rds_queue_logger.warning("RDS ping failed. Reconnecting.")
+                        try: rds_conn.close()
+                        except: pass
+                        rds_conn = None; initial_setup_done = False # Reset setup flag
+                        continue
+                except (pymysql.Error, AttributeError) as pe:
+                    rds_queue_logger.warning(f"RDS ping error: {pe}. Reconnecting.")
+                    try: rds_conn.close()
+                    except: pass
+                    rds_conn = None; initial_setup_done = False
+                    continue
+
+                if initial_setup_done: # Only process if initial table/trigger setup was successful
+                    rds_queue_logger.info(f"S3 Deletion Queue Worker: Polling queue.")
+                    process_s3_deletion_queue(rds_conn, s3_client_boto_for_deletion_queue)
+                else:
+                    rds_queue_logger.warning("Initial RDS setup (table/trigger) not complete. Skipping queue processing cycle.")
+
+
+        except Exception as e:
+            rds_queue_logger.error(f"Unhandled error in S3 Deletion Queue Worker loop: {e}", exc_info=True)
+            if rds_conn and rds_conn.open:
+                try: rds_conn.rollback()
+                except Exception as rb_e: rds_queue_logger.error(f"Rollback error: {rb_e}")
+
+        s3_deletion_queue_stop_event.wait(S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS)
+
+    if rds_conn and not rds_conn.closed:
+        try: rds_conn.close()
+        except pymysql.Error as e: rds_queue_logger.error(f"Error closing RDS connection: {e}")
+    rds_queue_logger.info("S3 Deletion Queue Worker thread finished.")
+
+# --- Helper Functions (EFS Monitor - Existing) ---
+def is_path_relevant(path_to_check, base_dir, patterns):
+    # (Identical to previous version)
+    if not path_to_check.startswith(base_dir + os.path.sep): return False, None
+    relative_file_path = os.path.relpath(path_to_check, base_dir)
+    return any(fnmatch.fnmatch(relative_file_path, pattern) for pattern in patterns), relative_file_path
+
+
+# --- FileSystem Event Handler Class (EFS Monitor - Existing) ---
+class Watcher(FileSystemEventHandler):
+    # (Content of Watcher class identical to previous version,
+    # including _is_excluded, _get_s3_path, _trigger_batched_cloudfront_invalidation,
+    # _add_to_cf_invalidation_batch, _handle_s3_upload, _handle_s3_delete,
+    # process_event_for_sync, on_created, on_modified, on_deleted, on_moved)
+    def __init__(self):
+        super().__init__()
+
+    def _is_excluded(self, filepath):
+        filename = os.path.basename(filepath)
+        if filename.startswith('.') or filename.endswith(('.swp', '.swx', '~', '.part', '.crdownload', '.tmp')): return True
+        if any(excluded_dir in filepath for excluded_dir in ['/cache/', '/.git/', '/node_modules/', '/uploads/sites/']):
+            if '/uploads/sites/' in filepath: monitor_logger.debug(f"Excluding Multisite sub-site upload path: {filepath}")
+            return True
+        return False
+
+    def _get_s3_path(self, relative_file_path): return f"s3://{S3_BUCKET}/{relative_file_path}"
+
+    def _trigger_batched_cloudfront_invalidation(self):
+        global cf_invalidation_paths_batch, cf_invalidation_timer
+        with cf_invalidation_lock:
+            if not cf_invalidation_paths_batch:
+                if cf_invalidation_timer: cf_invalidation_timer.cancel(); cf_invalidation_timer = None
+                return
+            if not CLOUDFRONT_DISTRIBUTION_ID:
+                cf_invalidation_paths_batch = []; # Clear batch
+                if cf_invalidation_timer: cf_invalidation_timer.cancel(); cf_invalidation_timer = None
+                monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set. Skipping CF invalidation.")
+                return
+            paths_to_invalidate_now = ["/" + p for p in cf_invalidation_paths_batch]
+            current_batch_to_log = list(cf_invalidation_paths_batch)
+            cf_invalidation_paths_batch = []
+            if cf_invalidation_timer: cf_invalidation_timer.cancel(); cf_invalidation_timer = None
+        monitor_logger.info(f"Triggering batched CF invalidation for {len(paths_to_invalidate_now)} paths on {CLOUDFRONT_DISTRIBUTION_ID}: {paths_to_invalidate_now}")
+        try:
+            boto3.client('cloudfront').create_invalidation(
+                DistributionId=CLOUDFRONT_DISTRIBUTION_ID,
+                InvalidationBatch={
+                    'Paths': {'Quantity': len(paths_to_invalidate_now), 'Items': paths_to_invalidate_now},
+                    'CallerReference': f"s3-efs-sync-batch-{int(time.time())}-{len(paths_to_invalidate_now)}"
+                })
+            monitor_logger.info(f"Batched CF invalidation request created for {len(paths_to_invalidate_now)} paths.")
+            transfer_logger.info(f"INVALIDATED_CF_BATCH: {len(paths_to_invalidate_now)} paths on {CLOUDFRONT_DISTRIBUTION_ID} - Paths: {', '.join(current_batch_to_log)}")
+        except Exception as e:
+            monitor_logger.error(f"Failed to create batched CF invalidation for {current_batch_to_log}: {e}", exc_info=True)
+            transfer_logger.info(f"INVALIDATION_CF_BATCH_FAILED: {len(paths_to_invalidate_now)} paths - {str(e)}")
+
+    def _add_to_cf_invalidation_batch(self, object_key_to_invalidate):
+        global cf_invalidation_paths_batch, cf_invalidation_timer
+        if not CLOUDFRONT_DISTRIBUTION_ID: return
+        with cf_invalidation_lock:
+            if object_key_to_invalidate not in cf_invalidation_paths_batch:
+                cf_invalidation_paths_batch.append(object_key_to_invalidate)
+                monitor_logger.info(f"Added '{object_key_to_invalidate}' to CF invalidation batch. Size: {len(cf_invalidation_paths_batch)}")
+            if cf_invalidation_timer: cf_invalidation_timer.cancel()
+            if len(cf_invalidation_paths_batch) >= CF_INVALIDATION_BATCH_MAX_SIZE:
+                self._trigger_batched_cloudfront_invalidation()
+            elif cf_invalidation_paths_batch:
+                cf_invalidation_timer = threading.Timer(CF_INVALIDATION_BATCH_TIMEOUT_SECONDS, self._trigger_batched_cloudfront_invalidation)
+                cf_invalidation_timer.daemon = True; cf_invalidation_timer.start()
+
+    def _handle_s3_upload(self, local_path, relative_file_path, is_initial_sync=False):
+        global efs_deleted_by_script
+        effective_delete_from_efs = DELETE_FROM_EFS_AFTER_SYNC and not is_initial_sync
+        current_time = time.time()
+        if not is_initial_sync and local_path in last_sync_file_map and (current_time - last_sync_file_map[local_path] < SYNC_DEBOUNCE_SECONDS):
+            monitor_logger.info(f"Debounce for '{local_path}'. Skipped upload."); return
+        s3_full_uri = self._get_s3_path(relative_file_path)
+        monitor_logger.info(f"Copying '{local_path}' to '{s3_full_uri}'...")
+        try:
+            process = subprocess.run([AWS_CLI_PATH, 's3', 'cp', local_path, s3_full_uri, '--acl', 'private', '--only-show-errors'], capture_output=True, text=True, check=False)
+            if process.returncode == 0:
+                monitor_logger.info(f"S3 copy OK for '{relative_file_path}'.")
+                transfer_logger.info(f"TRANSFERRED: {relative_file_path} to {s3_full_uri}")
+                last_sync_file_map[local_path] = current_time
+                if not is_initial_sync: self._add_to_cf_invalidation_batch(relative_file_path)
+                if effective_delete_from_efs and os.path.splitext(local_path)[1].lower() in DELETABLE_IMAGE_EXTENSIONS_FROM_EFS:
+                    try:
+                        with efs_deletion_lock: efs_deleted_by_script.add(local_path)
+                        os.remove(local_path)
+                        monitor_logger.info(f"Deleted IMAGE '{local_path}' from EFS."); transfer_logger.info(f"DELETED_EFS_IMAGE: {relative_file_path}")
+                    except OSError as e:
+                        monitor_logger.error(f"Failed to delete IMAGE '{local_path}' from EFS: {e}")
+                        with efs_deletion_lock:
+                            if local_path in efs_deleted_by_script: efs_deleted_by_script.remove(local_path)
+            else: monitor_logger.error(f"S3 copy FAILED for '{relative_file_path}'. RC: {process.returncode}. Stderr: {process.stderr.strip()}")
+        except FileNotFoundError: monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 copy failed for '{relative_file_path}'.")
+        except Exception as e: monitor_logger.error(f"Exception during S3 copy for {relative_file_path}: {e}", exc_info=True)
+
+    def _handle_s3_delete(self, relative_file_path):
+        s3_target_path_key = relative_file_path; s3_full_uri = self._get_s3_path(relative_file_path)
+        monitor_logger.info(f"Attempting to delete '{s3_full_uri}' from S3 (EFS event)...")
+        cli_rc = -1; cli_stderr = ""
+        try:
+            process = subprocess.run([AWS_CLI_PATH, 's3', 'rm', s3_full_uri], capture_output=True, text=True, check=False)
+            cli_rc = process.returncode; cli_stderr = process.stderr.strip()
+            if cli_rc == 0: transfer_logger.info(f"DELETED_S3_EFS_EVENT_CLI_OK: {relative_file_path}")
+            else: transfer_logger.info(f"DELETED_S3_EFS_EVENT_CLI_FAILED: {relative_file_path} - RC={cli_rc} ERR={cli_stderr}"); monitor_logger.error(f"AWS CLI 's3 rm' FAILED for '{relative_file_path}'. RC: {cli_rc}. Stderr: {cli_stderr}")
+        except FileNotFoundError: monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 delete failed."); return
+        except Exception as e: monitor_logger.error(f"Exception during AWS CLI 's3 rm' for {relative_file_path}: {e}", exc_info=True)
+
+        monitor_logger.info(f"Verifying S3 deletion of '{s3_target_path_key}' (Boto3 head_object)...")
+        try:
+            time.sleep(1); boto3.client('s3').head_object(Bucket=S3_BUCKET, Key=s3_target_path_key)
+            monitor_logger.error(f"S3 delete VERIFICATION FAILED for '{relative_file_path}'. Object still found. CLI RC: {cli_rc}. CLI Stderr: {cli_stderr}")
+            transfer_logger.info(f"DELETED_S3_EFS_EVENT_VERIFICATION_FAILED_STILL_EXISTS: {relative_file_path}")
+        except boto3.client('s3').exceptions.ClientError as e:
+            if e.response['Error']['Code'] in ['404', 'NoSuchKey']:
+                monitor_logger.info(f"S3 delete VERIFIED for '{relative_file_path}'. CLI RC: {cli_rc}."); transfer_logger.info(f"DELETED_S3_EFS_EVENT_VERIFIED_NOT_FOUND: {relative_file_path}")
+                self._add_to_cf_invalidation_batch(relative_file_path)
+            else:
+                monitor_logger.error(f"Error during S3 delete VERIFICATION for '{relative_file_path}': {e.response['Error']['Code']}. CLI RC: {cli_rc}. CLI Stderr: {cli_stderr}")
+                transfer_logger.info(f"DELETED_S3_EFS_EVENT_VERIFICATION_ERROR_HEAD_OBJECT: {relative_file_path} - {e.response['Error']['Code']}")
+        except Exception as ve: monitor_logger.error(f"Unexpected error during S3 delete VERIFICATION for '{s3_target_path_key}': {ve}", exc_info=True); transfer_logger.info(f"DELETED_S3_EFS_EVENT_VERIFICATION_UNEXPECTED_ERROR: {relative_file_path}")
+
+    def process_event_for_sync(self, event_type, path, dest_path=None):
+        global efs_deleted_by_script
+        if event_type == 'moved_from':
+            if self._is_excluded(path) or (os.path.exists(path) and os.path.isdir(path)): return
+            relevant_src, relative_src_path = is_path_relevant(path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
+            if not relevant_src or not relative_src_path: return
+            monitor_logger.info(f"Event: MOVED_FROM for '{relative_src_path}'")
+            ignore_s3_del = False
+            with efs_deletion_lock:
+                if path in efs_deleted_by_script: efs_deleted_by_script.remove(path); ignore_s3_del = True
+            if not ignore_s3_del: self._handle_s3_delete(relative_src_path)
+            else: transfer_logger.info(f"SKIPPED_S3_DELETE_MOVED_FROM_BY_SCRIPT_FLAG: {relative_src_path}")
+            return
+
+        current_path_to_check = dest_path if event_type == 'moved_to' else path
+        if self._is_excluded(current_path_to_check) or (os.path.exists(current_path_to_check) and os.path.isdir(current_path_to_check)): return
+        relevant, relative_path = is_path_relevant(current_path_to_check, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
+        if not relevant or not relative_path: return
+        monitor_logger.info(f"Event: {event_type.upper()} for '{relative_path}'")
+
+        if event_type in ['created', 'modified', 'moved_to']: self._handle_s3_upload(current_path_to_check, relative_path)
+        elif event_type == 'deleted':
+            ignore_s3_del = False
+            with efs_deletion_lock:
+                if path in efs_deleted_by_script: efs_deleted_by_script.remove(path); ignore_s3_del = True
+            if not ignore_s3_del: self._handle_s3_delete(relative_path)
+            else: transfer_logger.info(f"SKIPPED_S3_DELETE_BY_SCRIPT_FLAG: {relative_path}")
+
+    def on_created(self, event):
+        if not event.is_directory: self.process_event_for_sync('created', event.src_path)
+    def on_modified(self, event):
+        if not event.is_directory: self.process_event_for_sync('modified', event.src_path)
+    def on_deleted(self, event):
+        if not event.is_directory: self.process_event_for_sync('deleted', event.src_path)
+    def on_moved(self, event):
+        if not event.is_directory:
+            self.process_event_for_sync('moved_from', event.src_path)
+            self.process_event_for_sync('moved_to', event.src_path, dest_path=event.dest_path)
+
+# --- Initial Sync Function (EFS Monitor - Existing) ---
+def run_s3_sync_command(command_parts, description):
+    # (Identical to previous version)
+    monitor_logger.info(f"Attempting Initial Sync for {description} with command: {' '.join(command_parts)}")
+    try:
+        process = subprocess.run(command_parts, capture_output=True, text=True, check=False)
+        if process.returncode == 0:
+            monitor_logger.info(f"Initial Sync for {description} OK."); transfer_logger.info(f"INITIAL_SYNC_SUCCESS: {description}")
+            return True
+        elif process.returncode == 2: # Some files may not have been synced
+            monitor_logger.warning(f"Initial Sync for {description} RC 2. Stderr: {process.stderr.strip()}"); transfer_logger.info(f"INITIAL_SYNC_WARNING_RC2: {description} - ERR: {process.stderr.strip()}")
+            return True
+        else:
+            monitor_logger.error(f"Initial Sync for {description} FAILED. RC: {process.returncode}. Stderr: {process.stderr.strip()}"); transfer_logger.info(f"INITIAL_SYNC_FAILED: {description} - RC={process.returncode} ERR={process.stderr.strip()}")
+            return False
+    except FileNotFoundError: monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. Initial Sync failed."); return False
+    except Exception as e: monitor_logger.error(f"Exception during Initial Sync for {description}: {e}", exc_info=True); return False
+
+def perform_initial_sync():
+    # (Identical to previous version)
+    monitor_logger.info("--- Starting Initial S3 Sync ---")
+    if not S3_BUCKET or not os.path.isdir(MONITOR_DIR_BASE):
+        monitor_logger.error("S3_BUCKET not set or MONITOR_DIR_BASE not found. Skipping initial sync."); return
+    general_includes = ['*.css', '*.js', '*.jpg', '*.jpeg', '*.png', '*.gif', '*.svg', '*.webp', '*.ico', '*.woff', '*.woff2', '*.ttf', '*.eot', '*.otf', '*.mp4', '*.mov', '*.webm', '*.avi', '*.wmv', '*.mkv', '*.flv', '*.mp3', '*.wav', '*.ogg', '*.aac', '*.wma', '*.flac', '*.pdf', '*.doc', '*.docx', '*.xls', '*.xlsx', '*.ppt', '*.pptx', '*.zip', '*.txt']
+    includes_cmd = [item for sublist in [['--include', i] for i in general_includes] for item in sublist]
+    
+    wp_content_path = os.path.join(MONITOR_DIR_BASE, "wp-content")
+    if os.path.isdir(wp_content_path):
+        cmd = [AWS_CLI_PATH, 's3', 'sync', wp_content_path, f"s3://{S3_BUCKET}/wp-content/", '--exclude', '*.php', '--exclude', '*/index.php', '--exclude', '*/cache/*', '--exclude', '*/backups/*', '--exclude', '*/.DS_Store', '--exclude', '*/Thumbs.db'] + includes_cmd + ['--exact-timestamps', '--acl', 'private']
+        run_s3_sync_command(cmd, "wp-content")
+    
+    wp_includes_path = os.path.join(MONITOR_DIR_BASE, "wp-includes")
+    if os.path.isdir(wp_includes_path):
+        wp_inc_assets = ['*.css', '*.js', '*.jpg', '*.jpeg', '*.png', '*.gif', '*.svg', '*.webp', '*.ico']
+        inc_wp_inc_cmd = [item for sublist in [['--include', i] for i in wp_inc_assets] for item in sublist]
+        cmd = [AWS_CLI_PATH, 's3', 'sync', wp_includes_path, f"s3://{S3_BUCKET}/wp-includes/", '--exclude', '*'] + inc_wp_inc_cmd + ['--exact-timestamps', '--acl', 'private']
+        run_s3_sync_command(cmd, "wp-includes (assets only)")
+    monitor_logger.info("--- Initial S3 Sync Attempted ---")
+
+
+# --- Main Execution Block ---
+watcher_event_handler = Watcher()
+
+if __name__ == "__main__":
+    script_version_tag = "v2.5.0-SecretsManager-Full"
+    monitor_logger.info(f"Python EFS/S3 Monitor & RDS Queue Processor ({script_version_tag}) starting...")
+    monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
+    monitor_logger.info(f"EFS Monitor Dir: {MONITOR_DIR_BASE}")
+    monitor_logger.info(f"EFS Relevant Patterns: {RELEVANT_PATTERNS}")
+    monitor_logger.info(f"EFS Delete After Sync: {DELETE_FROM_EFS_AFTER_SYNC}")
+    monitor_logger.info(f"EFS Perform Initial Sync: {PERFORM_INITIAL_SYNC}")
+    monitor_logger.info(f"CF Distribution ID: {CLOUDFRONT_DISTRIBUTION_ID or 'Not Set'}")
+
+    monitor_logger.info(f"RDS Deletion Queue Enabled: {RDS_DELETION_QUEUE_ENABLED}")
+    if RDS_DELETION_QUEUE_ENABLED:
+        monitor_logger.info(f"RDS Secret ARN/Name: {RDS_SECRET_ARN_OR_NAME or 'Not Set (will use ENV for creds)'}")
+        monitor_logger.info(f"RDS Fallback Host (ENV): {RDS_HOST_ENV or 'Not Set'}")
+        # Do not log password
+        monitor_logger.info(f"RDS Posts Table Name: {RDS_WP_POSTS_TABLE_NAME}")
+        monitor_logger.info(f"RDS Postmeta Table Name: {RDS_WP_POSTMETA_TABLE_NAME}")
+        monitor_logger.info(f"RDS Queue Table Name: {S3_DELETION_QUEUE_TABLE_NAME}")
+        monitor_logger.info(f"RDS Queue Poll Interval: {S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS}s")
+        monitor_logger.info(f"S3 Base Path for Queue Deletion: '{S3_BASE_PATH_FOR_DELETION_QUEUE}'")
+
+    if not S3_BUCKET:
+        monitor_logger.critical("S3_BUCKET not set. Exiting."); exit(1)
+
+    aws_cli_actual_path = shutil.which(AWS_CLI_PATH)
+    if not aws_cli_actual_path:
+        monitor_logger.critical(f"AWS CLI not found at '{AWS_CLI_PATH}'. Exiting."); exit(1)
+    AWS_CLI_PATH = aws_cli_actual_path; monitor_logger.info(f"Using AWS CLI at: {AWS_CLI_PATH}")
+
+    try:
+        boto3.client('s3'); monitor_logger.info("Boto3 S3 client test OK.")
+    except Exception as e:
+        monitor_logger.critical(f"Boto3 S3 client init failed. Check AWS credentials/config: {e}", exc_info=True); exit(1)
+
+    if PERFORM_INITIAL_SYNC:
+        perform_initial_sync()
+
+    observer = None
+    if RELEVANT_PATTERNS:
+        if not os.path.isdir(MONITOR_DIR_BASE):
+            monitor_logger.error(f"EFS Monitor: Dir '{MONITOR_DIR_BASE}' not found. Observer not started.")
+        else:
+            observer = Observer()
+            observer.schedule(watcher_event_handler, MONITOR_DIR_BASE, recursive=True)
+            observer.start(); monitor_logger.info("EFS Watchdog Observer started.")
+    else:
+        monitor_logger.info("No RELEVANT_PATTERNS for EFS. Watchdog Observer not started.")
+
+    rds_deletion_thread = None
+    if RDS_DELETION_QUEUE_ENABLED:
+        if not RDS_SECRET_ARN_OR_NAME and not all([RDS_HOST_ENV, RDS_USER_ENV, RDS_DB_NAME_ENV]): # Password from ENV is not strictly checked here as it's not recommended
+             monitor_logger.error("RDS Deletion Queue enabled, but RDS_SECRET_ARN_OR_NAME and fallback ENV creds are incomplete. Worker not started.")
+        else:
+            rds_deletion_thread = threading.Thread(target=s3_deletion_queue_worker_thread_func, daemon=True)
+            rds_deletion_thread.start(); monitor_logger.info("RDS S3 Deletion Queue Worker thread initiated.")
+    else:
+        monitor_logger.info("RDS Deletion Queue is disabled.")
+
+    try:
+        while True: # Main loop to keep script alive
+            if observer and not observer.is_alive():
+                monitor_logger.error("EFS Observer thread died.")
+                if not rds_deletion_thread or not rds_deletion_thread.is_alive(): break # Exit if both dead
+            if rds_deletion_thread and not rds_deletion_thread.is_alive() and RDS_DELETION_QUEUE_ENABLED:
+                monitor_logger.error("RDS Deletion Queue thread died.")
+                if not observer or not observer.is_alive(): break # Exit if both dead
+            if (not observer or not observer.is_alive()) and \
+               (not RDS_DELETION_QUEUE_ENABLED or (rds_deletion_thread and not rds_deletion_thread.is_alive())):
+                monitor_logger.info("No active monitoring threads. Exiting.")
+                break
+            time.sleep(5)
+    except KeyboardInterrupt:
+        monitor_logger.info("Keyboard interrupt. Stopping...")
+        if cf_invalidation_timer and cf_invalidation_timer.is_alive():
+            with cf_invalidation_lock:
+                if cf_invalidation_timer and cf_invalidation_timer.is_alive(): cf_invalidation_timer.cancel()
+            watcher_event_handler._trigger_batched_cloudfront_invalidation()
+    except Exception as e:
+        monitor_logger.critical(f"Critical error in main loop: {e}", exc_info=True)
+    finally:
+        monitor_logger.info("Shutting down...")
+        if rds_deletion_thread and rds_deletion_thread.is_alive():
+            s3_deletion_queue_stop_event.set()
+            rds_deletion_thread.join(timeout=S3_DELETION_QUEUE_POLL_INTERVAL_SECONDS + 15)
+            if rds_deletion_thread.is_alive(): monitor_logger.warning("RDS Worker thread timed out on stop.")
+            else: monitor_logger.info("RDS Worker thread stopped.")
+        if observer and observer.is_alive():
+            observer.stop(); observer.join(timeout=10)
+            if observer.is_alive(): monitor_logger.warning("EFS Observer timed out on stop.")
+            else: monitor_logger.info("EFS Observer stopped.")
+        with cf_invalidation_lock:
+            if cf_invalidation_timer and cf_invalidation_timer.is_alive(): cf_invalidation_timer.cancel()
+        monitor_logger.info("Script finished.")
