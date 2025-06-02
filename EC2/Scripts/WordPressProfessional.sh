@@ -2,6 +2,7 @@
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
 # Versão: 2.3.4-zero-touch-s3-python-watchdog-phpfix-pyvars (Python Vars no Systemd)
 # Modificado para hardcodar comportamento de sync e placeholder no Python
+# Modificado para instalação explícita de pip packages para /usr/bin/python3
 
 # --- Configurações Chave ---
 readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.4.sh" # Atualizar versão
@@ -169,15 +170,12 @@ create_and_enable_python_monitor_service() {
     echo "INFO: Tentando limpar o serviço '$PYTHON_MONITOR_SERVICE_NAME' existente, se houver..."
     if sudo systemctl is-active "$PYTHON_MONITOR_SERVICE_NAME.service" &>/dev/null; then sudo systemctl stop "$PYTHON_MONITOR_SERVICE_NAME.service"; echo "INFO: Serviço '$PYTHON_MONITOR_SERVICE_NAME' parado."; fi
     if sudo systemctl is-enabled "$PYTHON_MONITOR_SERVICE_NAME.service" &>/dev/null; then sudo systemctl disable "$PYTHON_MONITOR_SERVICE_NAME.service"; echo "INFO: Serviço '$PYTHON_MONITOR_SERVICE_NAME' desabilitado."; fi
-    sudo rm -f "$service_file_path"; sudo rm -f "/etc/systemd/system/multi-user.target.wants/${PYTHON_MONITOR_SERVICE_NAME}.service"; sudo systemctl daemon-reload
+    sudo rm -f "$service_file_path"; sudo rm -f "/etc/systemd/system/multi-user.target.wants/${PYTHON_MONITOR_SERVICE_NAME}.service"; sudo systemctl daemon-reload; sudo systemctl reset-failed
     echo "INFO: Limpeza de serviço systemd anterior concluída."
 
     local mount_unit_name; mount_unit_name=$(systemd-escape -p --suffix=mount "$MOUNT_POINT")
     local aws_cli_full_path; aws_cli_full_path=$(command -v aws || echo "/usr/bin/aws") # Garante que temos um caminho para o AWS CLI
     local escaped_patterns_env_str; printf -v escaped_patterns_env_str "%s" "$patterns_env_str" # Para evitar problemas com caracteres especiais no systemd
-
-    # py_delete_from_efs_after_sync e py_perform_initial_sync foram REMOVIDAS
-    # pois serão hardcoded como True no script Python.
 
     sudo tee "$service_file_path" > /dev/null <<EOF_PY_SYSTEMD_SERVICE
 [Unit]
@@ -200,9 +198,8 @@ Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
 Environment="WP_SYNC_DEBOUNCE_SECONDS=5"
 Environment="WP_AWS_CLI_PATH=$aws_cli_full_path"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-# As Environments para WP_DELETE_FROM_EFS_AFTER_SYNC e WP_PERFORM_INITIAL_SYNC foram REMOVIDAS
-Environment="CF_INVALIDATION_BATCH_MAX_SIZE=${py_cf_invalidation_batch_max_size}" # Esta variável ainda pode ser útil
-Environment="CF_INVALIDATION_BATCH_TIMEOUT_SECONDS=${py_cf_invalidation_batch_timeout_seconds}" # Esta variável ainda pode ser útil
+Environment="CF_INVALIDATION_BATCH_MAX_SIZE=${py_cf_invalidation_batch_max_size:-15}"
+Environment="CF_INVALIDATION_BATCH_TIMEOUT_SECONDS=${py_cf_invalidation_batch_timeout_seconds:-20}"
 Environment="AWS_CLOUDFRONT_DISTRIBUTION_TARGET_ID_0=${AWS_CLOUDFRONT_DISTRIBUTION_ID_0:-}"
 
 [Install]
@@ -244,6 +241,8 @@ error_found=0; echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS E HARDCODED ---
 for var_name in "${essential_vars[@]}"; do
     current_var_value="${!var_name:-UNDEFINED}"; var_name_for_check="$var_name"; current_var_value_to_check="${!var_name:-}"
     if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then current_var_value_to_check="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"; var_name_for_check="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (de $var_name)"; fi
+    # Imprimir valor real para AWS_S3_BUCKET_TARGET_NAME_0 para depuração
+    if [ "$var_name" == "AWS_S3_BUCKET_TARGET_NAME_0" ]; then echo "INFO: Var (env check for Python): $var_name = '${current_var_value_to_check}'"; fi
     echo "INFO: Var (env): $var_name_for_check = '$current_var_value_to_check'"
     if [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && [ -z "$current_var_value_to_check" ]; then echo "ERRO: Var essencial '$var_name_for_check' vazia."; error_found=1; fi
 done
@@ -253,7 +252,7 @@ echo "INFO: --- FIM DOS VALORES DAS VARIÁVEIS ---"
 if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando ou mal configuradas. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
-echo "INFO: Instalando pacotes (Apache, PHP, Python3, pip, watchdog, etc.)..."
+echo "INFO: Instalando pacotes (Apache, PHP, Python3, pip, etc.)..."
 sudo yum update -y -q
 sudo amazon-linux-extras install -y epel -q # EPEL para pacotes adicionais se necessário
 sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils # Pacotes base
@@ -264,11 +263,34 @@ sudo yum install -y -q php php-common php-fpm php-mysqlnd php-json php-cli php-x
 if ! sudo rpm -q php-fpm; then echo "ERRO CRÍTICO: Pacote php-fpm não foi instalado corretamente."; exit 1; fi
 echo "INFO: PHP e PHP-FPM instalados."
 
-echo "INFO: Instalando Python3, pip e watchdog..."
-sudo yum install -y -q python3 python3-pip
-sudo pip3 install --upgrade pip # Garante que pip está atualizado
-sudo pip3 install watchdog boto3# Instala watchdog para Python3
-echo "INFO: Python3, pip e watchdog instalados."
+echo "INFO: Instalando Python3 e pip (via yum)..."
+sudo yum install -y -q python3 python3-pip # Isso geralmente instala /usr/bin/python3 e um pip associado
+
+echo "INFO: Atualizando pip para /usr/bin/python3 e instalando watchdog e boto3..."
+if ! sudo /usr/bin/python3 -m pip install --upgrade pip; then
+    echo "ERRO CRÍTICO: Falha ao atualizar pip para /usr/bin/python3."
+    # Tentar instalar com python3-pip do yum se o módulo pip falhar
+    if ! sudo yum install -y python3-pip; then # Tentar reinstalar/instalar python3-pip
+        echo "ERRO CRÍTICO: Falha ao instalar python3-pip via yum."
+        exit 1
+    fi
+    if ! sudo /usr/bin/python3 -m pip install --upgrade pip; then # Tentar novamente após reinstalação
+         echo "ERRO CRÍTICO: Falha ao atualizar pip para /usr/bin/python3 mesmo após reinstalar python3-pip."
+        exit 1
+    fi
+fi
+
+if ! sudo /usr/bin/python3 -m pip install watchdog boto3; then
+    echo "ERRO CRÍTICO: Falha ao instalar watchdog e boto3 para /usr/bin/python3."
+    # Adicionar depuração aqui:
+    echo "DEBUG: Verificando a versão do python3 e pip3 disponíveis..."
+    python3 --version
+    pip3 --version
+    echo "DEBUG: Tentando listar pacotes instalados com pip3..."
+    pip3 list
+    exit 1
+fi
+echo "INFO: watchdog e boto3 instalados para /usr/bin/python3."
 echo "INFO: Todos os pacotes de pré-requisitos foram processados."
 
 
