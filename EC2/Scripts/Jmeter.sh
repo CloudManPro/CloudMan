@@ -1,15 +1,15 @@
 #!/bin/bash
-# Script Jmeter.sh Version: 2.4.8
+# Script Jmeter.sh Version: 3.0.0 (Stable)
 # Changelog:
-# v2.4.8 - ## CORREÇÃO CRÍTICA FINAL ##: Adicionada lógica robusta para detectar e exportar a variável
-#          de ambiente JAVA_HOME antes de executar o JMeter. A falha em definir JAVA_HOME estava
-#          causando a interrupção do script ao tentar verificar a versão do JMeter.
-# v2.4.7 - Corrigida a linha 'ExecStart' no arquivo de serviço systemd.
+# v3.0.0 - Versão estável e consolidada.
+#          - Garante a instalação de TODAS as dependências (Java, pgrep, etc.).
+#          - Detecta e exporta JAVA_HOME de forma robusta.
+#          - Cria um serviço systemd que aponta corretamente para o script Python.
+#          - Estruturado com funções para clareza.
 
 set -e
 
-echo "INFO: Iniciando script Jmeter.sh (Version 2.4.8 - Correção Final JAVA_HOME)."
-echo "INFO: Timestamp de início: $(date '+%Y-%m-%d %H:%M:%S')"
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - [SETUP] - $1"; }
 
 # --- Definições de Variáveis ---
 APP_DIR="/opt/jmeter-remote-backend"
@@ -19,86 +19,81 @@ JMETER_TGZ_URL="https://dlcdn.apache.org//jmeter/binaries/apache-jmeter-${JMETER
 JMETER_INSTALL_DIR="/opt"
 JMETER_HOME_PATH="${JMETER_INSTALL_DIR}/apache-jmeter-${JMETER_VERSION}"
 USER_FOR_SERVICE="ec2-user"
-
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
-
-# --- 1. Instalação de Dependências e Configuração do JAVA_HOME ---
-log "INFO: Instalando dependências do sistema..."
-yum update -y -q
-# Usamos java-11-openjdk-devel para garantir que teremos o JDK completo
-PACKAGES_TO_INSTALL="python3 python3-pip aws-cli tar gzip wget procps-ng java-11-openjdk-devel"
-yum install -y -q $PACKAGES_TO_INSTALL || { log "ERRO CRÍTICO: Falha ao instalar dependências com yum."; exit 1; }
-log "INFO: Dependências do sistema instaladas."
-
-# ## CORREÇÃO ##: Detectar e exportar JAVA_HOME
-# Encontra o caminho do executável java
-JAVA_EXEC_PATH=$(readlink -f $(which java))
-# Deriva o diretório JAVA_HOME a partir do caminho do executável (ex: /usr/lib/jvm/java-11-openjdk-.../bin/java -> /usr/lib/jvm/java-11-openjdk-...)
-export JAVA_HOME=$(dirname $(dirname $JAVA_EXEC_PATH))
-
-if [ -z "$JAVA_HOME" ] || [ ! -d "$JAVA_HOME" ]; then
-    log "ERRO CRÍTICO: Falha ao detectar o diretório JAVA_HOME automaticamente."
-    exit 1
-fi
-
-log "INFO: JAVA_HOME detectado e exportado como: $JAVA_HOME"
-log "INFO: Verificando a versão do Java para confirmar..."
-java -version 2>&1 | while IFS= read -r line; do log "  $line"; done
-
-# Instalação do pip
-pip3 install --upgrade pip -q
-
-# --- 2. Instalação do JMeter ---
-log "INFO: Instalando JMeter ${JMETER_VERSION}..."
-if [ ! -d "${JMETER_HOME_PATH}" ]; then
-    cd /tmp
-    wget -T 30 -t 3 -q "${JMETER_TGZ_URL}" -O "apache-jmeter-${JMETER_VERSION}.tgz"
-    tar -xzf "apache-jmeter-${JMETER_VERSION}.tgz" -C "${JMETER_INSTALL_DIR}"
-    rm -f "apache-jmeter-${JMETER_VERSION}.tgz"
-    log "INFO: JMeter instalado em ${JMETER_HOME_PATH}."
-else
-    log "INFO: JMeter já está instalado."
-fi
-
-# Agora, com JAVA_HOME exportado, este comando deve funcionar
-log "INFO: Verificando a versão do JMeter..."
-"$JMETER_HOME_PATH/bin/jmeter" --version 2>&1 | while IFS= read -r line; do log "  $line"; done
-
-# --- 3. Preparar Diretório da Aplicação ---
-log "INFO: Criando diretório da aplicação em ${APP_DIR}."
-mkdir -p "${APP_DIR}"
-
-# --- 4. Baixar o script da Aplicação Python ---
-log "INFO: Baixando script da aplicação Python do S3..."
-if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] || [ -z "${AWS_S3_SCRIPT_KEY:-}" ]; then
-    log "ERRO CRÍTICO: Variáveis S3 para o script da aplicação não encontradas no ambiente."
-    exit 1
-fi
-
-PYTHON_SCRIPT_NAME=$(basename "${AWS_S3_SCRIPT_KEY}")
-LOCAL_PYTHON_SCRIPT_PATH="${APP_DIR}/${PYTHON_SCRIPT_NAME}"
-S3_URI_PYTHON_SCRIPT="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_SCRIPT_KEY}"
-
-log "INFO: Baixando de '${S3_URI_PYTHON_SCRIPT}' para '${LOCAL_PYTHON_SCRIPT_PATH}'"
-aws s3 cp "${S3_URI_PYTHON_SCRIPT}" "${LOCAL_PYTHON_SCRIPT_PATH}" --region "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-us-east-1}"
-log "INFO: Script da aplicação ${PYTHON_SCRIPT_NAME} baixado."
-
-# --- 5. Instalar Dependências Python ---
-log "INFO: Instalando pacotes Python..."
-pip3 install -q Flask Flask-CORS boto3 werkzeug || { log "ERRO: Falha ao instalar pacotes Python."; exit 1; }
-log "INFO: Pacotes Python instalados."
-
-# --- 6. Definir Permissões ---
-log "INFO: Definindo permissões para ${APP_DIR}."
-chown -R "${USER_FOR_SERVICE}:${USER_FOR_SERVICE}" "${APP_DIR}"
-chmod -R u+rwX,go+rX,go-w "${APP_DIR}"
-
-# --- 7. Configurar e Iniciar o Serviço Systemd ---
-log "INFO: Configurando o serviço systemd '${SERVICE_NAME}'..."
-SERVICE_FILE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_FILE_FOR_SERVICE="/home/ec2-user/.env"
 
-cat >"${SERVICE_FILE_PATH}" <<EOF
+# --- Funções de Setup ---
+
+install_dependencies() {
+    log "Iniciando a instalação de dependências do sistema..."
+    yum update -y -q
+    PACKAGES_TO_INSTALL="python3 python3-pip aws-cli tar gzip wget procps-ng java-11-openjdk-devel"
+    yum install -y -q $PACKAGES_TO_INSTALL
+    pip3 install --upgrade pip -q
+    log "Dependências do sistema instaladas com sucesso."
+}
+
+configure_java_home() {
+    log "Configurando o ambiente Java..."
+    if ! command -v java &>/dev/null; then
+        log "ERRO CRÍTICO: O comando 'java' não foi encontrado após a instalação."
+        return 1
+    fi
+    # Detecta e exporta JAVA_HOME para a sessão atual
+    export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))
+    if [ -z "$JAVA_HOME" ] || [ ! -d "$JAVA_HOME" ]; then
+        log "ERRO CRÍTICO: Falha ao detectar o diretório JAVA_HOME."
+        return 1
+    fi
+    log "JAVA_HOME detectado e exportado como: $JAVA_HOME"
+    java -version 2>&1 | sed 's/^/  /'
+}
+
+install_jmeter() {
+    log "Instalando JMeter ${JMETER_VERSION}..."
+    if [ ! -d "${JMETER_HOME_PATH}" ]; then
+        cd /tmp
+        wget -T 30 -t 3 -q "${JMETER_TGZ_URL}" -O "apache-jmeter.tgz"
+        tar -xzf "apache-jmeter.tgz" -C "${JMETER_INSTALL_DIR}"
+        rm -f "apache-jmeter.tgz"
+        log "JMeter instalado em ${JMETER_HOME_PATH}."
+    else
+        log "JMeter já está instalado."
+    fi
+    # Verifica se a instalação funciona (requer JAVA_HOME)
+    "$JMETER_HOME_PATH/bin/jmeter" --version 2>&1 | sed 's/^/  /'
+}
+
+setup_application() {
+    log "Configurando a aplicação backend..."
+    mkdir -p "${APP_DIR}"
+
+    if [ -z "${AWS_S3_BUCKET_TARGET_NAME_SCRIPT:-}" ] || [ -z "${AWS_S3_SCRIPT_KEY:-}" ]; then
+        log "ERRO CRÍTICO: Variáveis S3 (AWS_S3_BUCKET_TARGET_NAME_SCRIPT, AWS_S3_SCRIPT_KEY) não estão no ambiente."
+        return 1
+    fi
+
+    PYTHON_SCRIPT_NAME=$(basename "${AWS_S3_SCRIPT_KEY}")
+    LOCAL_PYTHON_SCRIPT_PATH="${APP_DIR}/${PYTHON_SCRIPT_NAME}"
+    S3_URI_PYTHON_SCRIPT="s3://${AWS_S3_BUCKET_TARGET_NAME_SCRIPT}/${AWS_S3_SCRIPT_KEY}"
+
+    log "Baixando script da aplicação de '${S3_URI_PYTHON_SCRIPT}'..."
+    aws s3 cp "${S3_URI_PYTHON_SCRIPT}" "${LOCAL_PYTHON_SCRIPT_PATH}" --region "${AWS_S3_BUCKET_TARGET_REGION_SCRIPT:-us-east-1}"
+    
+    log "Instalando pacotes Python para a aplicação..."
+    pip3 install -q Flask Flask-CORS boto3 werkzeug
+    
+    log "Definindo permissões da aplicação..."
+    chown -R "${USER_FOR_SERVICE}:${USER_FOR_SERVICE}" "${APP_DIR}"
+    chmod -R u+rwX,go+rX,go-w "${APP_DIR}"
+}
+
+create_and_start_service() {
+    log "Configurando o serviço systemd '${SERVICE_NAME}'..."
+    PYTHON_SCRIPT_NAME=$(basename "${AWS_S3_SCRIPT_KEY}")
+    LOCAL_PYTHON_SCRIPT_PATH="${APP_DIR}/${PYTHON_SCRIPT_NAME}"
+    SERVICE_FILE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+
+    cat >"${SERVICE_FILE_PATH}" <<EOF
 [Unit]
 Description=JMeter Remote Backend Flask Server
 After=network.target
@@ -108,7 +103,6 @@ User=${USER_FOR_SERVICE}
 Group=${USER_FOR_SERVICE}
 WorkingDirectory=${APP_DIR}
 Environment="PYTHONUNBUFFERED=1"
-# Exporta o JAVA_HOME detectado para o ambiente do serviço também
 Environment="JAVA_HOME=${JAVA_HOME}"
 Environment="JMETER_HOME=${JMETER_HOME_PATH}"
 EnvironmentFile=${ENV_FILE_FOR_SERVICE}
@@ -123,26 +117,33 @@ SyslogIdentifier=${SERVICE_NAME}
 WantedBy=multi-user.target
 EOF
 
-log "INFO: Serviço systemd criado em ${SERVICE_FILE_PATH}."
-log "INFO: Conteúdo do arquivo de serviço:"
-cat "${SERVICE_FILE_PATH}" | sed 's/^/  /'
+    log "Serviço systemd criado. Recarregando e reiniciando..."
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}.service"
+    systemctl restart "${SERVICE_NAME}.service"
+}
 
-log "INFO: Recarregando, habilitando e reiniciando o serviço ${SERVICE_NAME}..."
-systemctl daemon-reload
-systemctl enable "${SERVICE_NAME}.service"
-systemctl restart "${SERVICE_NAME}.service"
-sleep 5
+# --- Execução Principal ---
 
-log "INFO: Verificando status final do serviço ${SERVICE_NAME}..."
-if systemctl is-active --quiet "${SERVICE_NAME}"; then
-    log "INFO: SUCESSO! O serviço ${SERVICE_NAME} foi iniciado corretamente."
-    systemctl status "${SERVICE_NAME}" --no-pager -n 20
-else
-    log "ERRO CRÍTICO: O serviço ${SERVICE_NAME} falhou ao iniciar."
-    log "ERRO: Verificando logs do journal para depuração final:"
-    journalctl -u "${SERVICE_NAME}" --no-pager -n 50
-    exit 1
-fi
+main() {
+    log "Iniciando setup completo do JMeter Remote Backend."
+    install_dependencies
+    configure_java_home
+    install_jmeter
+    setup_application
+    create_and_start_service
 
-log "INFO: Script Jmeter.sh (Version 2.4.8) concluído com sucesso!"
-exit 0
+    sleep 5 # Aguarda um momento para o serviço estabilizar
+    log "Verificação final do status do serviço:"
+    if systemctl is-active --quiet "${SERVICE_NAME}"; then
+        log "SUCESSO! O serviço '${SERVICE_NAME}' está ativo e rodando."
+        systemctl status "${SERVICE_NAME}" --no-pager -n 10
+    else
+        log "ERRO FINAL: O serviço '${SERVICE_NAME}' falhou ao iniciar. Verifique os logs detalhados."
+        journalctl -u "${SERVICE_NAME}" --no-pager -n 50
+        return 1
+    fi
+    log "Script Jmeter.sh (v3.0.0) concluído com sucesso!"
+}
+
+main "$@"
