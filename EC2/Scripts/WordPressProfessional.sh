@@ -192,6 +192,7 @@ Restart=on-failure
 RestartSec=15s
 Environment="WP_MONITOR_DIR_BASE=$MOUNT_POINT"
 Environment="WP_S3_BUCKET=$AWS_S3_BUCKET_TARGET_NAME_0"
+Environment="NAME=$NAME"
 Environment="WP_RELEVANT_PATTERNS=$escaped_patterns_env_str"
 Environment="WP_PY_MONITOR_LOG_FILE=$PY_MONITOR_LOG_FILE"
 Environment="WP_PY_S3_TRANSFER_LOG=$PY_S3_TRANSFER_LOG_FILE"
