@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import time
 import logging
 import subprocess
@@ -358,13 +359,12 @@ class Watcher(FileSystemEventHandler):
     def process_event_for_sync(self, event_type, path, dest_path=None):
         global efs_deleted_by_script
         if event_type == 'moved_from':
-            # ... (lógica de moved_from como antes, usando efs_deletion_lock RLock) ...
             if self._is_excluded(path) or (os.path.exists(path) and os.path.isdir(path)): return
             relevant_src, relative_src_path = is_path_relevant(path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
             if not relevant_src or not relative_src_path: return
             monitor_logger.info(f"Event: MOVED_FROM for relevant file '{relative_src_path}' (full: {path})")
             ignore_s3_deletion_for_moved_src = False
-            with efs_deletion_lock: # Usa RLock
+            with efs_deletion_lock:
                 if path in efs_deleted_by_script:
                     monitor_logger.info(f"EFS MOVED_FROM for '{path}' was script-initiated. Not deleting from S3 for source.")
                     efs_deleted_by_script.remove(path); ignore_s3_deletion_for_moved_src = True
@@ -378,19 +378,33 @@ class Watcher(FileSystemEventHandler):
         relevant, relative_path = is_path_relevant(current_path_to_check, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
         if not relevant or not relative_path: return
 
+        # ===================================================================
+        # == INÍCIO DA CORREÇÃO: VERIFICAR SE O ARQUIVO É UM PLACEHOLDER   ==
+        # ===================================================================
+        # Esta verificação é crucial para eventos de modificação, que são disparados
+        # quando o próprio script substitui o arquivo original pelo placeholder de 1 byte.
         if event_type == 'modified' and os.path.exists(current_path_to_check):
             try:
+                # Otimização: checa o tamanho primeiro. Se não for 1 byte, não pode ser o placeholder.
                 if os.path.getsize(current_path_to_check) == len(PLACEHOLDER_CONTENT.encode('utf-8')):
-                    with open(current_path_to_check, 'r') as f_check: content = f_check.read()
+                    # Se o tamanho bate, verifica o conteúdo para ter 100% de certeza.
+                    with open(current_path_to_check, 'r') as f_check:
+                        content = f_check.read()
                     if content == PLACEHOLDER_CONTENT:
-                        monitor_logger.info(f"Event: MODIFIED for placeholder '{relative_path}'. Skipping S3 upload.")
-                        return
-            except OSError: pass
+                        monitor_logger.info(f"Event: MODIFIED for placeholder file '{relative_path}'. Skipping S3 upload.")
+                        return # PONTO CRÍTICO: Sai da função para não copiar o placeholder para o S3.
+            except OSError:
+                # O arquivo pode ter sido deletado entre as chamadas `exists` e `getsize`. Isso é normal.
+                pass
+        # ===================================================================
+        # == FIM DA CORREÇÃO                                               ==
+        # ===================================================================
+
         monitor_logger.info(f"Event: {event_type.upper()} for relevant file '{relative_path}' (full: {current_path_to_check})")
         if event_type in ['created', 'modified', 'moved_to']:
             self._handle_s3_upload(current_path_to_check, relative_path)
         elif event_type == 'deleted':
-            self._handle_s3_delete(relative_path) # A invalidação ocorrerá aqui se a deleção for bem-sucedida
+            self._handle_s3_delete(relative_path)
 
     def on_created(self, event):
         if not event.is_directory: self.process_event_for_sync('created', event.src_path)
@@ -480,8 +494,7 @@ def perform_initial_sync(watcher_instance):
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    script_version_tag = "v2.4.5-SelectiveInvalidation" # Atualizar a tag da versão
-    # ... (Logs de inicialização como antes, incluindo os novos timeouts BOTO3_S3_...)
+    script_version_tag = "v2.5.0-PlaceholderFix" # Atualizar a tag da versão
     monitor_logger.info(f"Python Watchdog Monitor ({script_version_tag}) starting for '{MONITOR_DIR_BASE}'.")
     monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
     monitor_logger.info(f"Relevant Patterns (raw): {RELEVANT_PATTERNS_STR}")
@@ -493,7 +506,7 @@ if __name__ == "__main__":
     monitor_logger.info(f"CF Invalidation Batch: MaxSize={CF_INVALIDATION_BATCH_MAX_SIZE}, Timeout={CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s")
     monitor_logger.info(f"AWS CLI Timeouts: S3 CP={AWS_CLI_TIMEOUT_S3_CP}s, S3 RM={AWS_CLI_TIMEOUT_S3_RM}s")
     monitor_logger.info(f"Boto3 CF Timeouts: Connect={BOTO3_CLOUDFRONT_CONNECT_TIMEOUT}s, Read={BOTO3_CLOUDFRONT_READ_TIMEOUT}s")
-    monitor_logger.info(f"Boto3 S3 (head_object) Timeouts: Connect={BOTO3_S3_CONNECT_TIMEOUT}s, Read={BOTO3_S3_READ_TIMEOUT}s") # Log do novo timeout
+    monitor_logger.info(f"Boto3 S3 (head_object) Timeouts: Connect={BOTO3_S3_CONNECT_TIMEOUT}s, Read={BOTO3_S3_READ_TIMEOUT}s")
     monitor_logger.info(f"Max Invalidation Workers: {MAX_INVALIDATION_WORKERS}")
 
 
@@ -549,7 +562,7 @@ if __name__ == "__main__":
                 time.sleep(0.5)
             else: all_processed = True
             if all_processed: monitor_logger.info("Invalidation queue processed (empty).")
-        with cf_invalidation_lock: # RLock
+        with cf_invalidation_lock:
             if cf_invalidation_timer and cf_invalidation_timer.is_alive():
                 monitor_logger.info("Cancelling main CF invalidation timer."); cf_invalidation_timer.cancel()
         monitor_logger.info("Script shutdown complete.")
