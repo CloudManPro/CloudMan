@@ -4,12 +4,13 @@ import logging
 import subprocess
 import os
 import fnmatch
+import sys
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import shutil  # Para shutil.which
+import shutil
 import boto3
-from botocore.config import Config # Para timeouts do Boto3
-from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutError # Para capturar erros do Boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutError
 import threading
 import queue
 
@@ -39,8 +40,8 @@ AWS_CLI_TIMEOUT_S3_CP = 300
 AWS_CLI_TIMEOUT_S3_RM = 60
 BOTO3_CLOUDFRONT_CONNECT_TIMEOUT = 10
 BOTO3_CLOUDFRONT_READ_TIMEOUT = 60
-BOTO3_S3_CONNECT_TIMEOUT = 5 # Timeout para head_object
-BOTO3_S3_READ_TIMEOUT = 10    # Timeout para head_object
+BOTO3_S3_CONNECT_TIMEOUT = 5
+BOTO3_S3_READ_TIMEOUT = 10
 
 PLACEHOLDER_TARGET_EXTENSIONS_EFS = [
     '.jpg', '.jpeg', '.png', '.gif', '.webp', '.ico', '.svg',
@@ -99,7 +100,7 @@ def setup_logger(name, log_file, level=logging.INFO, formatter_str='%(asctime)s 
 monitor_logger = setup_logger('PY_MONITOR', LOG_FILE_MONITOR)
 transfer_logger = setup_logger('PY_S3_TRANSFER', S3_TRANSFER_LOG, formatter_str='%(asctime)s - %(message)s')
 
-# --- Helper Functions ---
+# --- Helper Functions (unchanged, not shown for brevity) ---
 def is_path_relevant(path_to_check, base_dir, patterns):
     if not path_to_check.startswith(base_dir + os.path.sep): return False, None
     relative_file_path = os.path.relpath(path_to_check, base_dir)
@@ -115,7 +116,6 @@ def _replace_efs_file_with_placeholder(local_path, relative_file_path):
     except OSError as e: monitor_logger.error(f"Failed to replace EFS file '{local_path}' with placeholder: {e}"); return False
     except Exception as e: monitor_logger.error(f"Unexpected error replacing EFS file '{local_path}' with placeholder: {e}", exc_info=True); return False
 
-# --- Worker Thread para Invalidação do CloudFront ---
 def cloudfront_invalidation_worker(q, dist_id, cf_connect_timeout, cf_read_timeout):
     worker_boto_config = Config(connect_timeout=cf_connect_timeout, read_timeout=cf_read_timeout, retries={'max_attempts': 2})
     cloudfront_client = boto3.client('cloudfront', config=worker_boto_config)
@@ -151,7 +151,7 @@ def cloudfront_invalidation_worker(q, dist_id, cf_connect_timeout, cf_read_timeo
         except queue.Empty: monitor_logger.debug(f"CF Invalidation Worker (Thread: {threading.get_ident()}) queue empty, waiting."); continue
         except Exception as e_worker_loop: monitor_logger.critical(f"CF Invalidation Worker (Thread: {threading.get_ident()}) CRITICAL error: {e_worker_loop}", exc_info=True); time.sleep(5)
 
-# --- FileSystem Event Handler Class ---
+# --- FileSystem Event Handler Class (unchanged, not shown for brevity) ---
 class Watcher(FileSystemEventHandler):
     def __init__(self):
         super().__init__()
@@ -160,7 +160,7 @@ class Watcher(FileSystemEventHandler):
             read_timeout=BOTO3_S3_READ_TIMEOUT,
             retries={'max_attempts': 2}
         )
-        self.s3_client_boto = boto3.client('s3', config=s3_client_config)
+        self.s3_client_boto = boto3.client('s3', config=s3_client_config) # Cliente S3 para head_object
 
     def _is_excluded(self, filepath):
         filename = os.path.basename(filepath)
@@ -187,6 +187,7 @@ class Watcher(FileSystemEventHandler):
         except Exception as e_unexp:
             monitor_logger.error(f"Unexpected error during S3 object check for '{key}': {e_unexp}", exc_info=True)
             return False
+
 
     def _trigger_batched_cloudfront_invalidation(self, paths_override=None, reference_suffix_override=None):
         global cf_invalidation_paths_batch, cf_invalidation_timer, invalidation_queue
@@ -275,7 +276,7 @@ class Watcher(FileSystemEventHandler):
         if not is_initial_sync and local_path in last_sync_file_map and \
            (current_time - last_sync_file_map[local_path] < SYNC_DEBOUNCE_SECONDS):
             monitor_logger.info(f"Debounce for '{local_path}'. Skipped upload.")
-            return False
+            return
 
         s3_full_uri = self._get_s3_path(relative_file_path)
         object_existed_before_upload = False
@@ -298,28 +299,25 @@ class Watcher(FileSystemEventHandler):
                         self._add_to_cf_invalidation_batch(relative_file_path)
                     else:
                         monitor_logger.info(f"S3 object '{relative_file_path}' is NEW. Skipping CF invalidation for this upload.")
-                # Logic to replace with placeholder is now handled by the calling function (initial sync or event handler)
-                return True # Indicate success
+                if effective_replace_with_placeholder:
+                    _, ext = os.path.splitext(local_path)
+                    if ext.lower() in PLACEHOLDER_TARGET_EXTENSIONS_EFS: _replace_efs_file_with_placeholder(local_path, relative_file_path)
+                    else: monitor_logger.info(f"File '{local_path}' not targeted for placeholder.")
             else:
                 monitor_logger.error(f"S3 copy FAILED for '{relative_file_path}'. RC: {process.returncode}. Stderr: {process.stderr.strip()}")
                 transfer_logger.info(f"S3_CP_FAILED: {relative_file_path} RC={process.returncode} ERR={process.stderr.strip()}")
-                return False
         except subprocess.TimeoutExpired:
             monitor_logger.error(f"S3 copy TIMEOUT for '{relative_file_path}' after {AWS_CLI_TIMEOUT_S3_CP}s.")
             transfer_logger.info(f"S3_CP_TIMEOUT: {relative_file_path}")
-            return False
-        except FileNotFoundError:
-            monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 copy failed for '{relative_file_path}'.")
-            return False
-        except Exception as e:
-            monitor_logger.error(f"Exception during S3 copy for {relative_file_path}: {e}", exc_info=True)
-            return False
+        except FileNotFoundError: monitor_logger.error(f"AWS CLI not found at '{AWS_CLI_PATH}'. S3 copy failed for '{relative_file_path}'.")
+        except Exception as e: monitor_logger.error(f"Exception during S3 copy for {relative_file_path}: {e}", exc_info=True)
 
     def _handle_s3_delete(self, relative_file_path):
         s3_client_for_verify = boto3.client('s3')
         s3_target_path_key = relative_file_path
         s3_full_uri = self._get_s3_path(relative_file_path)
         monitor_logger.info(f"Attempting to delete '{s3_full_uri}' from S3 via AWS CLI (Timeout: {AWS_CLI_TIMEOUT_S3_RM}s)...")
+        cli_delete_reported_success = False; cli_rc = -1; cli_stderr = ""
         try:
             process = subprocess.run(
                 [AWS_CLI_PATH, 's3', 'rm', s3_full_uri, '--only-show-errors'],
@@ -328,31 +326,30 @@ class Watcher(FileSystemEventHandler):
             cli_rc = process.returncode; cli_stderr = process.stderr.strip()
             if cli_rc == 0:
                 monitor_logger.info(f"AWS CLI 's3 rm' for '{relative_file_path}' OK (RC: 0).")
-                transfer_logger.info(f"DELETED_S3_CLI_OK: {relative_file_path}")
+                transfer_logger.info(f"DELETED_S3_CLI_OK: {relative_file_path}"); cli_delete_reported_success = True
             else:
                 monitor_logger.error(f"AWS CLI 's3 rm' FAILED for '{relative_file_path}'. RC: {cli_rc}. Stderr: {cli_stderr}")
                 transfer_logger.info(f"DELETED_S3_CLI_FAILED: {relative_file_path} - RC={cli_rc} ERR={cli_stderr}")
         except subprocess.TimeoutExpired:
             monitor_logger.error(f"S3 rm TIMEOUT for '{relative_file_path}' after {AWS_CLI_TIMEOUT_S3_RM}s.")
             transfer_logger.info(f"S3_RM_TIMEOUT: {relative_file_path}"); return
-        except FileNotFoundError:
-            monitor_logger.error(f"AWS CLI not found. S3 delete for '{relative_file_path}' failed."); return
-        except Exception as e:
-            monitor_logger.error(f"Exception during AWS CLI 's3 rm' for {relative_file_path}: {e}", exc_info=True)
+        except FileNotFoundError: monitor_logger.error(f"AWS CLI not found. S3 delete for '{relative_file_path}' failed."); return
+        except Exception as e: monitor_logger.error(f"Exception during AWS CLI 's3 rm' for {relative_file_path}: {e}", exc_info=True)
 
         monitor_logger.info(f"Verifying deletion of '{s3_target_path_key}' in S3 (Boto3 head_object)...")
         try:
-            time.sleep(1) # Eventual consistency
+            time.sleep(1)
             s3_client_for_verify.head_object(Bucket=S3_BUCKET, Key=s3_target_path_key)
-            monitor_logger.error(f"S3 delete VERIFICATION FAILED for '{relative_file_path}'. Object still found.")
+            monitor_logger.error(f"S3 delete VERIFICATION FAILED for '{relative_file_path}'. Object still found. CLI RC: {cli_rc}.")
+            if cli_stderr: monitor_logger.error(f"CLI Stderr: {cli_stderr}")
             transfer_logger.info(f"DELETED_S3_VERIFICATION_FAILED_STILL_EXISTS: {relative_file_path}")
         except s3_client_for_verify.exceptions.ClientError as e:
             if e.response['Error']['Code'] in ('404', 'NoSuchKey'):
-                monitor_logger.info(f"S3 delete VERIFIED for '{relative_file_path}'. Not found.")
+                monitor_logger.info(f"S3 delete VERIFIED for '{relative_file_path}'. Not found. CLI RC: {cli_rc}.")
                 transfer_logger.info(f"DELETED_S3_VERIFIED_NOT_FOUND: {relative_file_path}")
-                self._add_to_cf_invalidation_batch(relative_file_path) # Invalidate ONLY after verified deletion
+                self._add_to_cf_invalidation_batch(relative_file_path)
             else:
-                monitor_logger.error(f"Boto3 ClientError during S3 delete VERIFICATION for '{relative_file_path}': {e.response['Error']['Code']}.")
+                monitor_logger.error(f"Boto3 ClientError during S3 delete VERIFICATION for '{relative_file_path}': {e.response['Error']['Code']}. CLI RC: {cli_rc}.")
                 transfer_logger.info(f"DELETED_S3_VERIFICATION_ERROR_HEAD_OBJECT: {relative_file_path} - {e.response['Error']['Code']}")
         except Exception as ve:
             monitor_logger.error(f"Unexpected error during S3 delete VERIFICATION for '{s3_target_path_key}': {ve}", exc_info=True)
@@ -365,12 +362,13 @@ class Watcher(FileSystemEventHandler):
             relevant_src, relative_src_path = is_path_relevant(path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
             if not relevant_src or not relative_src_path: return
             monitor_logger.info(f"Event: MOVED_FROM for relevant file '{relative_src_path}' (full: {path})")
+            ignore_s3_deletion_for_moved_src = False
             with efs_deletion_lock:
                 if path in efs_deleted_by_script:
                     monitor_logger.info(f"EFS MOVED_FROM for '{path}' was script-initiated. Not deleting from S3 for source.")
-                    efs_deleted_by_script.remove(path)
-                    return # Do not process deletion
-            self._handle_s3_delete(relative_src_path)
+                    efs_deleted_by_script.remove(path); ignore_s3_deletion_for_moved_src = True
+            if not ignore_s3_deletion_for_moved_src: self._handle_s3_delete(relative_src_path)
+            else: transfer_logger.info(f"SKIPPED_S3_DELETE_MOVED_FROM_BY_SCRIPT_FLAG: {relative_src_path}")
             return
 
         current_path_to_check = dest_path if event_type == 'moved_to' else path
@@ -379,27 +377,20 @@ class Watcher(FileSystemEventHandler):
         relevant, relative_path = is_path_relevant(current_path_to_check, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
         if not relevant or not relative_path: return
 
-        if event_type in ['modified', 'moved_to'] and os.path.exists(current_path_to_check):
+        if event_type == 'modified' and os.path.exists(current_path_to_check):
             try:
                 if os.path.getsize(current_path_to_check) == len(PLACEHOLDER_CONTENT.encode('utf-8')):
                     with open(current_path_to_check, 'r') as f_check:
-                        if f_check.read() == PLACEHOLDER_CONTENT:
-                            monitor_logger.info(f"Event: {event_type.upper()} for placeholder file '{relative_path}'. Skipping S3 upload.")
-                            return
-            except (OSError, UnicodeDecodeError): pass
+                        content = f_check.read()
+                    if content == PLACEHOLDER_CONTENT:
+                        monitor_logger.info(f"Event: MODIFIED for placeholder file '{relative_path}'. Skipping S3 upload.")
+                        return 
+            except OSError:
+                pass
 
         monitor_logger.info(f"Event: {event_type.upper()} for relevant file '{relative_path}' (full: {current_path_to_check})")
         if event_type in ['created', 'modified', 'moved_to']:
-            # The upload function now returns success status
-            upload_ok = self._handle_s3_upload(current_path_to_check, relative_path)
-            # If upload was successful and config says to delete, replace with placeholder
-            if upload_ok and DELETE_FROM_EFS_AFTER_SYNC:
-                _, ext = os.path.splitext(current_path_to_check)
-                if ext.lower() in PLACEHOLDER_TARGET_EXTENSIONS_EFS:
-                     _replace_efs_file_with_placeholder(current_path_to_check, relative_path)
-                else:
-                    monitor_logger.info(f"File '{current_path_to_check}' not targeted for placeholder (real-time event).")
-
+            self._handle_s3_upload(current_path_to_check, relative_path)
         elif event_type == 'deleted':
             self._handle_s3_delete(relative_path)
 
@@ -413,96 +404,130 @@ class Watcher(FileSystemEventHandler):
         if not os.path.isdir(event.src_path): self.process_event_for_sync('moved_from', event.src_path)
         if not event.is_directory: self.process_event_for_sync('moved_to', event.src_path, dest_path=event.dest_path)
 
-# --- Initial Sync Function (SAFE VERSION) ---
+
+# --- Initial Sync Function ---
+def run_s3_sync_command(command_parts, description):
+    monitor_logger.info(f"Attempting Initial Sync for {description} (timeout: {AWS_CLI_TIMEOUT_S3_CP}s)")
+    try:
+        process = subprocess.run(command_parts, capture_output=True, text=True, check=False, timeout=AWS_CLI_TIMEOUT_S3_CP)
+        if process.returncode == 0:
+            monitor_logger.info(f"Initial Sync for {description} OK.")
+            transfer_logger.info(f"INITIAL_SYNC_SUCCESS: {description}"); return True
+        elif process.returncode == 2:
+            monitor_logger.warning(f"Initial Sync for {description} RC 2. Stderr: {process.stderr.strip()}")
+            transfer_logger.info(f"INITIAL_SYNC_WARNING_RC2: {description} - ERR: {process.stderr.strip()}"); return True
+        else:
+            monitor_logger.error(f"Initial Sync for {description} FAILED. RC: {process.returncode}. Stderr: {process.stderr.strip()}")
+            transfer_logger.info(f"INITIAL_SYNC_FAILED: {description} - RC={process.returncode} ERR={process.stderr.strip()}"); return False
+    except subprocess.TimeoutExpired:
+        monitor_logger.error(f"Initial Sync TIMEOUT for '{description}' after {AWS_CLI_TIMEOUT_S3_CP}s.")
+        transfer_logger.info(f"INITIAL_SYNC_TIMEOUT: {description}"); return False
+    except FileNotFoundError: monitor_logger.error(f"AWS CLI not found. Initial Sync for {description} failed."); return False
+    except Exception as e: monitor_logger.error(f"Exception during Initial Sync for {description}: {e}", exc_info=True); return False
+
 def perform_initial_sync(watcher_instance):
-    """
-    Performs a safe initial sync by walking the filesystem, checking each file,
-    and only uploading non-placeholder files. This avoids the catastrophic bug
-    of overwriting S3 objects with placeholders on script restart.
-    """
-    monitor_logger.info("--- Starting SAFE Initial S3 Sync ---")
+    monitor_logger.info("--- Starting Initial S3 Sync ---")
     if not S3_BUCKET or not os.path.isdir(MONITOR_DIR_BASE):
-        monitor_logger.error("S3_BUCKET or MONITOR_DIR_BASE not configured/valid. Skipping initial sync.")
-        return
+        monitor_logger.error("S3_BUCKET or MONITOR_DIR_BASE not configured/valid. Skipping initial sync."); return
 
-    files_uploaded_in_sync = []
+    # === MODIFICATION START: Check if S3 bucket is empty before syncing ===
+    s3_client = boto3.client('s3')
+    is_empty = False
+    try:
+        monitor_logger.info(f"Checking if S3 bucket '{S3_BUCKET}' is empty before initial sync...")
+        # We only need to check for one key to determine if the bucket is non-empty.
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET, MaxKeys=1)
+        if 'Contents' not in response:
+            is_empty = True
+            monitor_logger.info(f"S3 bucket '{S3_BUCKET}' is empty. Proceeding with initial EFS to S3 sync.")
+        else:
+            monitor_logger.info(f"S3 bucket '{S3_BUCKET}' is not empty. Skipping initial EFS to S3 sync.")
+            transfer_logger.info("SKIPPED_INITIAL_SYNC: Bucket was not empty.")
+            return # Exit the function, skipping the sync.
+    except ClientError as e:
+        monitor_logger.error(f"Failed to check S3 bucket status due to a client error: {e}. Assuming it's not empty and skipping sync.", exc_info=True)
+        transfer_logger.info(f"SKIPPED_INITIAL_SYNC: Could not verify bucket status due to error: {e.response['Error']['Code']}")
+        return # Safer to skip if we can't check.
+    # === MODIFICATION END ===
+
+    general_sync_includes = [
+        '*.css', '*.js', '*.jpg', '*.jpeg', '*.png', '*.gif', '*.svg', '*.webp', '*.ico',
+        '*.woff', '*.woff2', '*.ttf', '*.eot', '*.otf', '*.mp4', '*.mov', '*.webm',
+        '*.avi', '*.wmv', '*.mkv', '*.flv', '*.mp3', '*.wav', '*.ogg', '*.aac',
+        '*.wma', '*.flac', '*.pdf', '*.doc', '*.docx', '*.xls', '*.xlsx', '*.ppt',
+        '*.pptx', '*.zip', '*.txt',
+    ]
+    includes_for_sync_cmd = [arg for item in general_sync_includes for arg in ('--include', item)]
     wp_content_path = os.path.join(MONITOR_DIR_BASE, "wp-content")
+    if os.path.isdir(wp_content_path):
+        cmd = [AWS_CLI_PATH, 's3', 'sync', wp_content_path, f"s3://{S3_BUCKET}/wp-content/",
+               '--exclude', '*.php', '--exclude', '*/index.php', '--exclude', 'wp-content/cache/*',
+               '--exclude', 'wp-content/backups/*', '--exclude', '*/.DS_Store', '--exclude', '*/Thumbs.db',
+               '--exclude', '*/node_modules/*', '--exclude', '*/.git/*'] + \
+              includes_for_sync_cmd + ['--exact-timestamps', '--acl', 'private', '--only-show-errors']
+        run_s3_sync_command(cmd, "wp-content")
+
     wp_includes_path = os.path.join(MONITOR_DIR_BASE, "wp-includes")
+    if os.path.isdir(wp_includes_path):
+        assets_includes = ['*.css', '*.js', '*.jpg', '*.jpeg', '*.png', '*.gif', '*.svg', '*.webp', '*.ico',
+                           '*.woff', '*.woff2', '*.ttf', '*.eot', '*.otf']
+        cmd_includes = [arg for item in assets_includes for arg in ('--include', item)]
+        cmd = [AWS_CLI_PATH, 's3', 'sync', wp_includes_path, f"s3://{S3_BUCKET}/wp-includes/",
+               '--exclude', '*'] + cmd_includes + \
+              ['--exact-timestamps', '--acl', 'private', '--only-show-errors']
+        run_s3_sync_command(cmd, "wp-includes (assets only)")
+    
+    monitor_logger.info("--- Initial S3 Sync Attempted ---")
 
-    # Phase 1: Scan EFS and upload only non-placeholder files
-    for scan_root in (p for p in (wp_content_path, wp_includes_path) if os.path.isdir(p)):
-        monitor_logger.info(f"Scanning '{scan_root}' for non-placeholder files to sync...")
-        for root, _, files in os.walk(scan_root):
-            for filename in files:
-                local_path = os.path.join(root, filename)
-
-                if watcher_instance._is_excluded(local_path):
-                    continue
-
-                try:
-                    # THE CRITICAL CHECK: Skip if file is a placeholder
-                    placeholder_size = len(PLACEHOLDER_CONTENT.encode('utf-8'))
-                    if os.path.getsize(local_path) == placeholder_size:
-                        with open(local_path, 'r', errors='ignore') as f_check:
-                            if f_check.read() == PLACEHOLDER_CONTENT:
-                                monitor_logger.debug(f"Initial Sync: Skipping placeholder '{local_path}'.")
-                                continue
-                except (OSError, UnicodeDecodeError):
-                    # File might have vanished, or is a binary file that can't be read as text.
-                    # In either case, it's not our specific text placeholder, so we proceed.
-                    pass
-
-                # If we're here, it's not a placeholder. Check if it's relevant to our patterns.
-                is_relevant, rel_path = is_path_relevant(local_path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
-                if is_relevant:
-                    monitor_logger.info(f"Initial Sync: Found non-placeholder file to upload: '{rel_path}'")
-                    # Upload and if successful, add to list for placeholder creation
-                    upload_ok = watcher_instance._handle_s3_upload(local_path, rel_path, is_initial_sync=True)
-                    if upload_ok:
-                        files_uploaded_in_sync.append((local_path, rel_path))
-
-    monitor_logger.info(f"--- Initial S3 Sync UPLOAD phase complete. {len(files_uploaded_in_sync)} files uploaded. ---")
-
-    # Phase 2: Create placeholders for the files that were just successfully uploaded
-    if DELETE_FROM_EFS_AFTER_SYNC and files_uploaded_in_sync:
-        monitor_logger.info(f"--- Starting EFS placeholder replacement for {len(files_uploaded_in_sync)} initially synced files ---")
-        for local_path, rel_path in files_uploaded_in_sync:
-            _, ext = os.path.splitext(local_path)
-            if ext.lower() in PLACEHOLDER_TARGET_EXTENSIONS_EFS:
-                monitor_logger.info(f"Initial Sync: Replacing '{local_path}' with placeholder.")
-                _replace_efs_file_with_placeholder(local_path, rel_path)
-            else:
-                monitor_logger.info(f"Initial Sync: File '{local_path}' not targeted for placeholder replacement (extension not in list).")
-    monitor_logger.info("--- EFS placeholder replacement Attempted ---")
-
-
-    # Phase 3: Invalidate CloudFront
+    if DELETE_FROM_EFS_AFTER_SYNC:
+        monitor_logger.info("--- Starting EFS placeholder replacement for initially synced files ---")
+        for scan_root in (p for p in (wp_content_path, wp_includes_path) if os.path.isdir(p)):
+            monitor_logger.info(f"Scanning '{scan_root}' for files to replace with placeholders...")
+            for root, _, files in os.walk(scan_root):
+                for filename in files:
+                    local_path = os.path.join(root, filename)
+                    if watcher_instance._is_excluded(local_path): continue
+                    is_relevant, rel_path = is_path_relevant(local_path, MONITOR_DIR_BASE, RELEVANT_PATTERNS)
+                    if is_relevant and os.path.splitext(local_path)[1].lower() in PLACEHOLDER_TARGET_EXTENSIONS_EFS:
+                        try:
+                            if os.path.exists(local_path) and \
+                               os.path.getsize(local_path) == len(PLACEHOLDER_CONTENT.encode('utf-8')):
+                                with open(local_path, 'r') as f_check: content = f_check.read()
+                                if content == PLACEHOLDER_CONTENT: monitor_logger.debug(f"'{local_path}' is already placeholder."); continue
+                        except OSError: pass
+                        if os.path.exists(local_path):
+                            monitor_logger.info(f"Initial Sync: Replacing '{local_path}' with placeholder.")
+                            _replace_efs_file_with_placeholder(local_path, rel_path)
+                        else: monitor_logger.warning(f"Initial Sync: File '{local_path}' gone before placeholder replacement.")
+        monitor_logger.info("--- EFS placeholder replacement Attempted ---")
+    
     if CLOUDFRONT_DISTRIBUTION_ID:
         monitor_logger.info("Initial sync complete. Enqueuing full CloudFront invalidation (/*).")
         watcher_instance._trigger_batched_cloudfront_invalidation(paths_override=['/*'], reference_suffix_override="initial-sync-full")
 
-
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    script_version_tag = "v2.6.0-SafeInitialSync" # Version updated to reflect critical fix
+    script_version_tag = "v2.6.0-ConditionalInitialSync"
     monitor_logger.info(f"Python Watchdog Monitor ({script_version_tag}) starting for '{MONITOR_DIR_BASE}'.")
+    
+    # The check for 'WPAdmin' in NAME has been removed.
+    
     monitor_logger.info(f"S3 Bucket: {S3_BUCKET}")
     monitor_logger.info(f"Relevant Patterns (raw): {RELEVANT_PATTERNS_STR}")
     monitor_logger.info(f"Relevant Watcher Patterns (parsed): {RELEVANT_PATTERNS}")
-    monitor_logger.info(f"Replace EFS files with placeholders: {DELETE_FROM_EFS_AFTER_SYNC}")
-    monitor_logger.info(f"Perform initial sync: {PERFORM_INITIAL_SYNC}")
+    monitor_logger.info(f"Replace EFS files with placeholders: {DELETE_FROM_EFS_AFTER_SYNC} (Hardcoded)")
+    monitor_logger.info(f"Perform initial sync (if bucket is empty): {PERFORM_INITIAL_SYNC} (Hardcoded)")
     monitor_logger.info(f"CloudFront Distribution ID: {CLOUDFRONT_DISTRIBUTION_ID if CLOUDFRONT_DISTRIBUTION_ID else 'Not Set'}")
-    monitor_logger.info(f"CF Invalidation Batch: MaxSize={CF_INVALIDATION_BATCH_MAX_SIZE}, Timeout={CF_INVALIDATION_BATCH_TIMEOUT_SECONDS}s")
-    monitor_logger.info(f"AWS CLI Timeouts: S3 CP={AWS_CLI_TIMEOUT_S3_CP}s, S3 RM={AWS_CLI_TIMEOUT_S3_RM}s")
-
-    if not S3_BUCKET: monitor_logger.critical("S3_BUCKET not set. Exiting."); exit(1)
-    if not os.path.isdir(MONITOR_DIR_BASE): monitor_logger.critical(f"Monitor dir '{MONITOR_DIR_BASE}' not found. Exiting."); exit(1)
+    
+    if not S3_BUCKET: monitor_logger.critical("S3_BUCKET not set. Exiting."); sys.exit(1)
+    if not os.path.isdir(MONITOR_DIR_BASE): monitor_logger.critical(f"Monitor dir '{MONITOR_DIR_BASE}' not found. Exiting."); sys.exit(1)
     resolved_cli_path = shutil.which(AWS_CLI_PATH)
-    if not resolved_cli_path: monitor_logger.critical(f"AWS CLI ('{AWS_CLI_PATH}') not found. Exiting."); exit(1)
+    if not resolved_cli_path: monitor_logger.critical(f"AWS CLI ('{AWS_CLI_PATH}') not found. Exiting."); sys.exit(1)
     AWS_CLI_PATH = resolved_cli_path
     monitor_logger.info(f"Using AWS CLI at: {AWS_CLI_PATH}")
+    
     try: boto3.client('s3'); monitor_logger.info("Boto3 S3 client OK.")
-    except Exception as e: monitor_logger.critical(f"Boto3 S3 client init failed: {e}", exc_info=True); exit(1)
+    except Exception as e: monitor_logger.critical(f"Boto3 S3 client init failed: {e}", exc_info=True); sys.exit(1)
 
     invalidation_worker_threads = []
     if CLOUDFRONT_DISTRIBUTION_ID:
@@ -516,7 +541,9 @@ if __name__ == "__main__":
     else: monitor_logger.warning("CLOUDFRONT_DISTRIBUTION_ID not set, workers NOT started.")
 
     event_handler = Watcher()
-    if PERFORM_INITIAL_SYNC: perform_initial_sync(event_handler)
+    if PERFORM_INITIAL_SYNC:
+        perform_initial_sync(event_handler)
+    
     if not RELEVANT_PATTERNS_STR or not RELEVANT_PATTERNS:
          monitor_logger.warning(f"RELEVANT_PATTERNS empty. Watchdog may only process initial sync/deletions.")
 
@@ -539,8 +566,14 @@ if __name__ == "__main__":
                 try: invalidation_queue.put((None, None), block=False, timeout=1)
                 except queue.Full: monitor_logger.warning("Queue full sending termination sentinels."); break
             monitor_logger.info(f"Waiting for {invalidation_queue.qsize()} items in invalidation queue...")
-            invalidation_queue.join()
-            monitor_logger.info("Invalidation queue processed (empty).")
+            all_processed = False; timeout_join = MAX_INVALIDATION_WORKERS * (BOTO3_CLOUDFRONT_READ_TIMEOUT + 10); start_join_time = time.time()
+            while not invalidation_queue.empty():
+                if time.time() - start_join_time > timeout_join:
+                    monitor_logger.warning(f"Timeout waiting for invalidation queue. {invalidation_queue.qsize()} items may remain.")
+                    break
+                time.sleep(0.5)
+            else: all_processed = True
+            if all_processed: monitor_logger.info("Invalidation queue processed (empty).")
         with cf_invalidation_lock:
             if cf_invalidation_timer and cf_invalidation_timer.is_alive():
                 monitor_logger.info("Cancelling main CF invalidation timer."); cf_invalidation_timer.cancel()
