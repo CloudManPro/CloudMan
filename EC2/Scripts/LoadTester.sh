@@ -1,3 +1,4 @@
+# LoadTester.sh
 set -e
    
    LOG_PREFIX="[SETUP-SCRIPT]"
