@@ -23,7 +23,7 @@ set -e
    
    # --- 2. Instalação de Dependências ---
    log "Iniciando a instalação de dependências..."
-   sudo yum update -y
+   #sudo yum update -y
    sudo yum install -y python3 python3-pip aws-cli
    
    pip3 install boto3 flask requests
