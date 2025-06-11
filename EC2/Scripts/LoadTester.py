@@ -149,7 +149,7 @@ def index():
     return flask.render_template_string(HTML_TEMPLATE)
 
 
-@app.route('/health')
+@app.route('/healthcheck')
 def health_check():
     """Endpoint para verificação de saúde do Load Balancer."""
     return flask.jsonify({"status": "ok"}), 200
