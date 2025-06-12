@@ -1,4 +1,4 @@
-#2.0.5
+#2.0.6
 import flask
 import requests
 import threading
@@ -199,26 +199,9 @@ HTML_TEMPLATE = """
             </div>
             <div id="charts-container" class="container" style="display:none;">
                 <h2>Gráficos de Performance</h2>
-                <!-- ### MODIFICADO ### - A ordem dos gráficos foi alterada. RPS vem primeiro. -->
-                <div class="chart-section">
-                    <h3>Requisições por Segundo (RPS)</h3>
-                    <div class="chart-wrapper"><canvas id="rps-chart"></canvas></div>
-                </div>
-                <div class="chart-section">
-                    <h3>Tempo de Resposta Médio (Sucessos)</h3>
-                    <div class="chart-wrapper"><canvas id="response-time-chart"></canvas></div>
-                </div>
-                <div class="chart-section">
-                    <h3 style="margin-bottom: 5px;">Distribuição de Respostas (Final)</h3>
-                    <div id="summary-legend">
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span>
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span>
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span>
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span>
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span>
-                    </div>
-                    <div class="chart-wrapper"><canvas id="summary-chart"></canvas></div>
-                </div>
+                <div class="chart-section"><h3 style="margin-bottom: 20px;">Requisições por Segundo (RPS)</h3><div class="chart-wrapper"><canvas id="rps-chart"></canvas></div></div>
+                <div class="chart-section"><h3 style="margin-bottom: 20px;">Tempo de Resposta Médio (Sucessos)</h3><div class="chart-wrapper"><canvas id="response-time-chart"></canvas></div></div>
+                <div class="chart-section"><h3 style="margin-bottom: 5px;">Distribuição de Respostas (Final)</h3><div id="summary-legend"><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span></div><div class="chart-wrapper"><canvas id="summary-chart"></canvas></div></div>
             </div>
         </div>
     </div>
@@ -244,7 +227,13 @@ HTML_TEMPLATE = """
         startBtn.disabled = true; stopBtn.style.display = 'inline-block';
         resultsContainer.style.display = 'block'; summaryContainer.style.display = 'none';
         summaryTable.innerHTML = ''; chartsContainer.style.display = 'block';
+        
+        // ### PONTO-CHAVE ###
+        // Os gráficos são limpos e reinicializados AQUI, e somente aqui,
+        // garantindo que os dados do teste anterior sejam removidos apenas
+        // quando um NOVO teste é iniciado.
         initializeCharts();
+        
         statusInterval = setInterval(updateStatus, 5000);
     }
 
@@ -255,7 +244,7 @@ HTML_TEMPLATE = """
         
         const rpsDatasets = chartConfigs.keys.map(key => ({
             label: chartConfigs.labels[key], data: [], backgroundColor: chartConfigs.colors[key],
-            borderColor: chartConfigs.colors[key], fill: true, key: key
+            borderColor: chartConfigs.colors[key], fill: true, key: key, pointRadius: 2, tension: 0.3
         }));
         rpsChart = new Chart(document.getElementById('rps-chart'), {
             type: 'line', data: { labels: [], datasets: rpsDatasets },
@@ -265,7 +254,7 @@ HTML_TEMPLATE = """
             }
         });
         
-        responseTimeChart = new Chart(document.getElementById('response-time-chart'), { type: 'line', data: { labels: [], datasets: [{ label: 'Tempo Médio (s)', data: [], borderColor: '#28a745', tension: 0.1, fill: false }] }, options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, title: { display: true, text: 'Segundos' } } }, animation: false } });
+        responseTimeChart = new Chart(document.getElementById('response-time-chart'), { type: 'line', data: { labels: [], datasets: [{ label: 'Tempo Médio (s)', data: [], borderColor: '#28a745', tension: 0.3, fill: false, pointRadius: 2 }] }, options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, title: { display: true, text: 'Segundos' } } }, animation: false } });
     }
 
     function updateStatus() {
@@ -279,17 +268,18 @@ HTML_TEMPLATE = """
             if (data.time_series_data) {
                 const labels = data.time_series_data.map(d => d.timestamp);
                 rpsChart.data.labels = labels;
-                rpsChart.data.datasets.forEach(dataset => {
-                    dataset.data = data.time_series_data.map(d => d.rates[dataset.key] || 0);
-                });
+                rpsChart.data.datasets.forEach(dataset => { dataset.data = data.time_series_data.map(d => d.rates[dataset.key] || 0); });
                 rpsChart.update();
-                
                 responseTimeChart.data.labels = labels;
                 responseTimeChart.data.datasets[0].data = data.time_series_data.map(d => d.avg_response_time);
                 responseTimeChart.update();
             }
 
             if (data.status === 'finished') {
+                // ### PONTO-CHAVE ###
+                // Ao finalizar, a atualização é parada. Nenhum comando para limpar os
+                // gráficos de linha é chamado aqui. Eles permanecem na tela com os
+                // últimos dados recebidos, como solicitado.
                 clearInterval(statusInterval);
                 startBtn.disabled = false; stopBtn.style.display = 'none';
                 displaySummary(data.summary);
