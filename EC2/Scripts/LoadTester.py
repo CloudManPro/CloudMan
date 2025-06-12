@@ -1,4 +1,4 @@
-#2.0.2
+#2.0.3
 import flask
 import requests
 import threading
@@ -187,7 +187,6 @@ def get_status():
         return flask.jsonify(test_state)
 
 # --- 3. TEMPLATE HTML (INTERFACE) ---
-# ### MODIFICADO ### - Estrutura HTML e CSS completamente refeita para o layout de duas colunas
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-br">
@@ -198,55 +197,31 @@ HTML_TEMPLATE = """
     <style>
         * { box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; background-color: #f8f9fa; color: #343a40; }
-        
-        /* ### NOVO ### - Layout principal de duas colunas */
-        .main-layout {
-            display: grid;
-            grid-template-columns: 450px 1fr; /* Coluna esquerda fixa, direita flexível */
-            min-height: 100vh;
-        }
-        .left-column {
-            padding: 20px;
-            background-color: #fff;
-            border-right: 1px solid #dee2e6;
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-        .right-column {
-            padding: 20px;
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
+        .main-layout { display: grid; grid-template-columns: 450px 1fr; min-height: 100vh; }
+        .left-column { padding: 20px; background-color: #fff; border-right: 1px solid #dee2e6; display: flex; flex-direction: column; gap: 20px; }
+        .right-column { padding: 20px; display: flex; flex-direction: column; gap: 20px; }
         .container { background: white; padding: 25px; border-radius: 8px; border: 1px solid #e9ecef; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
         h1, h2, h3 { color: #003049; margin-top: 0; }
         h3 { margin-bottom: 20px; text-align: center; }
-        
         label { display: block; margin-bottom: 5px; font-weight: 600; }
         input, select, textarea { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ced4da; border-radius: 4px; }
         textarea { font-family: monospace; height: 80px; }
         .grid-3, .grid-2 { display: grid; gap: 15px; }
         .grid-3 { grid-template-columns: repeat(3, 1fr); }
         .grid-2 { grid-template-columns: repeat(2, 1fr); }
-
         .btn { padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; color: white; font-size: 16px; font-weight: bold; margin-right: 10px; }
         .btn-start { background-color: #007bff; } .btn-stop { background-color: #dc3545; }
-        .btn-chart { background-color: #17a2b8; }
         .btn:disabled { background-color: #6c757d; cursor: not-allowed; }
-        
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #dee2e6; }
-        
         #summary-legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 15px; margin-bottom: 20px; }
         .legend-item { display: flex; align-items: center; font-size: 14px; }
         .legend-color-box { width: 15px; height: 15px; margin-right: 8px; border-radius: 3px; }
         .chart-wrapper { position: relative; height: 350px; width: 100%; margin: auto; }
+        .chart-section { margin-bottom: 20px; }
     </style>
 </head>
 <body>
-    <!-- ### NOVO ### - Estrutura principal com as duas colunas -->
     <div class="main-layout">
         <!-- Coluna Esquerda: Controles e Resumo Final -->
         <div class="left-column">
@@ -268,7 +243,7 @@ HTML_TEMPLATE = """
                     <div id="post-put-options" style="display:none;"><label>Cabeçalhos</label><textarea name="headers" placeholder="Content-Type: application/json"></textarea><label>Corpo (JSON)</label><textarea name="body" placeholder='{"key": "value"}'></textarea></div>
                     <button id="start-btn" type="submit" class="btn btn-start">Iniciar Teste</button>
                     <button id="stop-btn" type="button" class="btn btn-stop" style="display:none;">Parar Teste</button>
-                    <button id="toggle-charts-btn" type="button" class="btn btn-chart" style="display:none;">Ocultar Gráficos</button>
+                    <!-- ### MODIFICADO ### Botão de toggle foi removido -->
                 </form>
             </div>
             <div id="summary-container" class="container" style="display:none;">
@@ -290,35 +265,16 @@ HTML_TEMPLATE = """
             
             <div id="charts-container" class="container" style="display:none;">
                 <h2>Gráficos de Performance</h2>
-                <!-- Gráfico 1: Distribuição -->
-                <div class="chart-section">
-                    <h3>Distribuição de Respostas (Final)</h3>
-                    <div id="summary-legend">
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span>
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span>
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span>
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span>
-                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span>
-                    </div>
-                    <div class="chart-wrapper"><canvas id="summary-chart"></canvas></div>
-                </div>
-                <!-- Gráfico 2: RPS -->
-                <div class="chart-section">
-                    <h3>Requisições por Segundo (RPS)</h3>
-                    <div class="chart-wrapper"><canvas id="rps-chart"></canvas></div>
-                </div>
-                <!-- Gráfico 3: Tempo de Resposta -->
-                <div class="chart-section">
-                     <h3>Tempo de Resposta Médio (Sucessos)</h3>
-                     <div class="chart-wrapper"><canvas id="response-time-chart"></canvas></div>
-                </div>
+                <div class="chart-section"><h3 style="margin-bottom: 5px;">Distribuição de Respostas (Final)</h3><div id="summary-legend"><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span></div><div class="chart-wrapper"><canvas id="summary-chart"></canvas></div></div>
+                <div class="chart-section"><h3>Requisições por Segundo (RPS)</h3><div class="chart-wrapper"><canvas id="rps-chart"></canvas></div></div>
+                <div class="chart-section"><h3>Tempo de Resposta Médio (Sucessos)</h3><div class="chart-wrapper"><canvas id="response-time-chart"></canvas></div></div>
             </div>
         </div>
     </div>
 
 <script>
-    // ### JAVASCRIPT (Sem alterações na lógica, apenas gerencia a visibilidade dos novos containers) ###
-    const startBtn = document.getElementById('start-btn'), stopBtn = document.getElementById('stop-btn'), toggleChartsBtn = document.getElementById('toggle-charts-btn'), testForm = document.getElementById('test-form');
+    // ### MODIFICADO ### - Referência ao botão de toggle removida
+    const startBtn = document.getElementById('start-btn'), stopBtn = document.getElementById('stop-btn'), testForm = document.getElementById('test-form');
     const resultsContainer = document.getElementById('results-container'), summaryContainer = document.getElementById('summary-container'), chartsContainer = document.getElementById('charts-container');
     const statusText = document.getElementById('status-text'), progressText = document.getElementById('progress-text');
     const liveSuccessCount = document.getElementById('live-success-count'), liveErrorCount = document.getElementById('live-error-count');
@@ -330,31 +286,28 @@ HTML_TEMPLATE = """
         labels: { success: 'Sucesso (2xx)', rate_limit: 'Rate Limit (429)', client_error: 'Erro Cliente (4xx)', server_error: 'Erro Servidor (5xx)', network_error: 'Erro Rede/Timeout' }
     };
 
-    document.getElementById('delay_type').addEventListener('change', e => {
-        document.getElementById('constant-delay-div').style.display = e.target.value === 'constant' ? 'block' : 'none';
-        document.getElementById('variable-delay-div').style.display = e.target.value === 'variable' ? 'block' : 'none';
-    });
-    document.getElementById('method').addEventListener('change', e => {
-        document.getElementById('post-put-options').style.display = ['POST', 'PUT'].includes(e.target.value) ? 'block' : 'none';
-    });
+    document.getElementById('delay_type').addEventListener('change', e => { document.getElementById('constant-delay-div').style.display = e.target.value === 'constant' ? 'block' : 'none'; document.getElementById('variable-delay-div').style.display = e.target.value === 'variable' ? 'block' : 'none'; });
+    document.getElementById('method').addEventListener('change', e => { document.getElementById('post-put-options').style.display = ['POST', 'PUT'].includes(e.target.value) ? 'block' : 'none'; });
     document.getElementById('delay_type').dispatchEvent(new Event('change'));
     stopBtn.addEventListener('click', () => fetch('/stop_test', { method: 'POST' }));
-    toggleChartsBtn.addEventListener('click', () => {
-        const isHidden = chartsContainer.style.display === 'none';
-        chartsContainer.style.display = isHidden ? 'block' : 'none';
-        toggleChartsBtn.textContent = isHidden ? 'Ocultar Gráficos' : 'Exibir Gráficos';
-    });
+    
+    // ### MODIFICADO ### - Event listener do botão de toggle removido
+    
     testForm.addEventListener('submit', (e) => {
         e.preventDefault();
         fetch('/start_test', { method: 'POST', body: new FormData(testForm) }).then(res => res.ok && startMonitoring());
     });
     
     function startMonitoring() {
-        startBtn.disabled = true; stopBtn.style.display = 'inline-block'; toggleChartsBtn.style.display = 'none';
+        startBtn.disabled = true; 
+        stopBtn.style.display = 'inline-block';
         resultsContainer.style.display = 'block'; 
         summaryContainer.style.display = 'none';
-        chartsContainer.style.display = 'none'; 
         summaryTable.innerHTML = '';
+        
+        // ### MODIFICADO ### - Gráficos são exibidos IMEDIATAMENTE ao iniciar o teste
+        chartsContainer.style.display = 'block'; 
+        
         initializeCharts();
         statusInterval = setInterval(updateStatus, 5000);
     }
@@ -365,20 +318,15 @@ HTML_TEMPLATE = """
         if(responseTimeChart) responseTimeChart.destroy();
 
         summaryChart = new Chart(document.getElementById('summary-chart'), {
-            type: 'doughnut',
-            data: { labels: Object.values(chartConfigs.labels), datasets: [{ data: [0, 0, 0, 0, 0], backgroundColor: Object.values(chartConfigs.colors), borderWidth: 0 }] },
+            type: 'doughnut', data: { labels: Object.values(chartConfigs.labels), datasets: [{ data: [0, 0, 0, 0, 0], backgroundColor: Object.values(chartConfigs.colors), borderWidth: 0 }] },
             options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
         });
-
         rpsChart = new Chart(document.getElementById('rps-chart'), {
-            type: 'line',
-            data: { labels: [], datasets: [{ label: 'RPS', data: [], borderColor: '#007bff', tension: 0.1, fill: false }] },
+            type: 'line', data: { labels: [], datasets: [{ label: 'RPS', data: [], borderColor: '#007bff', tension: 0.1, fill: false }] },
             options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, title: { display: true, text: 'Reqs/seg' } } }, animation: false }
         });
-
         responseTimeChart = new Chart(document.getElementById('response-time-chart'), {
-            type: 'line',
-            data: { labels: [], datasets: [{ label: 'Tempo Médio (s)', data: [], borderColor: '#28a745', tension: 0.1, fill: false }] },
+            type: 'line', data: { labels: [], datasets: [{ label: 'Tempo Médio (s)', data: [], borderColor: '#28a745', tension: 0.1, fill: false }] },
             options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, title: { display: true, text: 'Segundos' } } }, animation: false }
         });
     }
@@ -403,8 +351,8 @@ HTML_TEMPLATE = """
 
             if (data.status === 'finished') {
                 clearInterval(statusInterval);
-                startBtn.disabled = false; stopBtn.style.display = 'none';
-                toggleChartsBtn.style.display = 'inline-block';
+                startBtn.disabled = false; 
+                stopBtn.style.display = 'none';
                 displaySummary(data.summary);
             }
         });
@@ -413,27 +361,15 @@ HTML_TEMPLATE = """
     function displaySummary(summary) {
         resultsContainer.style.display = 'none';
         summaryContainer.style.display = 'block';
-        if (!summary || Object.keys(summary).length === 0) {
-            summaryTable.innerHTML = '<tr><td>Nenhum resultado para exibir.</td></tr>'; return;
-        }
-        let html = `
-            <tr><td>Duração Total</td><td>${summary.total_duration}s</td></tr>
-            <tr><td>Total de Requisições</td><td>${summary.total_requests}</td></tr>
-            <tr><td>RPS (Média)</td><td>${summary.rps}</td></tr>
-            <tr><td colspan="2" style="background-color:#f2f2f2;"><strong>Estatísticas de Resposta (sucessos)</strong></td></tr>
-            <tr><td>Tempo Médio</td><td>${summary.avg_response_time || 'N/A'}s</td></tr>
-            <tr><td>Tempo Mínimo</td><td>${summary.min_response_time || 'N/A'}s</td></tr>
-            <tr><td>Tempo Máximo</td><td>${summary.max_response_time || 'N/A'}s</td></tr>
-            <tr><td>Mediana (p50)</td><td>${summary.p50_median || 'N/A'}s</td></tr>
-            <tr><td>Percentil 95 (p95)</td><td>${summary.p95 || 'N/A'}s</td></tr>`;
+        if (!summary || Object.keys(summary).length === 0) { summaryTable.innerHTML = '<tr><td>Nenhum resultado para exibir.</td></tr>'; return; }
+        
+        let html = `<tr><td>Duração Total</td><td>${summary.total_duration}s</td></tr><tr><td>Total de Requisições</td><td>${summary.total_requests}</td></tr><tr><td>RPS (Média)</td><td>${summary.rps}</td></tr><tr><td colspan="2" style="background-color:#f2f2f2;"><strong>Estatísticas de Resposta (sucessos)</strong></td></tr><tr><td>Tempo Médio</td><td>${summary.avg_response_time || 'N/A'}s</td></tr><tr><td>Tempo Mínimo</td><td>${summary.min_response_time || 'N/A'}s</td></tr><tr><td>Tempo Máximo</td><td>${summary.max_response_time || 'N/A'}s</td></tr><tr><td>Mediana (p50)</td><td>${summary.p50_median || 'N/A'}s</td></tr><tr><td>Percentil 95 (p95)</td><td>${summary.p95 || 'N/A'}s</td></tr>`;
         summaryTable.innerHTML = html;
 
         if (summary.categorized_distribution) {
             const dist = summary.categorized_distribution;
             summaryChart.data.datasets[0].data = [dist.success, dist.rate_limit, dist.client_error, dist.server_error, dist.network_error];
             summaryChart.update();
-            chartsContainer.style.display = 'block';
-            toggleChartsBtn.textContent = 'Ocultar Gráficos';
         }
     }
 </script>
