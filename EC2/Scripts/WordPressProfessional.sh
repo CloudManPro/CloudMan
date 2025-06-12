@@ -315,7 +315,24 @@ echo "INFO: Creds RDS OK (User: $DB_USER, DB: $DB_NAME_TO_USE)."
 echo "INFO: Verificando WP em '$MOUNT_POINT/wp-includes'..."
 if [ -d "$MOUNT_POINT/wp-includes" ]&&[ -f "$CONFIG_SAMPLE_ON_EFS" ]; then echo "WARN: WP já existe."; else
     echo "INFO: WP não encontrado. Baixando..."; sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"; sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"; sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-    cd "$WP_DOWNLOAD_DIR"; curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha download WP."; exit 1; }; tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha extração WP."; exit 1; }; rm latest.tar.gz
+    
+    ### CORREÇÃO APLICADA ###
+    # Usando um subshell (...) para executar as operações de download e extração.
+    # Isso garante que a mudança de diretório (cd) seja temporária e não afete
+    # o restante do script, evitando o erro "getcwd".
+    (
+      cd "$WP_DOWNLOAD_DIR" || { echo "ERRO: Falha ao entrar no diretório temporário '$WP_DOWNLOAD_DIR'."; exit 1; }
+      curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha download WP."; exit 1; }
+      tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha extração WP."; exit 1; }
+      rm latest.tar.gz
+    )
+    # Verifica se o subshell foi executado com sucesso.
+    if [ $? -ne 0 ]; then
+        echo "ERRO CRÍTICO: O bloco de download e extração do WordPress falhou."
+        exit 1
+    fi
+    ### FIM DA CORREÇÃO ###
+
     echo "INFO: WP baixado e extraído. Copiando para EFS como '$EFS_OWNER_USER'..."
     if sudo -u "$EFS_OWNER_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"; then echo "INFO: WP copiado para EFS."; else echo "ERRO: Falha copiar WP para EFS."; ls -ld "$MOUNT_POINT"; exit 1; fi
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"; echo "INFO: Limpeza WP temps OK."
