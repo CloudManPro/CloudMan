@@ -1,4 +1,4 @@
-#version 2.o.o
+#version 2.0.1
 import flask
 import requests
 import threading
@@ -11,19 +11,17 @@ from argparse import ArgumentParser
 # --- 1. LÓGICA DA APLICAÇÃO ---
 app = flask.Flask(__name__)
 
-# ### MODIFICADO ### - Estado global estendido para incluir dados para os gráficos
+# Estado global estendido para incluir dados para os gráficos
 test_state = {
     "status": "idle",  # idle, ramping, running, stopping, finished
     "params": {},
     "live_stats": {"total": 0},
     "results": [],
     "summary": {},
-    "time_series_data": [],  # NOVO: Para dados de gráficos ao longo do tempo
+    "time_series_data": [],
 }
 state_lock = threading.Lock()
 
-
-# ### NOVO ### - Função para agregar dados em tempo real para os gráficos
 def data_aggregator():
     """
     Thread em background que agrega os resultados a cada 10 segundos
@@ -31,30 +29,25 @@ def data_aggregator():
     """
     last_processed_index = 0
     while True:
-        time.sleep(10)  # Agrega a cada 10 segundos
+        time.sleep(10)
         with state_lock:
-            # Só executa se o teste estiver ativo
             if test_state["status"] not in ["ramping", "running"]:
-                last_processed_index = 0  # Reseta para o próximo teste
+                last_processed_index = 0
                 test_state["time_series_data"] = []
                 continue
 
             current_results_count = len(test_state["results"])
-            # Pega apenas os resultados novos desde a última agregação
             new_results = test_state["results"][last_processed_index:]
             last_processed_index = current_results_count
 
             if not new_results:
                 continue
 
-            # Calcula estatísticas para este intervalo de 10 segundos
-            interval_duration = 10  # Aproximadamente
+            interval_duration = 10
             rps = len(new_results) / interval_duration
             success_times = [r["duration"] for r in new_results if r["status_code"] and 200 <= r["status_code"] < 300]
-            
             avg_response_time = sum(success_times) / len(success_times) if success_times else 0
 
-            # Adiciona os dados agregados à série temporal
             interval_data = {
                 "timestamp": time.strftime('%H:%M:%S'),
                 "rps": f"{rps:.2f}",
@@ -137,8 +130,6 @@ def run_load_test(params):
         test_state["summary"] = calculate_summary(test_state["results"], duration)
         test_state["status"] = "finished"
 
-
-# ### NOVO ### - Função para categorizar os resultados
 def categorize_result(status_code):
     """Categoriza um status_code na nossa classificação para os gráficos."""
     if status_code is None:
@@ -160,16 +151,13 @@ def calculate_summary(results, duration):
     if total_reqs == 0:
         return {}
 
-    # ### MODIFICADO ### - Usa a nova função de categorização
     categorized_counts = Counter(categorize_result(r['status_code']) for r in results)
-
     success_times = [r["duration"] for r in results if categorize_result(r['status_code']) == 'success']
     
     summary = {
         "total_duration": f"{duration:.2f}",
         "total_requests": total_reqs,
         "rps": f"{total_reqs / duration:.2f}" if duration > 0 else "0.00",
-        # ### MODIFICADO ### - Adiciona a distribuição categorizada para o gráfico
         "categorized_distribution": {
             "success": categorized_counts.get('success', 0),
             "rate_limit": categorized_counts.get('rate_limit', 0),
@@ -214,7 +202,6 @@ def start_test():
             except (ValueError, TypeError):
                 params[key] = value
         
-        # ### MODIFICADO ### - Reseta o estado completamente
         test_state.update({
             "params": params, "status": "idle", "results": [], "summary": {}, 
             "live_stats": {"total": 0}, "time_series_data": []
@@ -246,19 +233,19 @@ def get_status():
 
 
 # --- 3. TEMPLATE HTML (INTERFACE) ---
-# ### MODIFICADO ### - HTML_TEMPLATE atualizado com Chart.js e novos elementos
+# ### MODIFICADO ### - HTML_TEMPLATE com legenda customizada e novo layout de gráficos
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
     <meta charset="UTF-8">
     <title>Ferramenta de Teste de Carga</title>
-    <!-- ### NOVO ### - Inclusão da biblioteca Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 900px; margin: auto; padding: 20px; background-color: #f8f9fa; color: #343a40; }
         .container { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
-        h1, h2 { color: #003049; }
+        h1, h2, h3 { color: #003049; }
+        h3 { margin-top: 25px; text-align: center;}
         label { display: block; margin-bottom: 5px; font-weight: 600; }
         input, select, textarea { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ced4da; border-radius: 4px; box-sizing: border-box; }
         textarea { font-family: monospace; height: 100px; }
@@ -275,6 +262,11 @@ HTML_TEMPLATE = """
         .stat-success { background-color: #d4edda; color: #155724; }
         .stat-error { background-color: #f8d7da; color: #721c24; }
         #charts-container { padding-top: 20px; }
+        /* ### NOVO ### - Estilos para a legenda customizada */
+        #summary-legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 15px; margin-bottom: 20px; }
+        .legend-item { display: flex; align-items: center; font-size: 14px; }
+        .legend-color-box { width: 15px; height: 15px; margin-right: 8px; border-radius: 3px; }
+        .chart-wrapper { position: relative; height: 350px; margin: auto; }
     </style>
 </head>
 <body>
@@ -296,7 +288,6 @@ HTML_TEMPLATE = """
             <div id="post-put-options" style="display:none;"><label>Cabeçalhos</label><textarea name="headers" placeholder="Content-Type: application/json"></textarea><label>Corpo (JSON)</label><textarea name="body" placeholder='{"key": "value"}'></textarea></div>
             <button id="start-btn" type="submit" class="btn btn-start">Iniciar Teste</button>
             <button id="stop-btn" type="button" class="btn btn-stop" style="display:none;">Parar Teste</button>
-            <!-- ### NOVO ### - Botão para exibir/ocultar gráficos -->
             <button id="toggle-charts-btn" type="button" class="btn btn-chart" style="display:none;">Exibir Gráficos</button>
         </form>
     </div>
@@ -308,22 +299,33 @@ HTML_TEMPLATE = """
             <div class="stat-box stat-error"><strong>Erros:</strong> <span id="live-error-count">0</span></div>
         </div>
     </div>
-    <!-- ### NOVO ### - Container para todos os gráficos -->
+    <!-- ### MODIFICADO ### - Novo layout do container de gráficos -->
     <div id="charts-container" class="container" style="display:none;">
         <h2>Gráficos de Performance</h2>
-        <div class="grid-2">
-             <div><h3>Distribuição de Respostas (Final)</h3><canvas id="summary-chart"></canvas></div>
-             <div><h3>Requisições por Segundo (RPS)</h3><canvas id="rps-chart"></canvas></div>
+        <div>
+             <h3>Distribuição de Respostas (Final)</h3>
+             <!-- ### NOVO ### - Legenda HTML customizada -->
+             <div id="summary-legend">
+                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span>
+                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span>
+                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span>
+                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span>
+                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span>
+             </div>
+             <div class="chart-wrapper">
+                <canvas id="summary-chart"></canvas>
+             </div>
         </div>
-         <h3 style="margin-top: 25px;">Tempo de Resposta Médio (Sucessos)</h3>
-         <canvas id="response-time-chart"></canvas>
+        <div class="grid-2" style="margin-top: 30px;">
+             <div><h3>Requisições por Segundo (RPS)</h3><canvas id="rps-chart"></canvas></div>
+             <div><h3>Tempo de Resposta Médio (s)</h3><canvas id="response-time-chart"></canvas></div>
+        </div>
     </div>
     <div id="summary-container" class="container" style="display:none;">
         <h2>Resumo Final do Teste</h2>
         <table id="summary-table"></table>
     </div>
 <script>
-    // ### MODIFICADO ### - Script atualizado para gerenciar e renderizar os gráficos
     const startBtn = document.getElementById('start-btn'), stopBtn = document.getElementById('stop-btn'), toggleChartsBtn = document.getElementById('toggle-charts-btn'), testForm = document.getElementById('test-form');
     const resultsContainer = document.getElementById('results-container'), summaryContainer = document.getElementById('summary-container'), chartsContainer = document.getElementById('charts-container');
     const statusText = document.getElementById('status-text'), progressText = document.getElementById('progress-text');
@@ -331,7 +333,6 @@ HTML_TEMPLATE = """
     const summaryTable = document.getElementById('summary-table');
     let statusInterval, summaryChart, rpsChart, responseTimeChart;
     
-    // Configurações dos gráficos
     const chartConfigs = {
         colors: { success: 'rgba(40, 167, 69, 0.8)', rate_limit: 'rgba(108, 92, 231, 0.8)', client_error: 'rgba(255, 193, 7, 0.8)', server_error: 'rgba(220, 53, 69, 0.8)', network_error: 'rgba(108, 117, 125, 0.8)' },
         labels: { success: 'Sucesso (2xx)', rate_limit: 'Rate Limit (429)', client_error: 'Erro Cliente (4xx)', server_error: 'Erro Servidor (5xx)', network_error: 'Erro Rede/Timeout' }
@@ -362,39 +363,45 @@ HTML_TEMPLATE = """
         chartsContainer.style.display = 'none'; toggleChartsBtn.textContent = 'Exibir Gráficos';
         summaryTable.innerHTML = '';
         initializeCharts();
-        statusInterval = setInterval(updateStatus, 5000); // Atualiza status e gráficos a cada 5s
+        statusInterval = setInterval(updateStatus, 5000);
     }
 
     function initializeCharts() {
-        // Destrói gráficos antigos se existirem, para evitar bugs
         if(summaryChart) summaryChart.destroy();
         if(rpsChart) rpsChart.destroy();
         if(responseTimeChart) responseTimeChart.destroy();
 
-        // Gráfico de Resumo Final (Pizza)
+        // ### MODIFICADO ### - Configuração do gráfico de resumo para usar legenda customizada
         summaryChart = new Chart(document.getElementById('summary-chart'), {
             type: 'doughnut',
             data: {
                 labels: Object.values(chartConfigs.labels),
                 datasets: [{
-                    data: [0, 0, 0, 0, 0], // Inicia zerado
+                    data: [0, 0, 0, 0, 0],
                     backgroundColor: Object.values(chartConfigs.colors),
+                    borderWidth: 0
                 }]
             },
-            options: { responsive: true, maintainAspectRatio: true }
+            options: {
+                responsive: true,
+                maintainAspectRatio: false, // Permite que o gráfico preencha o contêiner
+                plugins: {
+                    legend: {
+                        display: false // Oculta a legenda padrão
+                    }
+                }
+            }
         });
 
-        // Gráfico de RPS (Linha)
         rpsChart = new Chart(document.getElementById('rps-chart'), {
             type: 'line',
-            data: { labels: [], datasets: [{ label: 'RPS', data: [], borderColor: '#007bff', tension: 0.1 }] },
+            data: { labels: [], datasets: [{ label: 'RPS', data: [], borderColor: '#007bff', tension: 0.1, fill: false }] },
             options: { scales: { y: { beginAtZero: true, title: { display: true, text: 'Reqs/seg' } }, x: { title: { display: true, text: 'Tempo' } } }, animation: false }
         });
 
-        // Gráfico de Tempo de Resposta (Linha)
         responseTimeChart = new Chart(document.getElementById('response-time-chart'), {
             type: 'line',
-            data: { labels: [], datasets: [{ label: 'Tempo Médio (s)', data: [], borderColor: '#28a745', tension: 0.1 }] },
+            data: { labels: [], datasets: [{ label: 'Tempo Médio (s)', data: [], borderColor: '#28a745', tension: 0.1, fill: false }] },
             options: { scales: { y: { beginAtZero: true, title: { display: true, text: 'Segundos' } }, x: { title: { display: true, text: 'Tempo' } } }, animation: false }
         });
     }
@@ -407,7 +414,6 @@ HTML_TEMPLATE = """
             liveSuccessCount.textContent = data.live_stats.success || 0;
             liveErrorCount.textContent = data.live_stats.errors || 0;
 
-            // Atualiza os gráficos em tempo real
             if (data.time_series_data) {
                 const labels = data.time_series_data.map(d => d.timestamp);
                 rpsChart.data.labels = labels;
@@ -433,7 +439,6 @@ HTML_TEMPLATE = """
             summaryTable.innerHTML = '<tr><td>Nenhum resultado para exibir.</td></tr>'; return;
         }
 
-        // Preenche a tabela de resumo
         let html = `
             <tr><td>Duração Total</td><td>${summary.total_duration}s</td></tr>
             <tr><td>Total de Requisições</td><td>${summary.total_requests}</td></tr>
@@ -447,7 +452,6 @@ HTML_TEMPLATE = """
         `;
         summaryTable.innerHTML = html;
 
-        // Atualiza e exibe o gráfico final
         if (summary.categorized_distribution) {
             const dist = summary.categorized_distribution;
             summaryChart.data.datasets[0].data = [dist.success, dist.rate_limit, dist.client_error, dist.server_error, dist.network_error];
@@ -468,7 +472,6 @@ if __name__ == '__main__':
     parser.add_argument('--port', default=5000, type=int, help='Porta para escutar')
     args = parser.parse_args()
 
-    # ### NOVO ### - Inicia a thread que agrega os dados para os gráficos
     aggregator_thread = threading.Thread(target=data_aggregator, daemon=True)
     aggregator_thread.start()
 
