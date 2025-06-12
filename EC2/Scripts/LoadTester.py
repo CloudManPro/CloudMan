@@ -1,4 +1,4 @@
-#version 2.0.1
+#2.0.2
 import flask
 import requests
 import threading
@@ -8,12 +8,11 @@ import random
 from collections import Counter
 from argparse import ArgumentParser
 
-# --- 1. LÓGICA DA APLICAÇÃO ---
+# --- 1. LÓGICA DA APLICAÇÃO (Sem alterações) ---
 app = flask.Flask(__name__)
 
-# Estado global estendido para incluir dados para os gráficos
 test_state = {
-    "status": "idle",  # idle, ramping, running, stopping, finished
+    "status": "idle",
     "params": {},
     "live_stats": {"total": 0},
     "results": [],
@@ -23,10 +22,6 @@ test_state = {
 state_lock = threading.Lock()
 
 def data_aggregator():
-    """
-    Thread em background que agrega os resultados a cada 10 segundos
-    enquanto um teste está em execução.
-    """
     last_processed_index = 0
     while True:
         time.sleep(10)
@@ -35,19 +30,15 @@ def data_aggregator():
                 last_processed_index = 0
                 test_state["time_series_data"] = []
                 continue
-
             current_results_count = len(test_state["results"])
             new_results = test_state["results"][last_processed_index:]
             last_processed_index = current_results_count
-
             if not new_results:
                 continue
-
             interval_duration = 10
             rps = len(new_results) / interval_duration
             success_times = [r["duration"] for r in new_results if r["status_code"] and 200 <= r["status_code"] < 300]
             avg_response_time = sum(success_times) / len(success_times) if success_times else 0
-
             interval_data = {
                 "timestamp": time.strftime('%H:%M:%S'),
                 "rps": f"{rps:.2f}",
@@ -55,9 +46,7 @@ def data_aggregator():
             }
             test_state["time_series_data"].append(interval_data)
 
-
 def user_simulation(params, headers):
-    """Simula o ciclo de vida de um usuário: N requisições com um intervalo entre elas."""
     for _ in range(params.get("reqs_per_user", 1)):
         with state_lock:
             if test_state["status"] not in ["ramping", "running"]:
@@ -75,9 +64,7 @@ def user_simulation(params, headers):
         except (ValueError, KeyError):
             time.sleep(0)
 
-
 def worker(url, method, headers, body):
-    """Executa uma única requisição HTTP e cronometra o tempo de resposta."""
     start_time = time.time()
     result = {"status_code": None, "duration": 0, "error": None}
     try:
@@ -91,9 +78,7 @@ def worker(url, method, headers, body):
     result["duration"] = time.time() - start_time
     return result
 
-
 def run_load_test(params):
-    """Orquestra o teste de carga: gerencia o ramp-up e inicia as threads dos usuários."""
     threads = []
     start_time = time.time()
     with state_lock:
@@ -102,13 +87,11 @@ def run_load_test(params):
         headers = {k.strip(): v.strip() for line in params.get("headers", "").strip().split("\n") if ":" in line for k, v in [line.split(":", 1)]}
     except Exception:
         headers = {}
-
     with state_lock:
         test_state["status"] = "ramping"
     users_to_start = params.get("users", 1)
     ramp_up_duration = params.get("ramp_up", 0)
     ramp_up_interval = ramp_up_duration / users_to_start if ramp_up_duration > 0 and users_to_start > 0 else 0
-
     for _ in range(users_to_start):
         with state_lock:
             if test_state["status"] not in ["ramping", "running"]:
@@ -117,68 +100,49 @@ def run_load_test(params):
         threads.append(thread)
         thread.start()
         time.sleep(ramp_up_interval)
-
     with state_lock:
         if test_state["status"] == "ramping":
             test_state["status"] = "running"
-
     for thread in threads:
         thread.join()
-
     duration = time.time() - start_time
     with state_lock:
         test_state["summary"] = calculate_summary(test_state["results"], duration)
         test_state["status"] = "finished"
 
 def categorize_result(status_code):
-    """Categoriza um status_code na nossa classificação para os gráficos."""
-    if status_code is None:
-        return 'network_error'
-    if 200 <= status_code < 300:
-        return 'success'
-    if status_code == 429:
-        return 'rate_limit'
-    if 400 <= status_code < 500:
-        return 'client_error'
-    if 500 <= status_code < 600:
-        return 'server_error'
+    if status_code is None: return 'network_error'
+    if 200 <= status_code < 300: return 'success'
+    if status_code == 429: return 'rate_limit'
+    if 400 <= status_code < 500: return 'client_error'
+    if 500 <= status_code < 600: return 'server_error'
     return 'other_error'
 
-
 def calculate_summary(results, duration):
-    """Calcula as estatísticas finais do teste a partir da lista de resultados."""
     total_reqs = len(results)
-    if total_reqs == 0:
-        return {}
-
+    if total_reqs == 0: return {}
     categorized_counts = Counter(categorize_result(r['status_code']) for r in results)
     success_times = [r["duration"] for r in results if categorize_result(r['status_code']) == 'success']
-    
     summary = {
         "total_duration": f"{duration:.2f}",
         "total_requests": total_reqs,
         "rps": f"{total_reqs / duration:.2f}" if duration > 0 else "0.00",
         "categorized_distribution": {
-            "success": categorized_counts.get('success', 0),
-            "rate_limit": categorized_counts.get('rate_limit', 0),
-            "client_error": categorized_counts.get('client_error', 0),
-            "server_error": categorized_counts.get('server_error', 0),
+            "success": categorized_counts.get('success', 0), "rate_limit": categorized_counts.get('rate_limit', 0),
+            "client_error": categorized_counts.get('client_error', 0), "server_error": categorized_counts.get('server_error', 0),
             "network_error": categorized_counts.get('network_error', 0),
         }
     }
-
     if success_times:
         success_times.sort()
         summary.update({
-            "avg_response_time": f"{sum(success_times) / len(success_times):.4f}",
-            "min_response_time": f"{min(success_times):.4f}", "max_response_time": f"{max(success_times):.4f}",
-            "p50_median": f"{success_times[int(len(success_times) * 0.50)]:.4f}",
-            "p95": f"{success_times[int(len(success_times) * 0.95)]:.4f}",
-            "p99": f"{success_times[int(len(success_times) * 0.99)]:.4f}",
+            "avg_response_time": f"{sum(success_times) / len(success_times):.4f}", "min_response_time": f"{min(success_times):.4f}",
+            "max_response_time": f"{max(success_times):.4f}", "p50_median": f"{success_times[int(len(success_times) * 0.50)]:.4f}",
+            "p95": f"{success_times[int(len(success_times) * 0.95)]:.4f}", "p99": f"{success_times[int(len(success_times) * 0.99)]:.4f}",
         })
     return summary
 
-# --- 2. ROTAS FLASK (ENDPOINTS DA API) ---
+# --- 2. ROTAS FLASK (Sem alterações) ---
 
 @app.route('/')
 def index():
@@ -199,13 +163,8 @@ def start_test():
             try:
                 if '.' in value: params[key] = float(value)
                 else: params[key] = int(value)
-            except (ValueError, TypeError):
-                params[key] = value
-        
-        test_state.update({
-            "params": params, "status": "idle", "results": [], "summary": {}, 
-            "live_stats": {"total": 0}, "time_series_data": []
-        })
+            except (ValueError, TypeError): params[key] = value
+        test_state.update({"params": params, "status": "idle", "results": [], "summary": {}, "live_stats": {"total": 0}, "time_series_data": []})
         threading.Thread(target=run_load_test, args=(test_state["params"],)).start()
     return flask.redirect(flask.url_for('index'))
 
@@ -223,17 +182,12 @@ def get_status():
         live_stats = {}
         if total_reqs > 0 and 'start_time' in test_state:
             categorized_counts = Counter(categorize_result(r['status_code']) for r in test_state["results"])
-            live_stats = {
-                "success": categorized_counts.get('success', 0),
-                "errors": total_reqs - categorized_counts.get('success', 0),
-                "total": total_reqs
-            }
+            live_stats = {"success": categorized_counts.get('success', 0), "errors": total_reqs - categorized_counts.get('success', 0), "total": total_reqs}
         test_state["live_stats"] = live_stats
         return flask.jsonify(test_state)
 
-
 # --- 3. TEMPLATE HTML (INTERFACE) ---
-# ### MODIFICADO ### - HTML_TEMPLATE com legenda customizada e novo layout de gráficos
+# ### MODIFICADO ### - Estrutura HTML e CSS completamente refeita para o layout de duas colunas
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-br">
@@ -242,90 +196,128 @@ HTML_TEMPLATE = """
     <title>Ferramenta de Teste de Carga</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 900px; margin: auto; padding: 20px; background-color: #f8f9fa; color: #343a40; }
-        .container { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
-        h1, h2, h3 { color: #003049; }
-        h3 { margin-top: 25px; text-align: center;}
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; background-color: #f8f9fa; color: #343a40; }
+        
+        /* ### NOVO ### - Layout principal de duas colunas */
+        .main-layout {
+            display: grid;
+            grid-template-columns: 450px 1fr; /* Coluna esquerda fixa, direita flexível */
+            min-height: 100vh;
+        }
+        .left-column {
+            padding: 20px;
+            background-color: #fff;
+            border-right: 1px solid #dee2e6;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .right-column {
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .container { background: white; padding: 25px; border-radius: 8px; border: 1px solid #e9ecef; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        h1, h2, h3 { color: #003049; margin-top: 0; }
+        h3 { margin-bottom: 20px; text-align: center; }
+        
         label { display: block; margin-bottom: 5px; font-weight: 600; }
-        input, select, textarea { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ced4da; border-radius: 4px; box-sizing: border-box; }
-        textarea { font-family: monospace; height: 100px; }
-        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
-        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+        input, select, textarea { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ced4da; border-radius: 4px; }
+        textarea { font-family: monospace; height: 80px; }
+        .grid-3, .grid-2 { display: grid; gap: 15px; }
+        .grid-3 { grid-template-columns: repeat(3, 1fr); }
+        .grid-2 { grid-template-columns: repeat(2, 1fr); }
+
         .btn { padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; color: white; font-size: 16px; font-weight: bold; margin-right: 10px; }
         .btn-start { background-color: #007bff; } .btn-stop { background-color: #dc3545; }
         .btn-chart { background-color: #17a2b8; }
         .btn:disabled { background-color: #6c757d; cursor: not-allowed; }
+        
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #dee2e6; }
-        .live-stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; }
-        .stat-box { padding: 15px; border-radius: 5px; text-align: center; }
-        .stat-success { background-color: #d4edda; color: #155724; }
-        .stat-error { background-color: #f8d7da; color: #721c24; }
-        #charts-container { padding-top: 20px; }
-        /* ### NOVO ### - Estilos para a legenda customizada */
+        
         #summary-legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 15px; margin-bottom: 20px; }
         .legend-item { display: flex; align-items: center; font-size: 14px; }
         .legend-color-box { width: 15px; height: 15px; margin-right: 8px; border-radius: 3px; }
-        .chart-wrapper { position: relative; height: 350px; margin: auto; }
+        .chart-wrapper { position: relative; height: 350px; width: 100%; margin: auto; }
     </style>
 </head>
 <body>
-    <h1>Ferramenta de Teste de Carga</h1>
-    <div class="container">
-        <h2>Configuração do Teste</h2>
-        <form id="test-form" action="/start_test" method="post">
-            <label for="url">URL de Destino</label>
-            <input type="text" id="url" name="url" value="https://api.github.com/events" required>
-            <div class="grid-3">
-                <div><label for="users">Usuários Virtuais</label><input type="number" id="users" name="users" value="10" min="1" required></div>
-                <div><label for="reqs_per_user">Requisições por Usuário</label><input type="number" id="reqs_per_user" name="reqs_per_user" value="5" min="1" required></div>
-                <div><label for="ramp_up">Ramp-up (s)</label><input type="number" id="ramp_up" name="ramp_up" value="5" min="0" required></div>
+    <!-- ### NOVO ### - Estrutura principal com as duas colunas -->
+    <div class="main-layout">
+        <!-- Coluna Esquerda: Controles e Resumo Final -->
+        <div class="left-column">
+            <h1>Ferramenta de Teste de Carga</h1>
+            <div class="container">
+                <h2>Configuração</h2>
+                <form id="test-form" action="/start_test" method="post">
+                    <label for="url">URL de Destino</label>
+                    <input type="text" id="url" name="url" value="https://api.github.com/events" required>
+                    <div class="grid-3">
+                        <div><label for="users">Usuários</label><input type="number" id="users" name="users" value="10" min="1" required></div>
+                        <div><label>Reqs/Usuário</label><input type="number" id="reqs_per_user" name="reqs_per_user" value="5" min="1" required></div>
+                        <div><label>Ramp-up (s)</label><input type="number" id="ramp_up" name="ramp_up" value="5" min="0" required></div>
+                    </div>
+                    <label for="delay_type">Tipo de Intervalo</label><select id="delay_type" name="delay_type"><option value="constant">Constante</option><option value="variable">Variável</option></select>
+                    <div id="constant-delay-div"><label for="delay_constant">Intervalo (s)</label><input type="number" id="delay_constant" name="delay_constant" value="1" min="0" step="0.1"></div>
+                    <div id="variable-delay-div" style="display:none;"><div class="grid-2"><div><label>Min (s)</label><input type="number" name="delay_min" value="0.5"></div><div><label>Max (s)</label><input type="number" name="delay_max" value="2.0"></div></div></div>
+                    <label for="method">Método HTTP</label><select id="method" name="method"><option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option></select>
+                    <div id="post-put-options" style="display:none;"><label>Cabeçalhos</label><textarea name="headers" placeholder="Content-Type: application/json"></textarea><label>Corpo (JSON)</label><textarea name="body" placeholder='{"key": "value"}'></textarea></div>
+                    <button id="start-btn" type="submit" class="btn btn-start">Iniciar Teste</button>
+                    <button id="stop-btn" type="button" class="btn btn-stop" style="display:none;">Parar Teste</button>
+                    <button id="toggle-charts-btn" type="button" class="btn btn-chart" style="display:none;">Ocultar Gráficos</button>
+                </form>
             </div>
-            <label for="delay_type">Tipo de Intervalo</label><select id="delay_type" name="delay_type"><option value="constant">Constante</option><option value="variable">Variável</option></select>
-            <div id="constant-delay-div"><label for="delay_constant">Intervalo (s)</label><input type="number" id="delay_constant" name="delay_constant" value="1" min="0" step="0.1"></div>
-            <div id="variable-delay-div" style="display:none;"><div class="grid-2" style="gap:10px;"><div><label>Min (s)</label><input type="number" name="delay_min" value="0.5"></div><div><label>Max (s)</label><input type="number" name="delay_max" value="2.0"></div></div></div>
-            <label for="method">Método HTTP</label><select id="method" name="method"><option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option></select>
-            <div id="post-put-options" style="display:none;"><label>Cabeçalhos</label><textarea name="headers" placeholder="Content-Type: application/json"></textarea><label>Corpo (JSON)</label><textarea name="body" placeholder='{"key": "value"}'></textarea></div>
-            <button id="start-btn" type="submit" class="btn btn-start">Iniciar Teste</button>
-            <button id="stop-btn" type="button" class="btn btn-stop" style="display:none;">Parar Teste</button>
-            <button id="toggle-charts-btn" type="button" class="btn btn-chart" style="display:none;">Exibir Gráficos</button>
-        </form>
-    </div>
-    <div id="results-container" class="container" style="display:none;">
-        <h2>Resultados em Tempo Real</h2>
-        <p><strong>Status:</strong> <span id="status-text"></span> | <strong>Progresso:</strong> <span id="progress-text">0 / 0</span></p>
-        <div class="live-stats-grid">
-            <div class="stat-box stat-success"><strong>Sucessos:</strong> <span id="live-success-count">0</span></div>
-            <div class="stat-box stat-error"><strong>Erros:</strong> <span id="live-error-count">0</span></div>
+            <div id="summary-container" class="container" style="display:none;">
+                <h2>Resumo Final do Teste</h2>
+                <table id="summary-table"></table>
+            </div>
+        </div>
+
+        <!-- Coluna Direita: Status em Tempo Real e Gráficos -->
+        <div class="right-column">
+            <div id="results-container" class="container" style="display:none;">
+                <h2>Resultados em Tempo Real</h2>
+                <p><strong>Status:</strong> <span id="status-text"></span> | <strong>Progresso:</strong> <span id="progress-text">0 / 0</span></p>
+                <div class="grid-2">
+                    <div style="background-color: #d4edda; color: #155724; padding: 15px; border-radius: 5px; text-align: center;"><strong>Sucessos:</strong> <span id="live-success-count">0</span></div>
+                    <div style="background-color: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px; text-align: center;"><strong>Erros:</strong> <span id="live-error-count">0</span></div>
+                </div>
+            </div>
+            
+            <div id="charts-container" class="container" style="display:none;">
+                <h2>Gráficos de Performance</h2>
+                <!-- Gráfico 1: Distribuição -->
+                <div class="chart-section">
+                    <h3>Distribuição de Respostas (Final)</h3>
+                    <div id="summary-legend">
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span>
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span>
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span>
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span>
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span>
+                    </div>
+                    <div class="chart-wrapper"><canvas id="summary-chart"></canvas></div>
+                </div>
+                <!-- Gráfico 2: RPS -->
+                <div class="chart-section">
+                    <h3>Requisições por Segundo (RPS)</h3>
+                    <div class="chart-wrapper"><canvas id="rps-chart"></canvas></div>
+                </div>
+                <!-- Gráfico 3: Tempo de Resposta -->
+                <div class="chart-section">
+                     <h3>Tempo de Resposta Médio (Sucessos)</h3>
+                     <div class="chart-wrapper"><canvas id="response-time-chart"></canvas></div>
+                </div>
+            </div>
         </div>
     </div>
-    <!-- ### MODIFICADO ### - Novo layout do container de gráficos -->
-    <div id="charts-container" class="container" style="display:none;">
-        <h2>Gráficos de Performance</h2>
-        <div>
-             <h3>Distribuição de Respostas (Final)</h3>
-             <!-- ### NOVO ### - Legenda HTML customizada -->
-             <div id="summary-legend">
-                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span>
-                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span>
-                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span>
-                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span>
-                <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span>
-             </div>
-             <div class="chart-wrapper">
-                <canvas id="summary-chart"></canvas>
-             </div>
-        </div>
-        <div class="grid-2" style="margin-top: 30px;">
-             <div><h3>Requisições por Segundo (RPS)</h3><canvas id="rps-chart"></canvas></div>
-             <div><h3>Tempo de Resposta Médio (s)</h3><canvas id="response-time-chart"></canvas></div>
-        </div>
-    </div>
-    <div id="summary-container" class="container" style="display:none;">
-        <h2>Resumo Final do Teste</h2>
-        <table id="summary-table"></table>
-    </div>
+
 <script>
+    // ### JAVASCRIPT (Sem alterações na lógica, apenas gerencia a visibilidade dos novos containers) ###
     const startBtn = document.getElementById('start-btn'), stopBtn = document.getElementById('stop-btn'), toggleChartsBtn = document.getElementById('toggle-charts-btn'), testForm = document.getElementById('test-form');
     const resultsContainer = document.getElementById('results-container'), summaryContainer = document.getElementById('summary-container'), chartsContainer = document.getElementById('charts-container');
     const statusText = document.getElementById('status-text'), progressText = document.getElementById('progress-text');
@@ -358,9 +350,10 @@ HTML_TEMPLATE = """
     });
     
     function startMonitoring() {
-        startBtn.disabled = true; stopBtn.style.display = 'inline-block'; toggleChartsBtn.style.display = 'inline-block';
-        resultsContainer.style.display = 'block'; summaryContainer.style.display = 'none';
-        chartsContainer.style.display = 'none'; toggleChartsBtn.textContent = 'Exibir Gráficos';
+        startBtn.disabled = true; stopBtn.style.display = 'inline-block'; toggleChartsBtn.style.display = 'none';
+        resultsContainer.style.display = 'block'; 
+        summaryContainer.style.display = 'none';
+        chartsContainer.style.display = 'none'; 
         summaryTable.innerHTML = '';
         initializeCharts();
         statusInterval = setInterval(updateStatus, 5000);
@@ -371,38 +364,22 @@ HTML_TEMPLATE = """
         if(rpsChart) rpsChart.destroy();
         if(responseTimeChart) responseTimeChart.destroy();
 
-        // ### MODIFICADO ### - Configuração do gráfico de resumo para usar legenda customizada
         summaryChart = new Chart(document.getElementById('summary-chart'), {
             type: 'doughnut',
-            data: {
-                labels: Object.values(chartConfigs.labels),
-                datasets: [{
-                    data: [0, 0, 0, 0, 0],
-                    backgroundColor: Object.values(chartConfigs.colors),
-                    borderWidth: 0
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false, // Permite que o gráfico preencha o contêiner
-                plugins: {
-                    legend: {
-                        display: false // Oculta a legenda padrão
-                    }
-                }
-            }
+            data: { labels: Object.values(chartConfigs.labels), datasets: [{ data: [0, 0, 0, 0, 0], backgroundColor: Object.values(chartConfigs.colors), borderWidth: 0 }] },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
         });
 
         rpsChart = new Chart(document.getElementById('rps-chart'), {
             type: 'line',
             data: { labels: [], datasets: [{ label: 'RPS', data: [], borderColor: '#007bff', tension: 0.1, fill: false }] },
-            options: { scales: { y: { beginAtZero: true, title: { display: true, text: 'Reqs/seg' } }, x: { title: { display: true, text: 'Tempo' } } }, animation: false }
+            options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, title: { display: true, text: 'Reqs/seg' } } }, animation: false }
         });
 
         responseTimeChart = new Chart(document.getElementById('response-time-chart'), {
             type: 'line',
             data: { labels: [], datasets: [{ label: 'Tempo Médio (s)', data: [], borderColor: '#28a745', tension: 0.1, fill: false }] },
-            options: { scales: { y: { beginAtZero: true, title: { display: true, text: 'Segundos' } }, x: { title: { display: true, text: 'Tempo' } } }, animation: false }
+            options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, title: { display: true, text: 'Segundos' } } }, animation: false }
         });
     }
 
@@ -427,6 +404,7 @@ HTML_TEMPLATE = """
             if (data.status === 'finished') {
                 clearInterval(statusInterval);
                 startBtn.disabled = false; stopBtn.style.display = 'none';
+                toggleChartsBtn.style.display = 'inline-block';
                 displaySummary(data.summary);
             }
         });
@@ -438,7 +416,6 @@ HTML_TEMPLATE = """
         if (!summary || Object.keys(summary).length === 0) {
             summaryTable.innerHTML = '<tr><td>Nenhum resultado para exibir.</td></tr>'; return;
         }
-
         let html = `
             <tr><td>Duração Total</td><td>${summary.total_duration}s</td></tr>
             <tr><td>Total de Requisições</td><td>${summary.total_requests}</td></tr>
@@ -448,8 +425,7 @@ HTML_TEMPLATE = """
             <tr><td>Tempo Mínimo</td><td>${summary.min_response_time || 'N/A'}s</td></tr>
             <tr><td>Tempo Máximo</td><td>${summary.max_response_time || 'N/A'}s</td></tr>
             <tr><td>Mediana (p50)</td><td>${summary.p50_median || 'N/A'}s</td></tr>
-            <tr><td>Percentil 95 (p95)</td><td>${summary.p95 || 'N/A'}s</td></tr>
-        `;
+            <tr><td>Percentil 95 (p95)</td><td>${summary.p95 || 'N/A'}s</td></tr>`;
         summaryTable.innerHTML = html;
 
         if (summary.categorized_distribution) {
@@ -465,7 +441,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- 4. BLOCO DE EXECUÇÃO PRINCIPAL ---
+# --- 4. BLOCO DE EXECUÇÃO PRINCIPAL (Sem alterações) ---
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--host', default='127.0.0.1', help='Host a ser vinculado (ex: 0.0.0.0)')
