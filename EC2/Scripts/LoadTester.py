@@ -1,4 +1,4 @@
-#2.0.4
+#2.0.5
 import flask
 import requests
 import threading
@@ -8,15 +8,13 @@ import random
 from collections import Counter
 from argparse import ArgumentParser
 
-# --- 1. LÓGICA DA APLICAÇÃO ---
+# --- 1. LÓGICA DA APLICAÇÃO (Sem alterações) ---
 app = flask.Flask(__name__)
 
 test_state = { "status": "idle", "params": {}, "live_stats": {"total": 0}, "results": [], "summary": {}, "time_series_data": [] }
 state_lock = threading.Lock()
 
-# ### MODIFICADO ### - data_aggregator agora calcula taxas por categoria
 def data_aggregator():
-    """ Agrega os resultados a cada 10 segundos, calculando taxas por categoria. """
     last_processed_index = 0
     while True:
         time.sleep(10)
@@ -25,33 +23,18 @@ def data_aggregator():
                 last_processed_index = 0
                 test_state["time_series_data"] = []
                 continue
-
             current_results_count = len(test_state["results"])
             new_results = test_state["results"][last_processed_index:]
             last_processed_index = current_results_count
-
             if not new_results:
                 continue
-
-            interval_duration = 10.0  # Usar float para a divisão
+            interval_duration = 10.0
             interval_counts = Counter(categorize_result(r['status_code']) for r in new_results)
-            
-            # Calcula a taxa (reqs/seg) para cada categoria
-            rates = {
-                category: f"{interval_counts.get(category, 0) / interval_duration:.2f}"
-                for category in ['success', 'rate_limit', 'client_error', 'server_error', 'network_error']
-            }
-            
+            rates = { category: f"{interval_counts.get(category, 0) / interval_duration:.2f}" for category in ['success', 'rate_limit', 'client_error', 'server_error', 'network_error'] }
             success_times = [r["duration"] for r in new_results if categorize_result(r['status_code']) == 'success']
             avg_response_time = sum(success_times) / len(success_times) if success_times else 0
-
-            interval_data = {
-                "timestamp": time.strftime('%H:%M:%S'),
-                "rates": rates,  # Envia as taxas categorizadas
-                "avg_response_time": f"{avg_response_time:.4f}",
-            }
+            interval_data = { "timestamp": time.strftime('%H:%M:%S'), "rates": rates, "avg_response_time": f"{avg_response_time:.4f}", }
             test_state["time_series_data"].append(interval_data)
-
 
 def user_simulation(params, headers):
     for _ in range(params.get("reqs_per_user", 1)):
@@ -65,7 +48,6 @@ def user_simulation(params, headers):
             time.sleep(delay)
         except (ValueError, KeyError): time.sleep(0)
 
-
 def worker(url, method, headers, body):
     start_time = time.time()
     result = {"status_code": None, "duration": 0, "error": None}
@@ -77,7 +59,6 @@ def worker(url, method, headers, body):
     except json.JSONDecodeError as e: result["error"] = f"JSON Body Error: {e}"
     result["duration"] = time.time() - start_time
     return result
-
 
 def run_load_test(params):
     threads = []
@@ -101,7 +82,6 @@ def run_load_test(params):
     with state_lock:
         test_state["summary"] = calculate_summary(test_state["results"], duration); test_state["status"] = "finished"
 
-
 def categorize_result(status_code):
     if status_code is None: return 'network_error'
     if 200 <= status_code < 300: return 'success'
@@ -109,7 +89,6 @@ def categorize_result(status_code):
     if 400 <= status_code < 500: return 'client_error'
     if 500 <= status_code < 600: return 'server_error'
     return 'other_error'
-
 
 def calculate_summary(results, duration):
     total_reqs = len(results)
@@ -220,9 +199,26 @@ HTML_TEMPLATE = """
             </div>
             <div id="charts-container" class="container" style="display:none;">
                 <h2>Gráficos de Performance</h2>
-                <div class="chart-section"><h3 style="margin-bottom: 5px;">Distribuição de Respostas (Final)</h3><div id="summary-legend"><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span><span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span></div><div class="chart-wrapper"><canvas id="summary-chart"></canvas></div></div>
-                <div class="chart-section"><h3>Requisições por Segundo (RPS)</h3><div class="chart-wrapper"><canvas id="rps-chart"></canvas></div></div>
-                <div class="chart-section"><h3>Tempo de Resposta Médio (Sucessos)</h3><div class="chart-wrapper"><canvas id="response-time-chart"></canvas></div></div>
+                <!-- ### MODIFICADO ### - A ordem dos gráficos foi alterada. RPS vem primeiro. -->
+                <div class="chart-section">
+                    <h3>Requisições por Segundo (RPS)</h3>
+                    <div class="chart-wrapper"><canvas id="rps-chart"></canvas></div>
+                </div>
+                <div class="chart-section">
+                    <h3>Tempo de Resposta Médio (Sucessos)</h3>
+                    <div class="chart-wrapper"><canvas id="response-time-chart"></canvas></div>
+                </div>
+                <div class="chart-section">
+                    <h3 style="margin-bottom: 5px;">Distribuição de Respostas (Final)</h3>
+                    <div id="summary-legend">
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(40, 167, 69, 0.8);"></div>Sucesso (2xx)</span>
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 92, 231, 0.8);"></div>Rate Limit (429)</span>
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(255, 193, 7, 0.8);"></div>Erro Cliente (4xx)</span>
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(220, 53, 69, 0.8);"></div>Erro Servidor (5xx)</span>
+                        <span class="legend-item"><div class="legend-color-box" style="background-color: rgba(108, 117, 125, 0.8);"></div>Erro Rede/Timeout</span>
+                    </div>
+                    <div class="chart-wrapper"><canvas id="summary-chart"></canvas></div>
+                </div>
             </div>
         </div>
     </div>
@@ -257,14 +253,9 @@ HTML_TEMPLATE = """
 
         summaryChart = new Chart(document.getElementById('summary-chart'), { type: 'doughnut', data: { labels: Object.values(chartConfigs.labels), datasets: [{ data: [], backgroundColor: Object.values(chartConfigs.colors), borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } } });
         
-        // ### MODIFICADO ### - Inicializa o gráfico de RPS com múltiplos datasets (um para cada categoria)
         const rpsDatasets = chartConfigs.keys.map(key => ({
-            label: chartConfigs.labels[key],
-            data: [],
-            backgroundColor: chartConfigs.colors[key],
-            borderColor: chartConfigs.colors[key],
-            fill: true,
-            key: key // Chave para facilitar a busca de dados
+            label: chartConfigs.labels[key], data: [], backgroundColor: chartConfigs.colors[key],
+            borderColor: chartConfigs.colors[key], fill: true, key: key
         }));
         rpsChart = new Chart(document.getElementById('rps-chart'), {
             type: 'line', data: { labels: [], datasets: rpsDatasets },
@@ -287,8 +278,6 @@ HTML_TEMPLATE = """
 
             if (data.time_series_data) {
                 const labels = data.time_series_data.map(d => d.timestamp);
-                
-                // ### MODIFICADO ### - Atualiza cada dataset do gráfico de RPS
                 rpsChart.data.labels = labels;
                 rpsChart.data.datasets.forEach(dataset => {
                     dataset.data = data.time_series_data.map(d => d.rates[dataset.key] || 0);
