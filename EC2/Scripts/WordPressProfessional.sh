@@ -3,6 +3,7 @@
 # Versão: 2.3.4-zero-touch-s3-python-watchdog-phpfix-pyvars (Python Vars no Systemd)
 # Modificado para hardcodar comportamento de sync e placeholder no Python
 # Modificado para instalação explícita de pip packages para /usr/bin/python3
+# Modificado para incluir otimização de performance para Apache e PHP-FPM
 
 # --- Configurações Chave ---
 readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.3.4.sh" # Atualizar versão
@@ -224,6 +225,51 @@ EOF_PY_SYSTEMD_SERVICE
     fi
 }
 
+# --- INÍCIO DA NOVA FUNÇÃO ---
+# --- Função para Otimizar Apache MPM e PHP-FPM para Alta Concorrência ---
+tune_apache_and_phpfpm() {
+    echo "INFO (Performance Tuning): Otimizando Apache (MPM Event) e PHP-FPM para alta concorrência..."
+
+    # 1. Configuração do Apache MPM Event
+    # Criamos um arquivo de configuração separado para não alterar os padrões do sistema.
+    # Estes valores são um bom ponto de partida para uma instância com ~2-4 vCPUs e ~4-8GB RAM.
+    # MaxRequestWorkers = ServerLimit * ThreadsPerChild.
+    # Ex: 16 * 25 = 400 workers simultâneos. Ajuste conforme a memória e CPU da instância.
+    local APACHE_MPM_TUNING_CONF="/etc/httpd/conf.d/mpm_tuning.conf"
+    echo "INFO (Performance Tuning): Criando arquivo de configuração do Apache em '$APACHE_MPM_TUNING_CONF'..."
+    sudo tee "$APACHE_MPM_TUNING_CONF" >/dev/null <<EOF_APACHE_MPM
+# Configurações de performance para o MPM Event - Gerado por wordpress_setup_v2.3.4.sh
+# Habilita o MPM Event, que é ideal para alta concorrência quando se usa PHP-FPM.
+<IfModule mpm_event_module>
+    StartServers             3
+    MinSpareThreads          25
+    MaxSpareThreads          75
+    ThreadsPerChild          25
+    ServerLimit              16
+    MaxRequestWorkers        400
+    MaxConnectionsPerChild   1000
+</IfModule>
+EOF_APACHE_MPM
+
+    # 2. Configuração do Pool do PHP-FPM
+    # O arquivo www.conf controla o pool de processos padrão do PHP.
+    local PHP_FPM_POOL_CONF="/etc/php-fpm.d/www.conf"
+    if [ -f "$PHP_FPM_POOL_CONF" ]; then
+        echo "INFO (Performance Tuning): Ajustando pool do PHP-FPM em '$PHP_FPM_POOL_CONF'..."
+        # Aumenta o número de processos filhos que o PHP-FPM pode criar.
+        # pm.max_children é o mais importante. Cada processo consome memória (~30-60MB).
+        # Um valor de 50 é um bom começo para uma instância com ~4GB de RAM. Monitore o uso de memória!
+        sudo sed -i 's/^pm.max_children = .*/pm.max_children = 50/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.start_servers = .*/pm.start_servers = 10/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.min_spare_servers = .*/pm.min_spare_servers = 10/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.max_spare_servers = .*/pm.max_spare_servers = 30/' "$PHP_FPM_POOL_CONF"
+        echo "INFO (Performance Tuning): Pool do PHP-FPM ajustado."
+    else
+        echo "AVISO (Performance Tuning): Arquivo de pool do PHP-FPM '$PHP_FPM_POOL_CONF' não encontrado. Pulando otimização."
+    fi
+}
+# --- FIM DA NOVA FUNÇÃO ---
+
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
@@ -378,6 +424,11 @@ else
     if ! grep -q "SetEnvIf X-Forwarded-Proto" "$HTTPD_WP_CONF"; then echo -e "\n<IfModule mod_setenvif.c>\n  SetEnvIf X-Forwarded-Proto \"^https\$\" HTTPS=on\n</IfModule>" | sudo tee -a "$HTTPD_WP_CONF" > /dev/null; echo "INFO: SetEnvIf X-Forwarded-Proto adicionado a $HTTPD_WP_CONF."; fi
 fi
 echo "INFO: Configuração Apache em $HTTPD_WP_CONF verificada/criada."
+
+### INÍCIO DA SEÇÃO DE OTIMIZAÇÃO DE PERFORMANCE ###
+# Otimiza as configurações do Apache e PHP-FPM para alta concorrência
+tune_apache_and_phpfpm
+### FIM DA SEÇÃO DE OTIMIZAÇÃO DE PERFORMANCE ###
 
 # --- Detecção e Inicialização de PHP-FPM e HTTPD ---
 PHP_FPM_SERVICE_NAME=""
