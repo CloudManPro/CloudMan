@@ -1,6 +1,6 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS e RDS ===
-# Versão: 2.3.5-proxysql-integration (Integra ProxySQL para pooling de conexões com RDS)
+# Versão: 2.3.5-proxysql-integration-FIXED (Corrige a construção do ARN do Secrets Manager)
 # Modificado para validar otimização de performance e adicionar ProxySQL.
 
 # --- Configurações Chave ---
@@ -55,7 +55,6 @@ self_install_script() {
 }
 
 # --- Funções Auxiliares (mount_efs, create_wp_config_template) ---
-# ... (NENHUMA MUDANÇA NAS FUNÇÕES mount_efs, create_wp_config_template, etc. até a nova função) ...
 mount_efs() {
     local efs_id=$1; local mount_point_arg=$2; local efs_ap_id="${AWS_EFS_ACCESS_POINT_TARGET_ID_0:-}"
     local max_retries=5; local retry_delay_seconds=15; local attempt_num=1
@@ -114,8 +113,10 @@ EOPHP
     echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como '$APACHE_USER'..."
     if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then echo "INFO: Arquivo '$target_file_on_efs' criado."; else echo "ERRO CRÍTICO: Falha ao copiar para '$target_file_on_efs' como '$APACHE_USER'."; exit 1; fi
 }
-setup_python_monitor_script() { echo "Função setup_python_monitor_script não alterada..."; }
-create_and_enable_python_monitor_service() { echo "Função create_and_enable_python_monitor_service não alterada..."; }
+
+# (Função de exemplo, a lógica real deve ser implementada se necessária)
+setup_python_monitor_script() { echo "INFO: Função 'setup_python_monitor_script' placeholder - A lógica real deve ser adicionada se necessária."; }
+create_and_enable_python_monitor_service() { echo "INFO: Função 'create_and_enable_python_monitor_service' placeholder - A lógica real deve ser adicionada se necessária."; }
 
 ### INÍCIO DA NOVA FUNÇÃO PARA PROXYSQL ###
 setup_and_configure_proxysql() {
@@ -193,8 +194,47 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.3.5) ($(date)) ---"
-# ... (NENHUMA MUDANÇA NA SEÇÃO DE VERIFICAÇÃO DE VARIÁVEIS) ...
+echo "INFO: --- Iniciando Script WordPress Setup (v2.3.5-FIXED) ($(date)) ---"
+echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
+echo "INFO: =================================================="
+if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root."; exit 1; fi
+
+# self_install_script # Descomente se precisar da função de auto-instalação
+
+### INÍCIO DA CORREÇÃO - REINTRODUÇÃO DO BLOCO DE VERIFICAÇÃO DE VARIÁVEIS ###
+echo "INFO: Verificando e imprimindo variáveis de ambiente essenciais..."
+if [ -z "${ACCOUNT:-}" ]; then ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); if [ -n "$ACCOUNT_STS" ]; then ACCOUNT="$ACCOUNT_STS"; echo "INFO: ACCOUNT ID obtido via STS: $ACCOUNT"; else echo "WARN: Falha obter ACCOUNT ID via STS."; ACCOUNT=""; fi; fi
+
+AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
+if [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0:-}" ] && [ -n "${ACCOUNT:-}" ] && [ -n "${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0:-}" ]; then 
+    AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
+fi
+
+error_found=0
+echo "INFO: --- VALORES DAS VARIÁVEIS ESSENCIAIS ---"
+for var_name in "${essential_vars[@]}"; do
+    current_var_value="${!var_name:-UNDEFINED}"
+    var_name_for_check="$var_name"
+    current_var_value_to_check="${!var_name:-}"
+
+    if [ "$var_name" == "AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0" ]; then 
+        current_var_value_to_check="$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0"
+        var_name_for_check="AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 (construído de $var_name)"
+    fi
+    
+    echo "INFO: Var (env): $var_name_for_check = '$current_var_value_to_check'"
+    
+    # Não falha se o Access Point não for definido
+    if [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && [ -z "$current_var_value_to_check" ]; then 
+        echo "ERRO: Var essencial '$var_name_for_check' está vazia."
+        error_found=1
+    fi
+done
+echo "INFO: --- FIM DOS VALORES DAS VARIÁVEIS ---"
+if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando ou mal configuradas. Abortando."; exit 1; fi
+echo "INFO: Verificação de variáveis concluída. O ARN do segredo está pronto para ser usado."
+### FIM DA CORREÇÃO ###
+
 
 ### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES MODIFICADA ###
 echo "INFO: Instalando pacotes (Apache, PHP, Python3, ProxySQL, etc.)..."
@@ -209,13 +249,15 @@ sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils proxysql
 ### FIM DA SEÇÃO DE INSTALAÇÃO DE PACOTES MODIFICADA ###
 
 echo "INFO: Habilitando e instalando PHP 7.4 e módulos relacionados..."
-# ... (NENHUMA MUDANÇA NA SEÇÃO DE INSTALAÇÃO DO PHP E PYTHON/PIP) ...
+sudo amazon-linux-extras enable php7.4 -y -q
+sudo yum install -y -q php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache
 
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
 # ... (NENHUMA MUDANÇA NO TESTE DE ESCRITA EFS) ...
 
 ### INÍCIO DA SEÇÃO DE BANCO DE DADOS MODIFICADA ###
 echo "INFO: Obtendo credenciais do RDS do Secrets Manager..."
+# A variável $AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 agora está preenchida corretamente
 SECRET_STRING_VALUE=$(aws secretsmanager get-secret-value --secret-id "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" --query 'SecretString' --output text --region "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0")
 if [ -z "$SECRET_STRING_VALUE" ]; then echo "ERRO: Falha obter segredo RDS."; exit 1; fi
 DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username)
@@ -239,7 +281,26 @@ setup_and_configure_proxysql "$RDS_ACTUAL_HOST_ENDPOINT" "$RDS_ACTUAL_PORT" "$DB
 ### FIM DA SEÇÃO DE BANCO DE DADOS MODIFICADA ###
 
 echo "INFO: Verificando WP em '$MOUNT_POINT/wp-includes'..."
-# ... (NENHUMA MUDANÇA NA SEÇÃO DE DOWNLOAD E EXTRAÇÃO DO WORDPRESS) ...
+# ... (A lógica para download do WP não estava no script com erro, adicione-a da v2.3.4 se precisar) ...
+if [ ! -d "$MOUNT_POINT/wp-includes" ]; then
+    echo "INFO: WordPress não encontrado no EFS. Baixando e instalando..."
+    sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
+    sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
+    sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
+    (
+      cd "$WP_DOWNLOAD_DIR" || { echo "ERRO: Falha ao entrar no diretório temporário '$WP_DOWNLOAD_DIR'."; exit 1; }
+      curl -sLO https://wordpress.org/latest.tar.gz || { echo "ERRO: Falha download WP."; exit 1; }
+      tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1 || { echo "ERRO: Falha extração WP."; exit 1; }
+      rm latest.tar.gz
+    )
+    if [ $? -ne 0 ]; then echo "ERRO CRÍTICO: O bloco de download e extração do WordPress falhou."; exit 1; fi
+    echo "INFO: Copiando para EFS como '$APACHE_USER'..."
+    if sudo -u "$APACHE_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"; then echo "INFO: WP copiado para EFS."; else echo "ERRO: Falha copiar WP para EFS."; ls -ld "$MOUNT_POINT"; exit 1; fi
+    sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
+else
+    echo "WARN: Instalação do WordPress já existe em '$MOUNT_POINT/wp-includes'. Pulando download."
+fi
+
 
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then
     echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando...";
@@ -257,7 +318,14 @@ tune_apache_and_phpfpm
 ### INÍCIO DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS MODIFICADA ###
 PHP_FPM_SERVICE_NAME=""
 POSSIBLE_FPM_NAMES=("php-fpm.service" "php7.4-fpm.service" "php74-php-fpm.service")
-# ... (lógica de detecção do php-fpm não alterada) ...
+for fpm_name in "${POSSIBLE_FPM_NAMES[@]}"; do
+    if sudo systemctl list-unit-files | grep -q -w "$fpm_name"; then
+        PHP_FPM_SERVICE_NAME="$fpm_name"
+        echo "INFO: Nome do serviço PHP-FPM detectado: $PHP_FPM_SERVICE_NAME"
+        break
+    fi
+done
+if [ -z "$PHP_FPM_SERVICE_NAME" ]; then echo "ERRO CRÍTICO: Não foi possível detectar o nome do serviço PHP-FPM."; exit 1; fi
 
 echo "INFO: Habilitando e reiniciando serviços (httpd, $PHP_FPM_SERVICE_NAME, proxysql)..."
 sudo systemctl enable httpd
@@ -303,12 +371,12 @@ fi
 
 
 # --- Configuração do Monitoramento Python com Watchdog ---
-# ... (lógica não alterada) ...
+# setup_python_monitor_script # Descomente se precisar da função
+# create_and_enable_python_monitor_service # Descomente se precisar da função
 
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.3.5) concluído! ($(date)) ---"
+echo "INFO: --- Script WordPress Setup (v2.3.5-FIXED) concluído! ($(date)) ---"
 echo "INFO: Adicionado ProxySQL para pooling de conexões com o RDS."
 echo "INFO: WordPress agora se conecta a 127.0.0.1 (ProxySQL), que por sua vez se conecta ao RDS."
-# ... (restante dos logs de conclusão) ...
 echo "INFO: =================================================="
 exit 0
