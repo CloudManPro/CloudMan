@@ -311,14 +311,11 @@ done
 if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
-### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES - SOLUÇÃO DEFINITIVA ###
+### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES - SOLUÇÃO FINAL E COMPLETA ###
 echo "INFO: Instalando pacotes base e configurando repositório funcional do ProxySQL v2.6..."
 sudo yum update -y -q
 
-# --- Configuração Definitiva do Repositório ProxySQL v2.6 ---
-# Abandonamos a versão 2.x, cujo repositório está quebrado.
-# Usamos a v2.6, que é estável e tem um repositório YUM funcional e correto para CentOS 7.
-# Hardcodamos a versão '7' para garantir compatibilidade com Amazon Linux 2.
+# --- Configuração do Repositório ProxySQL v2.6 ---
 echo "INFO: Criando arquivo de repositório para o ProxySQL v2.6..."
 sudo tee /etc/yum.repos.d/proxysql.repo > /dev/null <<'EOF'
 [proxysql]
@@ -327,26 +324,32 @@ baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.6.x/centos/7/
 gpgcheck=1
 gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-2.6.x/repo_pub_key
 EOF
-
-if [ ! -f /etc/yum.repos.d/proxysql.repo ]; then
-    echo "ERRO CRÍTICO: Falha ao criar o arquivo de repositório /etc/yum.repos.d/proxysql.repo."
-    exit 1
-fi
-echo "INFO: Arquivo de repositório do ProxySQL v2.6 criado com sucesso."
 # --- Fim da Configuração do Repositório ---
 
-echo "INFO: Limpando cache do YUM para garantir que a nova fonte seja lida."
+echo "INFO: Limpando cache do YUM."
 sudo yum clean all
 
-echo "INFO: Instalando todos os pacotes necessários, incluindo o proxysql da nova fonte funcional..."
-# Instala todos os pacotes de uma vez, agora que o repositório está correto.
+echo "INFO: Instalando todos os pacotes necessários..."
+# Instala tudo de uma vez. O 'composer' do yum é opcional, mas não atrapalha.
 sudo yum install -y httpd jq aws-cli mysql amazon-efs-utils composer xray php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache proxysql
 if [ $? -ne 0 ]; then
-    echo "ERRO CRÍTICO: Falha durante o 'yum install'. Verifique o log do yum para detalhes."
+    echo "ERRO CRÍTICO: Falha durante o 'yum install'."
     exit 1
 fi
-echo "INFO: Todos os pacotes foram instalados com sucesso."
 
+# --- Instalação Manual e Robusta do Composer ---
+# Garante que o Composer esteja no local esperado pelo resto do script (/usr/local/bin)
+echo "INFO: Garantindo a instalação do Composer em /usr/local/bin/composer..."
+# Baixa o instalador do Composer para um local temporário
+curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
+# Executa o instalador, colocando o binário em /usr/local/bin com o nome 'composer'
+sudo php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+# Remove o script de instalação
+rm /tmp/composer-setup.php
+echo "INFO: Composer instalado/atualizado com sucesso em /usr/local/bin/composer."
+# --- Fim da Instalação do Composer ---
+
+echo "INFO: Todos os pacotes e ferramentas foram instalados com sucesso."
 ### FIM DA SEÇÃO DE INSTALAÇÃO ###
 
 
