@@ -311,17 +311,48 @@ done
 if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
-### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES MODIFICADA PARA X-RAY ###
+### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES CORRIGIDA E ROBUSTA ###
 echo "INFO: Instalando pacotes (Apache, PHP, ProxySQL, Composer, X-Ray, etc.)..."
 sudo yum update -y -q
-sudo amazon-linux-extras install -y epel -q
-curl -s https://repo.proxysql.com/ProxySQL/proxysql-2.x/repo.el.7.sh | sudo bash
-echo "INFO: Instalando httpd, aws-cli, mysql, efs-utils, proxysql, composer e xray..."
-sudo yum install -y -q httpd jq aws-cli mysql amazon-efs-utils proxysql composer xray
+
+# O 'set -o pipefail' é CRÍTICO. Ele garante que se o 'curl' falhar, o script inteiro para.
+set -o pipefail
+
+echo "INFO: Adicionando repositório do ProxySQL..."
+if curl -s https://repo.proxysql.com/ProxySQL/proxysql-2.x/repo.el.7.sh | sudo bash; then
+    echo "INFO: Repositório do ProxySQL adicionado com sucesso."
+else
+    echo "ERRO CRÍTICO: Falha ao adicionar o repositório do ProxySQL. Verifique a conectividade e a URL."
+    exit 1
+fi
+
+# Desativa o pipefail após seu uso para não afetar o resto do script
+set +o pipefail
+
+# Verificação explícita se o arquivo do repositório foi criado
+if [ ! -f /etc/yum.repos.d/proxysql.repo ]; then
+    echo "ERRO CRÍTICO: O arquivo do repositório /etc/yum.repos.d/proxysql.repo não foi encontrado após a execução do script."
+    exit 1
+fi
+
+echo "INFO: Instalando httpd, aws-cli, mysql, efs-utils, composer, xray e proxysql..."
+# Instalamos todos os pacotes de uma vez. O yum falhará se algum pacote não for encontrado.
+sudo yum install -y httpd jq aws-cli mysql amazon-efs-utils composer xray proxysql
+if [ $? -ne 0 ]; then
+    echo "ERRO CRÍTICO: Falha durante o 'yum install'. Um ou mais pacotes não puderam ser instalados. Verifique o log acima."
+    exit 1
+fi
+echo "INFO: Pacotes principais instalados."
+
 echo "INFO: Habilitando e instalando PHP 7.4 e módulos..."
 sudo amazon-linux-extras enable php7.4 -y -q
 sudo yum install -y -q php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache
+
+echo "INFO: Instalando Composer globalmente..."
+# A instalação do Composer já pode vir do yum, mas garantimos a versão mais recente assim.
+# A linha abaixo pode ser redundante se o 'yum install composer' já funcionar bem.
 curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer
+
 ### FIM DA SEÇÃO DE INSTALAÇÃO DE PACOTES ###
 
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
