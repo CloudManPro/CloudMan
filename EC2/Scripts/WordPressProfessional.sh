@@ -311,28 +311,47 @@ done
 if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
-### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES - MÉTODO ROBUSTO (CORRIGIDO) ###
-echo "INFO: Instalando pacotes (Apache, PHP, etc.) e configurando repositório do ProxySQL..."
+### INÍCIO DA SEÇÃO DE INSTALAÇÃO - ESTRATÉGIA DE DOWNLOAD DIRETO (MAIS GARANTIDA) ###
+echo "INFO: Instalando pacotes base (Apache, PHP, etc.)..."
+# Instala tudo, exceto o proxysql, que será instalado manualmente via download.
 sudo yum update -y -q
-
-# --- Configuração Robusta do Repositório ProxySQL ---
-# Criamos o arquivo de repositório diretamente, "hardcodando" a versão '7'
-# para garantir compatibilidade com Amazon Linux 2 (que é baseada no CentOS 7).
-echo "INFO: Criando arquivo de repositório para o ProxySQL..."
-sudo tee /etc/yum.repos.d/proxysql.repo > /dev/null <<'EOF'
-[proxysql]
-name=ProxySQL YUM repository for v2.x on EL7
-baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.x/centos/7/
-gpgcheck=1
-gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-2.x/repo_pub_key
-EOF
-
-if [ ! -f /etc/yum.repos.d/proxysql.repo ]; then
-    echo "ERRO CRÍTICO: Falha ao criar o arquivo de repositório /etc/yum.repos.d/proxysql.repo."
+sudo yum install -y httpd jq aws-cli mysql amazon-efs-utils composer xray php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache
+if [ $? -ne 0 ]; then
+    echo "ERRO CRÍTICO: Falha ao instalar pacotes base via YUM."
     exit 1
 fi
-echo "INFO: Arquivo de repositório do ProxySQL criado com sucesso."
-# --- Fim da Configuração do Repositório ---
+echo "INFO: Pacotes base instalados com sucesso."
+
+# --- Bloco de Instalação Local do ProxySQL via Download Direto ---
+echo "INFO: Tentando instalar ProxySQL via download direto de RPM, já que o repositório YUM está instável."
+
+# Usamos a URL que foi confirmada como funcional anteriormente.
+PROXYSQL_RPM_URL="https://repo.proxysql.com/ProxySQL/proxysql-2.x/centos/7/proxysql-2.5.5-1-centos7.x86_64.rpm"
+LOCAL_RPM_PATH="/tmp/proxysql.rpm"
+
+echo "INFO: Baixando ProxySQL RPM de $PROXYSQL_RPM_URL..."
+# Usamos -L para seguir redirecionamentos e --fail para que o curl retorne um erro em caso de HTTP 4xx/5xx
+# A conectividade foi provada com o teste manual, então este passo deve funcionar.
+if curl -L --fail -o "$LOCAL_RPM_PATH" "$PROXYSQL_RPM_URL"; then
+    echo "INFO: Download do RPM bem-sucedido. Instalando localmente..."
+    
+    # O yum localinstall resolve dependências que o RPM possa ter a partir dos repositórios da Amazon.
+    sudo yum localinstall -y "$LOCAL_RPM_PATH"
+    if [ $? -ne 0 ]; then
+        echo "ERRO CRÍTICO: Falha ao instalar o RPM local do ProxySQL com 'yum localinstall'."
+        exit 1
+    fi
+    # Limpa o arquivo baixado
+    rm -f "$LOCAL_RPM_PATH"
+    echo "INFO: ProxySQL instalado com sucesso."
+else
+    # Este erro agora seria extremamente inesperado, já que provamos que o curl funciona.
+    echo "ERRO CRÍTICO: Falha ao baixar o RPM do ProxySQL. A conectividade da EC2 para este URL específico está intermitente ou bloqueada."
+    exit 1
+fi
+# --- Fim do Bloco de Instalação Local ---
+
+### FIM DA SEÇÃO DE INSTALAÇÃO ###
 
 
 echo "INFO: Limpando cache do YUM para garantir que o novo repositório seja lido."
