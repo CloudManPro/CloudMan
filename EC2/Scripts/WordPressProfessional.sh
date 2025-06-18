@@ -311,65 +311,102 @@ done
 if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
-### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES - SOLUÇÃO FINAL E COMPLETA ###
-echo "INFO: Instalando pacotes base e configurando repositório funcional do ProxySQL v2.6..."
-sudo yum update -y -q
+### INÍCIO DA FUNÇÃO DE INSTRUMENTAÇÃO DO X-RAY (OTIMIZADA E LEVE) ###
+setup_xray_instrumentation() {
+    local wp_path="$1"
+    echo "INFO (X-Ray): Iniciando instrumentação OTIMIZADA do WordPress em '$wp_path'..."
 
-# --- Configuração do Repositório ProxySQL v2.6 ---
-echo "INFO: Criando arquivo de repositório para o ProxySQL v2.6..."
-sudo tee /etc/yum.repos.d/proxysql.repo > /dev/null <<'EOF'
-[proxysql]
-name=ProxySQL YUM repository for v2.6
-baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.6.x/centos/7/
-gpgcheck=1
-gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-2.6.x/repo_pub_key
+    # 1. Instalar APENAS o pacote do AWS X-Ray via Composer
+    local composer_json_path="$wp_path/composer.json"
+    if [ ! -f "$composer_json_path" ]; then
+        echo "INFO (X-Ray): Criando '$composer_json_path' otimizado (apenas pacote aws/aws-xray)..."
+        # Esta versão é muito mais leve e rápida de instalar.
+        sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
+{
+    "require": {
+        "aws/aws-xray": "^1.0"
+    },
+    "config": {
+        "platform": {
+            "php": "7.4"
+        }
+    }
+}
 EOF
-# --- Fim da Configuração do Repositório ---
+    else
+        echo "INFO (X-Ray): '$composer_json_path' já existe. Verificando dependência."
+    fi
 
-echo "INFO: Limpando cache do YUM."
-sudo yum clean all
+    echo "INFO (X-Ray): Executando 'composer install' para instalar o pacote AWS X-Ray (com timeout desabilitado)..."
+    # Mantemos o timeout desabilitado como uma boa prática para o EFS, embora a instalação seja muito mais rápida agora.
+    (cd "$wp_path" && sudo -u "$APACHE_USER" COMPOSER_PROCESS_TIMEOUT=0 /usr/local/bin/composer install --no-dev -o)
+    if [ $? -ne 0 ]; then
+        echo "ERRO CRÍTICO (X-Ray): Falha no 'composer install'."
+        exit 1
+    fi
 
-echo "INFO: Instalando todos os pacotes necessários..."
-# Instala tudo de uma vez. O 'composer' do yum é opcional, mas não atrapalha.
-sudo yum install -y httpd jq aws-cli mysql amazon-efs-utils composer xray php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache proxysql
-if [ $? -ne 0 ]; then
-    echo "ERRO CRÍTICO: Falha durante o 'yum install'."
-    exit 1
-fi
+    # O restante da função para criar os arquivos xray-init.php e db.php permanece exatamente o mesmo,
+    # pois a classe usada (`Aws\XRay\XRayClient`) é a mesma.
+    
+    # 2. Criar o Must-Use Plugin
+    local mu_plugin_dir="$wp_path/wp-content/mu-plugins"
+    local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
+    sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
+    if [ ! -f "$xray_init_plugin_path" ]; then
+        echo "INFO (X-Ray): Criando Must-Use Plugin em '$xray_init_plugin_path'..."
+        sudo -u "$APACHE_USER" tee "$xray_init_plugin_path" > /dev/null <<'EOPHP'
+<?php
+/** Plugin Name: AWS X-Ray Tracer Initializer */
+if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'healthcheck.php') !== false) { return; }
+if (file_exists(__DIR__ . '/../../vendor/autoload.php')) {
+    require_once __DIR__ . '/../../vendor/autoload.php';
+    $xray_client = new Aws\XRay\XRayClient([
+        'version' => 'latest', 'region'  => getenv('AWS_REGION') ?: 'us-east-1',
+        'daemon_name' => '127.0.0.1:2000',
+    ]);
+    $segment_name = $_SERVER['HTTP_HOST'] ?? 'wordpress-site';
+    $xray_client->beginSegment($segment_name, null);
+    register_shutdown_function(function() use ($xray_client) {
+        $xray_client->endSegment(); $xray_client->send();
+    });
+    $GLOBALS['xray_client'] = $xray_client;
+}
+EOPHP
+    fi
 
-# --- Instalação Manual e Robusta do Composer ---
-# Garante que o Composer esteja no local esperado pelo resto do script (/usr/local/bin)
-echo "INFO: Garantindo a instalação do Composer em /usr/local/bin/composer..."
-# Baixa o instalador do Composer para um local temporário
-curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
-# Executa o instalador, colocando o binário em /usr/local/bin com o nome 'composer'
-sudo php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
-# Remove o script de instalação
-rm /tmp/composer-setup.php
-echo "INFO: Composer instalado/atualizado com sucesso em /usr/local/bin/composer."
-# --- Fim da Instalação do Composer ---
+    # 3. Criar o DB Drop-in
+    local db_dropin_path="$wp_path/wp-content/db.php"
+    if [ ! -f "$db_dropin_path" ]; then
+        echo "INFO (X-Ray): Criando DB Drop-in em '$db_dropin_path'..."
+        sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
+<?php
+/** WordPress DB Drop-in for AWS X-Ray Tracing. */
+if (file_exists(ABSPATH . WPINC . '/wp-db.php')) { require_once(ABSPATH . WPINC . '/wp-db.php'); }
+if (class_exists('wpdb')) {
+    class XRay_wpdb extends wpdb {
+        public function query($query) {
+            $xray_client = $GLOBALS['xray_client'] ?? null;
+            if (!$xray_client) { return parent::query($query); }
+            $xray_client->beginSubsegment('RDS-Query');
+            try {
+                $xray_client->addMetadata('sql', substr($query, 0, 500));
+                $result = parent::query($query);
+                if ($this->last_error) {
+                    $xray_client->addAnnotation('db_error', true);
+                    $xray_client->addMetadata('db_error_message', $this->last_error);
+                }
+                return $result;
+            } finally { $xray_client->endSubsegment(); }
+        }
+    }
+    $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
+}
+EOPHP
+    fi
 
-echo "INFO: Todos os pacotes e ferramentas foram instalados com sucesso."
-### FIM DA SEÇÃO DE INSTALAÇÃO ###
-
-
-echo "INFO: Limpando cache do YUM para garantir que o novo repositório seja lido."
-sudo yum clean all
-
-echo "INFO: Instalando httpd, aws-cli, mysql, efs-utils, composer, xray e proxysql..."
-# O yum agora usará a URL correta para encontrar o pacote 'proxysql'.
-sudo yum install -y httpd jq aws-cli mysql amazon-efs-utils composer xray proxysql
-if [ $? -ne 0 ]; then
-    echo "ERRO CRÍTICO: Falha durante o 'yum install'. Um ou mais pacotes não puderam ser instalados. Verifique o log do yum."
-    exit 1
-fi
-echo "INFO: Pacotes principais, incluindo ProxySQL, instalados com sucesso."
-
-echo "INFO: Habilitando e instalando PHP 7.4 e módulos..."
-sudo amazon-linux-extras enable php7.4 -y -q
-sudo yum install -y -q php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache
-
-### FIM DA SEÇÃO DE INSTALAÇÃO ###
+    echo "INFO (X-Ray): Instrumentação do WordPress concluída com sucesso."
+}
+### FIM DA FUNÇÃO DE INSTRUMENTAÇÃO DO X-RAY (OTIMIZADA) ###
 
 mount_efs "$AWS_EFS_FILE_SYSTEM_TARGET_ID_0" "$MOUNT_POINT"
 
