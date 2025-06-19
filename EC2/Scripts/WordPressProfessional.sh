@@ -243,6 +243,7 @@ EOF
     local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
     sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
     
+    # === CORREÇÃO 1: Corrige a chamada da API do X-Ray beginSegment ===
     if [ ! -f "$xray_init_plugin_path" ]; then
         echo "INFO (X-Ray): Criando Must-Use Plugin em '$xray_init_plugin_path'..."
         sudo -u "$APACHE_USER" tee "$xray_init_plugin_path" > /dev/null <<'EOPHP'
@@ -256,7 +257,8 @@ if (file_exists(__DIR__ . '/../../vendor/autoload.php')) {
     require_once __DIR__ . '/../../vendor/autoload.php';
     $xray_client = new Aws\XRay\XRayClient(['version' => 'latest', 'region'  => getenv('AWS_REGION') ?: 'us-east-1', 'daemon_address' => '127.0.0.1:2000']);
     $segment_name = $_SERVER['HTTP_HOST'] ?? 'wordpress-site';
-    $xray_client->beginSegment($segment_name, null);
+    // CORREÇÃO: Passa os parâmetros como um array associativo, como esperado pelo AWS SDK v3.
+    $xray_client->beginSegment(['Name' => $segment_name]);
     register_shutdown_function(function() use ($xray_client) { $xray_client->endSegment(); $xray_client->send(); });
     $GLOBALS['xray_client'] = $xray_client;
 }
@@ -264,28 +266,45 @@ EOPHP
     fi
 
     local db_dropin_path="$wp_path/wp-content/db.php"
+    # === CORREÇÃO 2: Corrige a lógica do db.php para funcionar durante a instalação do WordPress ===
     if [ ! -f "$db_dropin_path" ]; then
         echo "INFO (X-Ray): Criando DB Drop-in em '$db_dropin_path'..."
         sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
 <?php
 /**
  * WordPress DB Drop-in for AWS X-Ray Tracing.
+ * CORREÇÃO: Garante que $wpdb seja instanciado durante a instalação.
  */
 
-if (defined('WP_INSTALLING') && WP_INSTALLING) {
+if (!class_exists('wpdb')) {
     require_once(ABSPATH . WPINC . '/wp-db.php');
-} else {
+}
+
+// Durante a instalação, use a classe wpdb padrão para evitar problemas.
+if (defined('WP_INSTALLING') && WP_INSTALLING) {
+    $wpdb = new wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
+} 
+// Em operação normal, use a classe estendida para o X-Ray.
+else {
     class XRay_wpdb extends wpdb {
         public function query($query) {
             $xray_client = $GLOBALS['xray_client'] ?? null;
-            if (!$xray_client) { return parent::query($query); }
+            if (!$xray_client) {
+                return parent::query($query);
+            }
+            
             $xray_client->beginSubsegment('RDS-Query');
             try {
                 $xray_client->addMetadata('sql', substr($query, 0, 500));
                 $result = parent::query($query);
-                if ($this->last_error) { $xray_client->addAnnotation('db_error', true); $xray_client->addMetadata('db_error_message', $this->last_error); }
+                if ($this->last_error) {
+                    $xray_client->addAnnotation('db_error', true);
+                    $xray_client->addMetadata('db_error_message', $this->last_error);
+                }
                 return $result;
-            } finally { $xray_client->endSubsegment(); }
+            } finally {
+                $xray_client->endSubsegment();
+            }
         }
     }
     $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
@@ -293,31 +312,6 @@ if (defined('WP_INSTALLING') && WP_INSTALLING) {
 EOPHP
     fi
     echo "INFO (X-Ray): Instrumentação do WordPress concluída."
-}
-
-tune_apache_and_phpfpm() {
-    echo "INFO (Performance Tuning): Otimizando Apache (MPM Event) e PHP-FPM..."
-    
-    local APACHE_MPM_TUNING_CONF="/etc/httpd/conf.d/mpm_tuning.conf"
-    sudo tee "$APACHE_MPM_TUNING_CONF" >/dev/null <<EOF_APACHE_MPM
-<IfModule mpm_event_module>
-    StartServers             3
-    MinSpareThreads          25
-    MaxSpareThreads          75
-    ThreadsPerChild          25
-    ServerLimit              16
-    MaxRequestWorkers        400
-    MaxConnectionsPerChild   1000
-</IfModule>
-EOF_APACHE_MPM
-
-    local PHP_FPM_POOL_CONF="/etc/php-fpm.d/www.conf"
-    if [ -f "$PHP_FPM_POOL_CONF" ]; then
-        sudo sed -i 's/^pm.max_children = .*/pm.max_children = 50/' "$PHP_FPM_POOL_CONF"
-        sudo sed -i 's/^pm.start_servers = .*/pm.start_servers = 10/' "$PHP_FPM_POOL_CONF"
-        sudo sed -i 's/^pm.min_spare_servers = .*/pm.min_spare_servers = 10/' "$PHP_FPM_POOL_CONF"
-        sudo sed -i 's/^pm.max_spare_servers = .*/pm.max_spare_servers = 30/' "$PHP_FPM_POOL_CONF"
-    fi
 }
 
 # --- Lógica Principal de Execução ---
