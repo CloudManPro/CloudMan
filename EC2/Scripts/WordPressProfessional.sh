@@ -1,15 +1,15 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.4.6 (Reformatado para legibilidade máxima, funcionalmente idêntico ao v2.4.5)
-# Instalação manual do X-Ray via RPM e usa o nome de pacote/serviço 'xray'.
+# Versão: 2.4.7 (Corrige erro do composer.lock em EFS preexistente e garante legibilidade)
+# Garante a remoção de composer.lock e vendor/ antes do 'composer install'.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.6.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.7.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.6_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.7_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.4.6.log"
+LOG_FILE="/var/log/wordpress_setup_v2.4.7.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -98,7 +98,6 @@ create_wp_config_template() {
 
     temp_config_file=$(mktemp /tmp/wp-config.XXXXXX.php)
     sudo chmod 644 "$temp_config_file"
-    # Garante que o arquivo temporário seja removido ao final da função
     trap 'rm -f "$temp_config_file"' RETURN
 
     echo "INFO: Criando wp-config.php em '$temp_config_file' para EFS '$target_file_on_efs' com DB_HOST: '$db_host'..."
@@ -109,7 +108,6 @@ create_wp_config_template() {
 
     sudo cp "$CONFIG_SAMPLE_ON_EFS" "$temp_config_file"
 
-    # Escapa caracteres especiais para uso seguro no sed
     SAFE_DB_NAME=$(echo "$db_name" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
     SAFE_DB_USER=$(echo "$db_user" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
     SAFE_DB_PASSWORD=$(echo "$db_password" | sed -e 's/[&\\/]/\\&/g' -e "s/'/\\'/g")
@@ -120,12 +118,10 @@ create_wp_config_template() {
     sed -i "s/password_here/$SAFE_DB_PASSWORD/g" "$temp_config_file"
     sed -i "s/localhost/$SAFE_DB_HOST/g" "$temp_config_file"
 
-    # Gera e insere novos SALTs de segurança
     SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
     if [ -n "$SALT" ]; then
         TEMP_SALT_FILE_INNER=$(mktemp /tmp/salts.XXXXXX)
         echo "$SALT" >"$TEMP_SALT_FILE_INNER"
-        # Remove as linhas de SALT existentes e insere as novas
         sed -i -e '/^define( *'\''AUTH_KEY'\''/d' -e '/^define( *'\''SECURE_AUTH_KEY'\''/d' -e '/^define( *'\''LOGGED_IN_KEY'\''/d' -e '/^define( *'\''NONCE_KEY'\''/d' -e '/^define( *'\''AUTH_SALT'\''/d' -e '/^define( *'\''SECURE_AUTH_SALT'\''/d' -e '/^define( *'\''LOGGED_IN_SALT'\''/d' -e '/^define( *'\''NONCE_SALT'\''/d' "$temp_config_file"
         sed -i "/$MARKER_LINE_SED_PATTERN/r $TEMP_SALT_FILE_INNER" "$temp_config_file"
         rm -f "$TEMP_SALT_FILE_INNER"
@@ -134,10 +130,8 @@ create_wp_config_template() {
         echo "ERRO: Falha ao obter SALTs de segurança do WordPress.org."
     fi
 
-    # Adiciona definições personalizadas (WP_HOME, WP_SITEURL, etc.)
     PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
 // --- Configurações Adicionadas pelo Script de Setup ---
-// Define WP_HOME e WP_SITEURL dinamicamente com base no cabeçalho Host.
 \$site_scheme = 'https';
 \$site_host = '$primary_wpdomain_for_fallback'; // Fallback
 if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) {
@@ -147,17 +141,13 @@ if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) {
     \$site_host = \$_SERVER['HTTP_HOST'];
 }
 
-// Força HTTPS quando atrás de um Load Balancer
 if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower(\$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
     \$_SERVER['HTTPS'] = 'on';
 }
 
 define('WP_HOME', \$site_scheme . '://' . \$site_host);
 define('WP_SITEURL', \$site_scheme . '://' . \$site_host);
-
-// Método direto para manipulação de arquivos
 define('FS_METHOD', 'direct');
-
 // --- Fim das Configurações Adicionadas ---
 EOPHP
 )
@@ -167,7 +157,6 @@ EOPHP
     rm -f "$TEMP_DEFINES_FILE_INNER"
     echo "INFO: Definições de WP_HOME e WP_SITEURL configuradas."
 
-    echo "INFO: Copiando '$temp_config_file' para '$target_file_on_efs' como '$APACHE_USER'..."
     if sudo -u "$APACHE_USER" cp "$temp_config_file" "$target_file_on_efs"; then
         echo "INFO: Arquivo '$target_file_on_efs' criado com sucesso."
     else
@@ -183,9 +172,7 @@ setup_and_configure_proxysql() {
     local db_pass="$4"
     
     echo "INFO (ProxySQL): Iniciando configuração do ProxySQL..."
-    run_proxysql_admin() {
-        mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "$1"
-    }
+    run_proxysql_admin() { mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "$1"; }
     
     if ! sudo systemctl start proxysql; then
         echo "ERRO CRÍTICO (ProxySQL): Falha ao iniciar o serviço ProxySQL para configuração."
@@ -193,16 +180,10 @@ setup_and_configure_proxysql() {
     fi
     sleep 5
 
-    echo "INFO (ProxySQL): Configurando servidor backend (RDS)..."
     run_proxysql_admin "INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '${rds_host}', ${rds_port});"
-    
-    echo "INFO (ProxySQL): Configurando usuário de conexão com o backend..."
     run_proxysql_admin "INSERT INTO mysql_users (username, password, default_hostgroup) VALUES ('${db_user}', '${db_pass}', 10);"
-    
-    echo "INFO (ProxySQL): Configurando regra de roteamento transparente..."
     run_proxysql_admin "INSERT INTO mysql_query_rules (rule_id, active, username, destination_hostgroup, apply) VALUES (1, 1, '${db_user}', 10, 1);"
     
-    echo "INFO (ProxySQL): Carregando e salvando configurações..."
     run_proxysql_admin "LOAD MYSQL SERVERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL USERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL QUERY RULES TO RUNTIME;"
@@ -217,7 +198,6 @@ setup_xray_instrumentation() {
     local wp_path="$1"
     echo "INFO (X-Ray): Iniciando instrumentação do WordPress em '$wp_path'..."
 
-    # 1. Cria o composer.json para instalar o SDK do X-Ray
     local composer_json_path="$wp_path/composer.json"
     echo "INFO (X-Ray): Criando/Atualizando '$composer_json_path'..."
     sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
@@ -233,7 +213,11 @@ setup_xray_instrumentation() {
 }
 EOF
 
-    # 2. Executa o composer install
+    # CORREÇÃO: Remove o lock file e o diretório vendor antigos para garantir uma instalação limpa.
+    echo "INFO (X-Ray): Removendo arquivos antigos do Composer para garantir uma instalação limpa..."
+    sudo -u "$APACHE_USER" rm -f "$wp_path/composer.lock"
+    sudo -u "$APACHE_USER" rm -rf "$wp_path/vendor"
+
     echo "INFO (X-Ray): Executando 'composer install'..."
     local COMPOSER_CACHE_DIR="/tmp/composer_cache_apache"
     sudo -u "$APACHE_USER" mkdir -p "$COMPOSER_CACHE_DIR"
@@ -242,8 +226,7 @@ EOF
         echo "ERRO CRÍTICO (X-Ray): Falha no 'composer install'."
         exit 1
     fi
-
-    # 3. Cria o Must-Use Plugin para iniciar o rastreamento
+    
     local mu_plugin_dir="$wp_path/wp-content/mu-plugins"
     local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
     sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
@@ -254,36 +237,20 @@ EOF
 <?php
 /**
  * Plugin Name: AWS X-Ray Tracer Initializer
- * Description: Inicia o rastreamento do AWS X-Ray para cada requisição.
  */
 
-if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'healthcheck.php') !== false) {
-    return; // Não rastrear health checks para evitar ruído.
-}
-
+if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'healthcheck.php') !== false) { return; }
 if (file_exists(__DIR__ . '/../../vendor/autoload.php')) {
     require_once __DIR__ . '/../../vendor/autoload.php';
-    
-    $xray_client = new Aws\XRay\XRayClient([
-        'version' => 'latest',
-        'region'  => getenv('AWS_REGION') ?: 'us-east-1',
-        'daemon_name' => '127.0.0.1:2000',
-    ]);
-
+    $xray_client = new Aws\XRay\XRayClient(['version' => 'latest', 'region'  => getenv('AWS_REGION') ?: 'us-east-1', 'daemon_name' => '127.0.0.1:2000']);
     $segment_name = $_SERVER['HTTP_HOST'] ?? 'wordpress-site';
     $xray_client->beginSegment($segment_name, null);
-
-    register_shutdown_function(function() use ($xray_client) {
-        $xray_client->endSegment();
-        $xray_client->send();
-    });
-
+    register_shutdown_function(function() use ($xray_client) { $xray_client->endSegment(); $xray_client->send(); });
     $GLOBALS['xray_client'] = $xray_client;
 }
 EOPHP
     fi
 
-    # 4. Cria o DB Drop-in para rastrear queries SQL
     local db_dropin_path="$wp_path/wp-content/db.php"
     if [ ! -f "$db_dropin_path" ]; then
         echo "INFO (X-Ray): Criando DB Drop-in em '$db_dropin_path'..."
@@ -293,30 +260,19 @@ EOPHP
  * WordPress DB Drop-in for AWS X-Ray Tracing.
  */
 
-if (file_exists(ABSPATH . WPINC . '/wp-db.php')) {
-    require_once(ABSPATH . WPINC . '/wp-db.php');
-}
-
+if (file_exists(ABSPATH . WPINC . '/wp-db.php')) { require_once(ABSPATH . WPINC . '/wp-db.php'); }
 if (class_exists('wpdb')) {
     class XRay_wpdb extends wpdb {
         public function query($query) {
             $xray_client = $GLOBALS['xray_client'] ?? null;
-            if (!$xray_client) {
-                return parent::query($query);
-            }
-
+            if (!$xray_client) { return parent::query($query); }
             $xray_client->beginSubsegment('RDS-Query');
             try {
                 $xray_client->addMetadata('sql', substr($query, 0, 500));
                 $result = parent::query($query);
-                if ($this->last_error) {
-                    $xray_client->addAnnotation('db_error', true);
-                    $xray_client->addMetadata('db_error_message', $this->last_error);
-                }
+                if ($this->last_error) { $xray_client->addAnnotation('db_error', true); $xray_client->addMetadata('db_error_message', $this->last_error); }
                 return $result;
-            } finally {
-                $xray_client->endSubsegment();
-            }
+            } finally { $xray_client->endSubsegment(); }
         }
     }
     $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
@@ -354,7 +310,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v2.4.6) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v2.4.7) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -363,10 +319,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "INFO: Verificando variáveis de ambiente essenciais..."
-if [ -z "${ACCOUNT:-}" ]; then
-    ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
-    ACCOUNT="${ACCOUNT_STS:-}"
-fi
+if [ -z "${ACCOUNT:-}" ]; then ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); ACCOUNT="${ACCOUNT_STS:-}"; fi
 error_found=0
 for var_name in "${essential_vars[@]}"; do
     if [ "$var_name" != "AWS_EFS_ACCESS_POINT_TARGET_ID_0" ] && [ -z "${!var_name:-}" ]; then
@@ -374,10 +327,7 @@ for var_name in "${essential_vars[@]}"; do
         error_found=1
     fi
 done
-if [ "$error_found" -eq 1 ]; then
-    echo "ERRO CRÍTICO: Uma ou mais variáveis essenciais não foram definidas. Abortando."
-    exit 1
-fi
+if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Uma ou mais variáveis essenciais não foram definidas. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
 ### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES - DEFINITIVA ###
@@ -407,10 +357,7 @@ sudo yum clean all
 
 echo "INFO: Instalando pacotes restantes (PHP, ProxySQL)..."
 sudo yum install -y httpd php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache proxysql
-if [ $? -ne 0 ]; then
-    echo "ERRO CRÍTICO: Falha durante o 'yum install' dos pacotes restantes."
-    exit 1
-fi
+if [ $? -ne 0 ]; then echo "ERRO CRÍTICO: Falha durante o 'yum install' dos pacotes restantes."; exit 1; fi
 
 echo "INFO: Instalando Composer..."
 curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
@@ -418,10 +365,7 @@ sudo php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=compose
 rm /tmp/composer-setup.php
 
 echo "INFO: Verificando instalação do X-Ray..."
-if ! rpm -q xray > /dev/null; then
-    echo "ERRO CRÍTICO: O pacote 'xray' não foi instalado com sucesso. Abortando."
-    exit 1
-fi
+if ! rpm -q xray > /dev/null; then echo "ERRO CRÍTICO: O pacote 'xray' não foi instalado com sucesso. Abortando."; exit 1; fi
 echo "INFO: Todos os pacotes e ferramentas foram instalados com sucesso."
 ### FIM DA SEÇÃO DE INSTALAÇÃO DE PACOTES ###
 
@@ -435,10 +379,8 @@ DB_USER=$(echo "$SECRET_STRING_VALUE" | jq -r .username)
 DB_PASSWORD=$(echo "$SECRET_STRING_VALUE" | jq -r .password)
 DB_NAME_TO_USE="$AWS_DB_INSTANCE_TARGET_NAME_0"
 RDS_ACTUAL_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1)
-RDS_ACTUAL_PORT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f2)
-[ -z "$RDS_ACTUAL_PORT" ] && RDS_ACTUAL_PORT=3306
-DB_HOST_FOR_WP_CONFIG="127.0.0.1" # WordPress se conecta ao ProxySQL localmente
-
+RDS_ACTUAL_PORT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f2); [ -z "$RDS_ACTUAL_PORT" ] && RDS_ACTUAL_PORT=3306
+DB_HOST_FOR_WP_CONFIG="127.0.0.1"
 setup_and_configure_proxysql "$RDS_ACTUAL_HOST_ENDPOINT" "$RDS_ACTUAL_PORT" "$DB_USER" "$DB_PASSWORD"
 
 if [ ! -d "$MOUNT_POINT/wp-includes" ]; then
@@ -502,6 +444,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v2.4.6) concluído! ---"
+echo "--- Script WordPress Setup (v2.4.7) concluído! ---"
 echo "=================================================="
 exit 0
