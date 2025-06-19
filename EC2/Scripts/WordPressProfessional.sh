@@ -180,17 +180,26 @@ setup_and_configure_proxysql() {
     fi
     sleep 5
 
+    # Limpa configurações antigas para garantir a idempotência
     run_proxysql_admin "DELETE FROM mysql_servers WHERE hostgroup_id = 10;"
     run_proxysql_admin "DELETE FROM mysql_users WHERE username = '${db_user}';"
     run_proxysql_admin "DELETE FROM mysql_query_rules WHERE rule_id = 1;"
 
+    # Insere as novas configurações para o APLICATIVO
     run_proxysql_admin "INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '${rds_host}', ${rds_port});"
     run_proxysql_admin "INSERT INTO mysql_users (username, password, default_hostgroup) VALUES ('${db_user}', '${db_pass}', 10);"
     run_proxysql_admin "INSERT INTO mysql_query_rules (rule_id, active, username, destination_hostgroup, apply) VALUES (1, 1, '${db_user}', 10, 1);"
     
+    # === CORREÇÃO: Define as credenciais para o MONITORAMENTO INTERNO do ProxySQL ===
+    run_proxysql_admin "UPDATE global_variables SET variable_value='${db_user}' WHERE variable_name='mysql-monitor_username';"
+    run_proxysql_admin "UPDATE global_variables SET variable_value='${db_pass}' WHERE variable_name='mysql-monitor_password';"
+    
+    # Carrega e salva TODAS as configurações
+    run_proxysql_admin "LOAD MYSQL VARIABLES TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL SERVERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL USERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL QUERY RULES TO RUNTIME;"
+    run_proxysql_admin "SAVE MYSQL VARIABLES TO DISK;"
     run_proxysql_admin "SAVE MYSQL SERVERS TO DISK;"
     run_proxysql_admin "SAVE MYSQL USERS TO DISK;"
     run_proxysql_admin "SAVE MYSQL QUERY RULES TO DISK;"
