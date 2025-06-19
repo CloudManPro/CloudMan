@@ -1,18 +1,16 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 3.0.0 (PHP 8.2 e Estável)
-# - ATUALIZADO: A versão do PHP foi alterada de 7.4 para 8.2, conforme recomendação da AWS.
-# - MANTIDO: Utiliza a instrumentação manual e robusta do X-Ray via UDP para o RDS,
-#   que é independente da versão do PHP e não requer Composer.
-# - OTIMIZADO: Removidos passos desnecessários (instalação do Composer, etc.).
+# Versão: 3.1.0 (PHP 8.2 e WordPress 6.5.4 Fixo)
+# - ATUALIZADO: A instalação do WordPress foi fixada na versão 6.5.4 para garantir implantações consistentes.
+# - MANTIDO: PHP 8.2 e instrumentação manual robusta do X-Ray via UDP.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v3.0.0.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v3.1.0.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v3.0.0_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v3.1.0_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v3.0.0.log"
+LOG_FILE="/var/log/wordpress_setup_v3.1.0.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -242,7 +240,7 @@ class XRayManualTracer {
         $trace_header = $_SERVER['HTTP_X_AMZN_TRACE_ID'];
         
         foreach (explode(';', $trace_header) as $part) {
-            list($key, $value) = explode('=', $part, 2);
+            @list($key, $value) = explode('=', $part, 2);
             if ($key === 'Root') $this->trace_id = $value;
             if ($key === 'Parent') $this->parent_id = $value;
             if ($key === 'Sampled') $this->is_sampled = ($value === '1');
@@ -349,7 +347,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v3.0.0 - PHP 8.2) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v3.1.0 - PHP 8.2, WP 6.5.4) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -373,7 +371,6 @@ echo "INFO: Verificação de variáveis concluída."
 echo "INFO: Iniciando instalação de pacotes..."
 sudo yum update -y -q
 
-# --- MUDANÇA PRINCIPAL: HABILITANDO O PHP 8.2 ---
 echo "INFO: Instalando dependências básicas e habilitando PHP 8.2..."
 sudo yum install -y amazon-efs-utils jq mysql
 sudo amazon-linux-extras enable php8.2 -y
@@ -418,10 +415,12 @@ DB_HOST_FOR_WP_CONFIG="127.0.0.1:6033"
 setup_and_configure_proxysql "$RDS_ACTUAL_HOST_ENDPOINT" "$RDS_ACTUAL_PORT" "$DB_USER" "$DB_PASSWORD"
 
 if [ ! -d "$MOUNT_POINT/wp-includes" ]; then
-    echo "INFO: WordPress não encontrado no EFS. Baixando e instalando..."
+    echo "INFO: WordPress 6.5.4 não encontrado no EFS. Baixando e instalando..."
     sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-    (cd "$WP_DOWNLOAD_DIR" && curl -sLO https://wordpress.org/latest.tar.gz && tar -xzf latest.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1)
+    # --- MUDANÇA PRINCIPAL: BAIXANDO UMA VERSÃO FIXA DO WORDPRESS ---
+    (cd "$WP_DOWNLOAD_DIR" && curl -sLO https://wordpress.org/wordpress-6.5.4.tar.gz && tar -xzf wordpress-6.5.4.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1)
+    if [ $? -ne 0 ]; then echo "ERRO CRÍTICO: Falha ao baixar ou extrair o WordPress."; exit 1; fi
     sudo -u "$APACHE_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
 fi
@@ -485,6 +484,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v3.0.0) concluído! ---"
+echo "--- Script WordPress Setup (v3.1.0) concluído! ---"
 echo "=================================================="
 exit 0
