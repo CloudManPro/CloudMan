@@ -209,14 +209,14 @@ setup_and_configure_proxysql() {
 
 setup_xray_instrumentation() {
     local wp_path="$1"
-    echo "INFO (X-Ray): Iniciando instrumentação do WordPress em '$wp_path'..."
+    echo "INFO (X-Ray): Iniciando instrumentação do WordPress em '$wp_path' com o SDK correto..."
 
     local composer_json_path="$wp_path/composer.json"
-    echo "INFO (X-Ray): Criando/Atualizando '$composer_json_path'..."
+    echo "INFO (X-Ray): CORREÇÃO: Usando o SDK 'aws/aws-xray-sdk-php' para instrumentação."
     sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
 {
     "require": {
-        "aws/aws-sdk-php": "^3.0"
+        "aws/aws-xray-sdk-php": "^1.0"
     },
     "config": {
         "platform": {
@@ -226,16 +226,16 @@ setup_xray_instrumentation() {
 }
 EOF
 
-    echo "INFO (X-Ray): Removendo arquivos antigos do Composer para garantir uma instalação limpa..."
+    echo "INFO (X-Ray): Removendo arquivos antigos do Composer para garantir uma instalação limpa com o novo SDK..."
     sudo -u "$APACHE_USER" rm -f "$wp_path/composer.lock"
     sudo -u "$APACHE_USER" rm -rf "$wp_path/vendor"
 
-    echo "INFO (X-Ray): Executando 'composer install'..."
+    echo "INFO (X-Ray): Executando 'composer install' para o SDK de instrumentação..."
     local COMPOSER_CACHE_DIR="/tmp/composer_cache_apache"
     sudo -u "$APACHE_USER" mkdir -p "$COMPOSER_CACHE_DIR"
     (cd "$wp_path" && sudo -u "$APACHE_USER" COMPOSER_HOME="$COMPOSER_CACHE_DIR" COMPOSER_PROCESS_TIMEOUT=0 /usr/local/bin/composer install --no-dev -o)
     if [ $? -ne 0 ]; then
-        echo "ERRO CRÍTICO (X-Ray): Falha no 'composer install'."
+        echo "ERRO CRÍTICO (X-Ray): Falha no 'composer install' do SDK de instrumentação."
         exit 1
     fi
     
@@ -243,95 +243,83 @@ EOF
     local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
     sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
     
-    # Esta verificação é intencional para idempotência. A limpeza explícita já é feita na lógica principal do script.
-    if [ ! -f "$xray_init_plugin_path" ]; then
-        echo "INFO (X-Ray): Criando Must-Use Plugin em '$xray_init_plugin_path'..."
-        sudo -u "$APACHE_USER" tee "$xray_init_plugin_path" > /dev/null <<'EOPHP'
+    echo "INFO (X-Ray): CORREÇÃO: Criando Must-Use Plugin com a lógica do Tracer do X-Ray SDK."
+    sudo -u "$APACHE_USER" tee "$xray_init_plugin_path" > /dev/null <<'EOPHP'
 <?php
 /**
- * Plugin Name: AWS X-Ray Tracer Initializer
+ * Plugin Name: AWS X-Ray Tracer Initializer (SDK Corrigido)
  */
 if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'healthcheck.php') !== false) { return; }
+
 if (file_exists(__DIR__ . '/../../vendor/autoload.php')) {
     require_once __DIR__ . '/../../vendor/autoload.php';
+
     try {
-        $xray_client = new Aws\XRay\XRayClient([
-            'version' => 'latest',
-            'region'  => getenv('AWS_REGION') ?: 'us-east-1',
-            'daemon_address' => '127.0.0.1:2000'
-        ]);
+        // Usa as classes corretas do SDK de instrumentação
+        $emitter = new Aws\XRay\Emitters\DaemonEmitter('127.0.0.1:2000');
         $segment_name = $_SERVER['HTTP_HOST'] ?? 'wordpress-site';
-        $xray_client->beginSegment(['Name' => $segment_name]);
-        register_shutdown_function(function() use ($xray_client) { $xray_client->endSegment(); $xray_client->send(); });
-        $GLOBALS['xray_client'] = $xray_client;
+        $tracer = new Aws\XRay\Tracer($segment_name, null, $emitter);
+        
+        // Armazena o tracer globalmente para ser usado por outros componentes (como db.php)
+        $GLOBALS['xray_tracer'] = $tracer;
+
+        // Garante que os dados sejam enviados ao final da requisição
+        register_shutdown_function(function() use ($tracer) {
+            $tracer->send();
+        });
     } catch (\Exception $e) {
-        // Silently fail if X-Ray client can't be created.
+        // Falha silenciosamente se o tracer não puder ser criado
     }
 }
 EOPHP
-    fi
-
+    
     local db_dropin_path="$wp_path/wp-content/db.php"
-    # A limpeza explícita já é feita na lógica principal do script.
-    if [ ! -f "$db_dropin_path" ]; then
-        echo "INFO (X-Ray): Criando DB Drop-in com lógica e sintaxe finais e refatoradas em '$db_dropin_path'..."
-        sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
+    echo "INFO (X-Ray): CORREÇÃO: Criando DB Drop-in que usa o Tracer para criar Subsegmentos."
+    sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
 <?php
 /**
- * WordPress DB Drop-in for AWS X-Ray Tracing.
- * Versão Final: Código refatorado para ser mais limpo, eficiente e corrigir os bugs de instalação e execução.
+ * WordPress DB Drop-in for AWS X-Ray Tracing (SDK Corrigido).
  */
+if (!class_exists('wpdb')) { require_once(ABSPATH . WPINC . '/wp-db.php'); }
 
-// Garante que a classe base wpdb do WordPress esteja sempre disponível.
-if (!class_exists('wpdb')) {
-    require_once(ABSPATH . WPINC . '/wp-db.php');
-}
-
-/**
- * Define a classe personalizada para o X-Ray.
- * Ela estende a classe 'wpdb' padrão e intercepta o método 'query'.
- */
 class XRay_wpdb extends wpdb {
     public function query($query) {
-        $xray_client = $GLOBALS['xray_client'] ?? null;
-
-        // Se o cliente X-Ray não foi inicializado, executa a query normalmente.
-        if (!$xray_client) {
+        // Busca o Tracer global, não o XRayClient
+        $tracer = $GLOBALS['xray_tracer'] ?? null;
+        if (!$tracer) {
             return parent::query($query);
         }
 
-        // CORREÇÃO FINAL: A chamada para beginSubsegment agora usa a sintaxe de array correta.
-        $xray_client->beginSubsegment(['Name' => 'RDS-Query']);
+        // Usa os métodos corretos do Tracer
+        $tracer->beginSubsegment('RDS-Query');
         try {
-            $xray_client->addMetadata('sql', substr($query, 0, 500));
+            // Adiciona metadados ao subsegmento atual
+            $subsegment = $tracer->getCurrentSubsegment();
+            if ($subsegment) {
+                $subsegment->setMetadata(['sql' => substr($query, 0, 500)]);
+            }
+
             $result = parent::query($query);
-            if ($this->last_error) {
-                $xray_client->addAnnotation('db_error', true);
-                $xray_client->addMetadata('db_error_message', $this->last_error);
+
+            if ($this->last_error && $subsegment) {
+                $subsegment->setAnnotations(['db_error' => true]);
+                $subsegment->setMetadata(['db_error_message' => $this->last_error]);
             }
             return $result;
         } finally {
-            $xray_client->endSubsegment();
+            $tracer->endSubsegment();
         }
     }
 }
 
-/**
- * LÓGICA FINAL: Decide QUAL classe instanciar para a variável global $wpdb.
- * Esta é a correção crucial que resolve o erro na tela de instalação.
- */
 if (defined('WP_INSTALLING') && WP_INSTALLING) {
-    // Durante a instalação, usa a classe padrão do WordPress para evitar problemas.
     $wpdb = new wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 } else {
-    // Em operação normal, usa nossa classe instrumentada com X-Ray.
     $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 }
 EOPHP
-    fi
-    echo "INFO (X-Ray): Instrumentação do WordPress concluída com sucesso."
+    echo "INFO (X-Ray): Instrumentação do WordPress concluída com sucesso usando o SDK correto."
 }
-
 tune_apache_and_phpfpm() {
     echo "INFO (Performance Tuning): Otimizando Apache, PHP-FPM e limite de memória do PHP..."
     
