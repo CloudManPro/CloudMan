@@ -1,15 +1,15 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.4.9 (Torna a configuração do ProxySQL 100% idempotente)
+# Versão: 2.5.0 (Corrige erro de sintaxe na configuração do Apache)
 # Garante a remoção de composer.lock e vendor/ antes do 'composer install'.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.9.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.5.0.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.9_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.5.0_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.4.9.log"
+LOG_FILE="/var/log/wordpress_setup_v2.5.0.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -165,9 +165,6 @@ EOPHP
     fi
 }
 
-# ==============================================================================
-# === CORREÇÃO DE IDEMPOTÊNCIA: Deletar registros antes de inserir novamente. ===
-# ==============================================================================
 setup_and_configure_proxysql() {
     local rds_host="$1"
     local rds_port="$2"
@@ -183,17 +180,14 @@ setup_and_configure_proxysql() {
     fi
     sleep 5
 
-    # Limpa configurações antigas para garantir a idempotência
     run_proxysql_admin "DELETE FROM mysql_servers WHERE hostgroup_id = 10;"
     run_proxysql_admin "DELETE FROM mysql_users WHERE username = '${db_user}';"
     run_proxysql_admin "DELETE FROM mysql_query_rules WHERE rule_id = 1;"
 
-    # Insere as novas configurações
     run_proxysql_admin "INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '${rds_host}', ${rds_port});"
     run_proxysql_admin "INSERT INTO mysql_users (username, password, default_hostgroup) VALUES ('${db_user}', '${db_pass}', 10);"
     run_proxysql_admin "INSERT INTO mysql_query_rules (rule_id, active, username, destination_hostgroup, apply) VALUES (1, 1, '${db_user}', 10, 1);"
     
-    # Carrega e salva as configurações
     run_proxysql_admin "LOAD MYSQL SERVERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL USERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL QUERY RULES TO RUNTIME;"
@@ -320,7 +314,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v2.4.9) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v2.5.0) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -420,7 +414,14 @@ sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
 echo "INFO: Configurando Apache..."
 sudo sed -i "s#^DocumentRoot \"/var/www/html\"#DocumentRoot \"$MOUNT_POINT\"#" /etc/httpd/conf/httpd.conf
 sudo sed -i "s#^<Directory \"/var/www/html\">#<Directory \"$MOUNT_POINT\">#" /etc/httpd/conf/httpd.conf
-sudo tee "/etc/httpd/conf.d/wordpress.conf" >/dev/null <<< "<Directory \"$MOUNT_POINT\"> AllowOverride All; Require all granted; </Directory>"
+
+# === CORREÇÃO: Usando "here document" para evitar erros de sintaxe do shell ===
+sudo tee "/etc/httpd/conf.d/wordpress.conf" >/dev/null <<EOF
+<Directory "$MOUNT_POINT">
+    AllowOverride All
+    Require all granted
+</Directory>
+EOF
 
 tune_apache_and_phpfpm
 
@@ -456,6 +457,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v2.4.9) concluído! ---"
+echo "--- Script WordPress Setup (v2.5.0) concluído! ---"
 echo "=================================================="
 exit 0
