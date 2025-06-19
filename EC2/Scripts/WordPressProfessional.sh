@@ -1,19 +1,19 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.5.4 (Final e Robusto)
-# - Garante a limpeza de arquivos de instrumentação antigos no EFS.
+# Versão: 2.5.5 (Final e Robusto)
+# - Garante a limpeza de arquivos de instrumentação antigos no EFS para evitar problemas de cache.
 # - Corrige a porta de conexão do WordPress para o ProxySQL (6033).
 # - Corrige a chamada da API beginSegment do X-Ray.
 # - Corrige a lógica do db.php para a instalação do WordPress.
 # - Adiciona a função tune_apache_and_phpfpm e aumenta o memory_limit do PHP para 512M.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.5.4.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.5.5.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.5.4_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.5.5_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.5.4.log"
+LOG_FILE="/var/log/wordpress_setup_v2.5.5.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -243,6 +243,7 @@ EOF
     local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
     sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
     
+    # Esta verificação é intencional para idempotência. A limpeza explícita é feita na lógica principal.
     if [ ! -f "$xray_init_plugin_path" ]; then
         echo "INFO (X-Ray): Criando Must-Use Plugin em '$xray_init_plugin_path'..."
         sudo -u "$APACHE_USER" tee "$xray_init_plugin_path" > /dev/null <<'EOPHP'
@@ -263,6 +264,7 @@ EOPHP
     fi
 
     local db_dropin_path="$wp_path/wp-content/db.php"
+    # Esta verificação é intencional para idempotência. A limpeza explícita é feita na lógica principal.
     if [ ! -f "$db_dropin_path" ]; then
         echo "INFO (X-Ray): Criando DB Drop-in em '$db_dropin_path'..."
         sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
@@ -328,7 +330,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v2.5.4 - Final) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v2.5.5 - Final Robusto) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -348,7 +350,7 @@ done
 if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Uma ou mais variáveis essenciais não foram definidas. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
-### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES - DEFINITIVA ###
+### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES E CONFIGURAÇÃO ###
 echo "INFO: Iniciando instalação de pacotes..."
 sudo yum update -y -q
 
@@ -387,7 +389,6 @@ fi
 echo "INFO: Verificando instalação do X-Ray..."
 if ! rpm -q xray > /dev/null; then echo "ERRO CRÍTICO: O pacote 'xray' não foi instalado com sucesso. Abortando."; exit 1; fi
 echo "INFO: Todos os pacotes e ferramentas foram instalados com sucesso."
-### FIM DA SEÇÃO DE INSTALAÇÃO DE PACOTES ###
 
 AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
 
@@ -451,22 +452,27 @@ if ! sudo systemctl list-unit-files | grep -q -w "$PHP_FPM_SERVICE_NAME"; then
     exit 1
 fi
 
-echo "INFO: Habilitando e reiniciando serviços (httpd, $PHP_FPM_SERVICE_NAME, proxysql, xray)..."
+echo "INFO: Habilitando serviços para iniciar no boot (httpd, php-fpm, proxysql, xray)..."
 sudo systemctl enable httpd
 sudo systemctl enable "$PHP_FPM_SERVICE_NAME"
 sudo systemctl enable proxysql
 sudo systemctl enable xray
 
+echo "INFO: Reiniciando serviços na ordem correta para aplicar todas as mudanças e limpar o cache..."
+# Inicia/Reinicia serviços de baixo nível primeiro
 sudo systemctl restart xray
 sudo systemctl restart proxysql
+
+# Reinicia o PHP-FPM e o Apache POR ÚLTIMO para garantir que eles leiam
+# todas as configurações e arquivos de código mais recentes, limpando o OPcache.
 sudo systemctl restart "$PHP_FPM_SERVICE_NAME"
 sudo systemctl restart httpd
 
 sleep 3
 if systemctl is-active --quiet httpd && systemctl is-active --quiet "$PHP_FPM_SERVICE_NAME" && systemctl is-active --quiet proxysql && systemctl is-active --quiet xray; then
-    echo "INFO: Todos os serviços (httpd, php-fpm, proxysql, xray) estão ativos."
+    echo "INFO: Todos os serviços essenciais estão ativos."
 else
-    echo "ERRO CRÍTICO: Um ou mais serviços essenciais não estão ativos. Verificando status..."
+    echo "ERRO CRÍTICO: Um ou mais serviços essenciais não estão ativos após o reinício final."
     sudo systemctl status httpd --no-pager
     sudo systemctl status "$PHP_FPM_SERVICE_NAME" --no-pager
     sudo systemctl status proxysql --no-pager
@@ -476,6 +482,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v2.5.4) concluído! ---"
+echo "--- Script WordPress Setup (v2.5.5) concluído! ---"
 echo "=================================================="
 exit 0
