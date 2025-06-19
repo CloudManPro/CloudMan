@@ -116,19 +116,21 @@ setup_and_configure_proxysql() {
 }
 ### FIM DA FUNÇÃO PARA PROXYSQL ###
 
-### INÍCIO DA FUNÇÃO DE INSTRUMENTAÇÃO DO X-RAY ###
+### INÍCIO DA FUNÇÃO DE INSTRUMENTAÇÃO DO X-RAY (OTIMIZADA E COM CORREÇÃO DE TIMEOUT) ###
 setup_xray_instrumentation() {
     local wp_path="$1"
-    echo "INFO (X-Ray): Iniciando instrumentação do WordPress em '$wp_path'..."
+    echo "INFO (X-Ray): Iniciando instrumentação OTIMIZADA do WordPress em '$wp_path'..."
 
-    # 1. Instalar o AWS SDK via Composer
+    # 1. Usar o pacote LEVE `aws/aws-xray` para uma instalação rápida
     local composer_json_path="$wp_path/composer.json"
-    if [ ! -f "$composer_json_path" ]; then
-        echo "INFO (X-Ray): Criando '$composer_json_path'..."
-        sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
+    
+    # Independentemente de o arquivo existir, garantimos que ele tenha o conteúdo correto e otimizado.
+    # Isso torna o script idempotente e corrige instalações parciais anteriores.
+    echo "INFO (X-Ray): Criando/Atualizando '$composer_json_path' para usar o pacote leve 'aws/aws-xray'..."
+    sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
 {
     "require": {
-        "aws/aws-sdk-php": "^3.200"
+        "aws/aws-xray": "^1.0"
     },
     "config": {
         "platform": {
@@ -137,17 +139,11 @@ setup_xray_instrumentation() {
     }
 }
 EOF
-    else
-        echo "INFO (X-Ray): '$composer_json_path' já existe. Verificando dependência."
-        # Garante que a dependência está lá, de forma simples
-        if ! sudo -u "$APACHE_USER" grep -q '"aws/aws-sdk-php"' "$composer_json_path"; then
-            echo "ERRO CRÍTICO (X-Ray): composer.json existe, mas não contém aws-sdk-php."
-            exit 1
-        fi
-    fi
 
-    echo "INFO (X-Ray): Executando 'composer install' para instalar o AWS SDK..."
-    (cd "$wp_path" && sudo -u "$APACHE_USER" /usr/local/bin/composer install --no-dev -o)
+    echo "INFO (X-Ray): Executando 'composer install' para instalar o pacote AWS X-Ray (com timeout desabilitado)..."
+    # A variável COMPOSER_PROCESS_TIMEOUT=0 desabilita o timeout, prevenindo erros em sistemas de arquivos lentos como o EFS.
+    # O uso do pacote leve 'aws/aws-xray' torna esta operação muito mais rápida.
+    (cd "$wp_path" && sudo -u "$APACHE_USER" COMPOSER_PROCESS_TIMEOUT=0 /usr/local/bin/composer install --no-dev -o)
     if [ $? -ne 0 ]; then
         echo "ERRO CRÍTICO (X-Ray): Falha no 'composer install'."
         exit 1
@@ -264,7 +260,7 @@ EOPHP
         echo "INFO (X-Ray): DB Drop-in já existe em '$db_dropin_path'."
     fi
 
-    echo "INFO (X-Ray): Instrumentação do WordPress concluída."
+    echo "INFO (X-Ray): Instrumentação do WordPress concluída com sucesso."
 }
 ### FIM DA FUNÇÃO DE INSTRUMENTAÇÃO DO X-RAY ###
 
