@@ -1,15 +1,15 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.4.8 (Corrige o nome do pacote Composer para o AWS SDK)
+# Versão: 2.4.9 (Torna a configuração do ProxySQL 100% idempotente)
 # Garante a remoção de composer.lock e vendor/ antes do 'composer install'.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.8.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.9.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.8_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.9_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.4.8.log"
+LOG_FILE="/var/log/wordpress_setup_v2.4.9.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -165,13 +165,16 @@ EOPHP
     fi
 }
 
+# ==============================================================================
+# === CORREÇÃO DE IDEMPOTÊNCIA: Deletar registros antes de inserir novamente. ===
+# ==============================================================================
 setup_and_configure_proxysql() {
     local rds_host="$1"
     local rds_port="$2"
     local db_user="$3"
     local db_pass="$4"
     
-    echo "INFO (ProxySQL): Iniciando configuração do ProxySQL..."
+    echo "INFO (ProxySQL): Iniciando configuração idempotente do ProxySQL..."
     run_proxysql_admin() { mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "$1"; }
     
     if ! sudo systemctl start proxysql; then
@@ -180,10 +183,17 @@ setup_and_configure_proxysql() {
     fi
     sleep 5
 
+    # Limpa configurações antigas para garantir a idempotência
+    run_proxysql_admin "DELETE FROM mysql_servers WHERE hostgroup_id = 10;"
+    run_proxysql_admin "DELETE FROM mysql_users WHERE username = '${db_user}';"
+    run_proxysql_admin "DELETE FROM mysql_query_rules WHERE rule_id = 1;"
+
+    # Insere as novas configurações
     run_proxysql_admin "INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '${rds_host}', ${rds_port});"
     run_proxysql_admin "INSERT INTO mysql_users (username, password, default_hostgroup) VALUES ('${db_user}', '${db_pass}', 10);"
     run_proxysql_admin "INSERT INTO mysql_query_rules (rule_id, active, username, destination_hostgroup, apply) VALUES (1, 1, '${db_user}', 10, 1);"
     
+    # Carrega e salva as configurações
     run_proxysql_admin "LOAD MYSQL SERVERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL USERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL QUERY RULES TO RUNTIME;"
@@ -200,7 +210,6 @@ setup_xray_instrumentation() {
 
     local composer_json_path="$wp_path/composer.json"
     echo "INFO (X-Ray): Criando/Atualizando '$composer_json_path'..."
-    # CORREÇÃO: O pacote 'aws/aws-xray' não existe. O correto é 'aws/aws-sdk-php', que contém o cliente X-Ray.
     sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
 {
     "require": {
@@ -214,7 +223,6 @@ setup_xray_instrumentation() {
 }
 EOF
 
-    # CORREÇÃO: Remove o lock file e o diretório vendor antigos para garantir uma instalação limpa.
     echo "INFO (X-Ray): Removendo arquivos antigos do Composer para garantir uma instalação limpa..."
     sudo -u "$APACHE_USER" rm -f "$wp_path/composer.lock"
     sudo -u "$APACHE_USER" rm -rf "$wp_path/vendor"
@@ -312,7 +320,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v2.4.8) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v2.4.9) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -362,9 +370,11 @@ sudo yum install -y httpd php php-common php-fpm php-mysqlnd php-json php-cli ph
 if [ $? -ne 0 ]; then echo "ERRO CRÍTICO: Falha durante o 'yum install' dos pacotes restantes."; exit 1; fi
 
 echo "INFO: Instalando Composer..."
-curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
-sudo php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
-rm /tmp/composer-setup.php
+if ! command -v composer &> /dev/null; then
+    curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
+    sudo php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+    rm /tmp/composer-setup.php
+fi
 
 echo "INFO: Verificando instalação do X-Ray..."
 if ! rpm -q xray > /dev/null; then echo "ERRO CRÍTICO: O pacote 'xray' não foi instalado com sucesso. Abortando."; exit 1; fi
@@ -446,6 +456,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v2.4.8) concluído! ---"
+echo "--- Script WordPress Setup (v2.4.9) concluído! ---"
 echo "=================================================="
 exit 0
