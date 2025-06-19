@@ -1,15 +1,15 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.4.0-xray-integration (Adiciona instrumentação completa do AWS X-Ray)
+# Versão: 2.4.1 (Corrige dependências do Amazon Linux 2, sintaxe do Apache e cache do Composer)
 # Modificado para validar otimização, adicionar ProxySQL e integrar X-Ray.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.0.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.1.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.0_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.1_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.4.0.log"
+LOG_FILE="/var/log/wordpress_setup_v2.4.1.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -78,7 +78,7 @@ create_wp_config_template() {
         rm -f "$TEMP_SALT_FILE_INNER"; echo "INFO: SALTS configurados."
     else echo "ERRO: Falha ao obter SALTS."; fi
     PHP_DEFINES_BLOCK_CONTENT=$(cat <<EOPHP
-// Gerado por wordpress_setup_v2.4.0.sh
+// Gerado por wordpress_setup_v2.4.1.sh
 \$site_scheme = 'https';
 \$site_host = '$primary_wpdomain_for_fallback';
 if (!empty(\$_SERVER['HTTP_X_FORWARDED_HOST'])) { \$hosts = explode(',', \$_SERVER['HTTP_X_FORWARDED_HOST']); \$site_host = trim(\$hosts[0]); } elseif (!empty(\$_SERVER['HTTP_HOST'])) { \$site_host = \$_SERVER['HTTP_HOST']; }
@@ -116,16 +116,12 @@ setup_and_configure_proxysql() {
 }
 ### FIM DA FUNÇÃO PARA PROXYSQL ###
 
-### INÍCIO DA FUNÇÃO DE INSTRUMENTAÇÃO DO X-RAY (OTIMIZADA E COM CORREÇÃO DE TIMEOUT) ###
+### INÍCIO DA FUNÇÃO DE INSTRUMENTAÇÃO DO X-RAY (OTIMIZADA E COM CORREÇÃO DE TIMEOUT E CACHE) ###
 setup_xray_instrumentation() {
     local wp_path="$1"
     echo "INFO (X-Ray): Iniciando instrumentação OTIMIZADA do WordPress em '$wp_path'..."
 
-    # 1. Usar o pacote LEVE `aws/aws-xray` para uma instalação rápida
     local composer_json_path="$wp_path/composer.json"
-    
-    # Independentemente de o arquivo existir, garantimos que ele tenha o conteúdo correto e otimizado.
-    # Isso torna o script idempotente e corrige instalações parciais anteriores.
     echo "INFO (X-Ray): Criando/Atualizando '$composer_json_path' para usar o pacote leve 'aws/aws-xray'..."
     sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
 {
@@ -141,15 +137,15 @@ setup_xray_instrumentation() {
 EOF
 
     echo "INFO (X-Ray): Executando 'composer install' para instalar o pacote AWS X-Ray (com timeout desabilitado)..."
-    # A variável COMPOSER_PROCESS_TIMEOUT=0 desabilita o timeout, prevenindo erros em sistemas de arquivos lentos como o EFS.
-    # O uso do pacote leve 'aws/aws-xray' torna esta operação muito mais rápida.
-    (cd "$wp_path" && sudo -u "$APACHE_USER" COMPOSER_PROCESS_TIMEOUT=0 /usr/local/bin/composer install --no-dev -o)
+    # CORREÇÃO: Criamos um diretório de cache temporário e usamos COMPOSER_HOME para evitar avisos de permissão.
+    local COMPOSER_CACHE_DIR="/tmp/composer_cache_apache"
+    sudo -u "$APACHE_USER" mkdir -p "$COMPOSER_CACHE_DIR"
+    (cd "$wp_path" && sudo -u "$APACHE_USER" COMPOSER_HOME="$COMPOSER_CACHE_DIR" COMPOSER_PROCESS_TIMEOUT=0 /usr/local/bin/composer install --no-dev -o)
     if [ $? -ne 0 ]; then
         echo "ERRO CRÍTICO (X-Ray): Falha no 'composer install'."
         exit 1
     fi
 
-    # 2. Criar o Must-Use Plugin para iniciar o rastreamento
     local mu_plugin_dir="$wp_path/wp-content/mu-plugins"
     local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
     sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
@@ -171,27 +167,20 @@ if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'healthche
 if (file_exists(__DIR__ . '/../../vendor/autoload.php')) {
     require_once __DIR__ . '/../../vendor/autoload.php';
     
-    // Configuração do cliente X-Ray
-    // O Daemon Name é o endereço UDP onde o X-Ray Daemon está escutando.
     $xray_client = new Aws\XRay\XRayClient([
         'version' => 'latest',
-        'region'  => getenv('AWS_REGION') ?: 'us-east-1', // Use a região do ambiente ou um padrão
+        'region'  => getenv('AWS_REGION') ?: 'us-east-1',
         'daemon_name' => '127.0.0.1:2000',
     ]);
 
-    // O nome do segmento deve representar sua aplicação.
     $segment_name = $_SERVER['HTTP_HOST'] ?? 'wordpress-site';
-    
-    // Inicia o segmento principal para a requisição
     $xray_client->beginSegment($segment_name, null);
 
-    // Garante que o segmento será fechado e enviado no final da execução do script
     register_shutdown_function(function() use ($xray_client) {
         $xray_client->endSegment();
         $xray_client->send();
     });
 
-    // Torna o cliente acessível globalmente se necessário (opcional, mas útil para o db.php)
     $GLOBALS['xray_client'] = $xray_client;
 }
 EOPHP
@@ -199,7 +188,6 @@ EOPHP
         echo "INFO (X-Ray): Must-Use Plugin já existe em '$xray_init_plugin_path'."
     fi
 
-    # 3. Criar o DB Drop-in para rastrear queries SQL
     local db_dropin_path="$wp_path/wp-content/db.php"
     if [ ! -f "$db_dropin_path" ]; then
         echo "INFO (X-Ray): Criando DB Drop-in em '$db_dropin_path'..."
@@ -207,52 +195,34 @@ EOPHP
 <?php
 /**
  * WordPress DB Drop-in for AWS X-Ray Tracing.
- *
- * Coloque este arquivo em /wp-content/db.php
  */
 
-// Inclui a classe original do WordPress
 if (file_exists(ABSPATH . WPINC . '/wp-db.php')) {
     require_once(ABSPATH . WPINC . '/wp-db.php');
 }
 
 if (class_exists('wpdb')) {
     class XRay_wpdb extends wpdb {
-        
         public function query($query) {
-            // Obtém o cliente X-Ray global, iniciado pelo mu-plugin
             $xray_client = $GLOBALS['xray_client'] ?? null;
-            
             if (!$xray_client) {
-                // Se o cliente não estiver disponível, executa a query normalmente
                 return parent::query($query);
             }
 
-            // Inicia um subsegmento para a chamada ao banco de dados
             $xray_client->beginSubsegment('RDS-Query');
-            
             try {
-                // Adiciona metadados úteis para análise no console do X-Ray
-                $xray_client->addMetadata('sql', substr($query, 0, 500)); // Limita o tamanho da query por segurança
-
-                // Executa a query original
+                $xray_client->addMetadata('sql', substr($query, 0, 500));
                 $result = parent::query($query);
-                
                 if ($this->last_error) {
                     $xray_client->addAnnotation('db_error', true);
                     $xray_client->addMetadata('db_error_message', $this->last_error);
                 }
-
                 return $result;
-
             } finally {
-                // Garante que o subsegmento seja fechado, mesmo que ocorra um erro
                 $xray_client->endSubsegment();
             }
         }
     }
-    
-    // Substitui a instância global do wpdb pela nossa classe instrumentada
     $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 }
 EOPHP
@@ -269,8 +239,12 @@ tune_apache_and_phpfpm() {
     local APACHE_MPM_TUNING_CONF="/etc/httpd/conf.d/mpm_tuning.conf"
     sudo tee "$APACHE_MPM_TUNING_CONF" >/dev/null <<EOF_APACHE_MPM
 <IfModule mpm_event_module>
-    StartServers             3; MinSpareThreads          25; MaxSpareThreads          75
-    ThreadsPerChild          25; ServerLimit              16; MaxRequestWorkers        400
+    StartServers             3
+    MinSpareThreads          25
+    MaxSpareThreads          75
+    ThreadsPerChild          25
+    ServerLimit              16
+    MaxRequestWorkers        400
     MaxConnectionsPerChild   1000
 </IfModule>
 EOF_APACHE_MPM
@@ -286,12 +260,11 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "INFO: =================================================="
-echo "INFO: --- Iniciando Script WordPress Setup (v2.4.0-XRAY) ($(date)) ---"
+echo "INFO: --- Iniciando Script WordPress Setup (v2.4.1) ($(date)) ---"
 echo "INFO: Script target: $THIS_SCRIPT_TARGET_PATH. Log: ${LOG_FILE}"
 echo "INFO: =================================================="
 if [ "$(id -u)" -ne 0 ]; then echo "ERRO: Execução inicial deve ser como root."; exit 1; fi
 
-# Verificação de variáveis (bloco omitido para brevidade, igual ao anterior)
 echo "INFO: Verificando e imprimindo variáveis de ambiente essenciais..."
 if [ -z "${ACCOUNT:-}" ]; then ACCOUNT_STS=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); if [ -n "$ACCOUNT_STS" ]; then ACCOUNT="$ACCOUNT_STS"; else ACCOUNT=""; fi; fi
 AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0=""
@@ -307,7 +280,7 @@ done
 if [ "$error_found" -eq 1 ]; then echo "ERRO CRÍTICO: Variáveis faltando. Abortando."; exit 1; fi
 echo "INFO: Verificação de variáveis concluída."
 
-### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES - COMPLETA E DEFINITIVA ###
+### INÍCIO DA SEÇÃO DE INSTALAÇÃO DE PACOTES - COMPLETA E ROBUSTA ###
 echo "INFO: Iniciando instalação de pacotes em fases para máxima robustez..."
 sudo yum update -y -q
 
@@ -322,6 +295,10 @@ echo "INFO: Pacote 'amazon-efs-utils' instalado com sucesso."
 
 # --- FASE 2: Configurar repositórios e instalar o restante dos pacotes ---
 echo "INFO: FASE 2 - Configurando repositórios e instalando pacotes restantes..."
+
+# CORREÇÃO: Habilita o repositório PHP 7.4 do Amazon Linux Extras.
+echo "INFO: Habilitando Amazon Linux Extras para PHP 7.4..."
+sudo amazon-linux-extras enable php7.4 -y
 
 # Configuração Robusta do Repositório ProxySQL v2.6
 echo "INFO: Configurando repositório YUM para o ProxySQL v2.6..."
@@ -338,12 +315,11 @@ if [ ! -f /etc/yum.repos.d/proxysql.repo ]; then
     exit 1
 fi
 
-# Limpa o cache do YUM para garantir que a nova fonte seja usada.
 echo "INFO: Limpando cache do YUM."
 sudo yum clean all
 
-# Instalação dos pacotes principais
-echo "INFO: Instalando pacotes principais (httpd, php, proxysql, xray, etc.)..."
+# Instalação dos pacotes principais (httpd, php, proxysql, xray, etc.).
+echo "INFO: Instalando pacotes principais..."
 sudo yum install -y httpd jq aws-cli mysql php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache proxysql xray
 if [ $? -ne 0 ]; then
     echo "ERRO CRÍTICO: Falha durante o 'yum install' dos pacotes principais."
@@ -360,6 +336,12 @@ if [ $? -ne 0 ]; then
 fi
 rm /tmp/composer-setup.php
 echo "INFO: Instalação do Composer concluída."
+
+# Verificação pós-instalação para garantir que o serviço X-Ray existe.
+if ! rpm -q xray > /dev/null; then
+    echo "ERRO CRÍTICO: O pacote 'xray' não foi instalado com sucesso. O serviço xray.service não estará disponível. Abortando."
+    exit 1
+fi
 
 echo "INFO: Todos os pacotes e ferramentas foram instalados com sucesso."
 ### FIM DA SEÇÃO DE INSTALAÇÃO DE PACOTES ###
@@ -395,11 +377,8 @@ else
     echo "WARN: Instalação do WordPress já existe. Pulando download."
 fi
 
-### INÍCIO DA SEÇÃO DE CONFIGURAÇÃO DO X-RAY ###
-# Chama a função para instalar o SDK e criar os arquivos de instrumentação.
-# Isso é feito depois que o WordPress está no lugar, mas antes de iniciar os serviços.
+### CHAMADA DA CONFIGURAÇÃO DO X-RAY (após instalação de pacotes e WP) ###
 setup_xray_instrumentation "$MOUNT_POINT"
-### FIM DA SEÇÃO DE CONFIGURAÇÃO DO X-RAY ###
 
 if [ ! -f "$ACTIVE_CONFIG_FILE_EFS" ]; then
     echo "INFO: '$ACTIVE_CONFIG_FILE_EFS' não encontrado. Criando...";
@@ -417,7 +396,8 @@ sudo find "$MOUNT_POINT" -type f -exec chmod 664 {} \;
 echo "INFO: Configurando Apache..."
 sudo sed -i "s#^DocumentRoot \"/var/www/html\"#DocumentRoot \"$MOUNT_POINT\"#" /etc/httpd/conf/httpd.conf
 sudo sed -i "s#^<Directory \"/var/www/html\">#<Directory \"$MOUNT_POINT\">#" /etc/httpd/conf/httpd.conf
-sudo tee "/etc/httpd/conf.d/wordpress.conf" >/dev/null <<< "<Directory \"$MOUNT_POINT\">; AllowOverride All; Require all granted; </Directory>"
+# CORREÇÃO: Removido o ponto e vírgula (;) para corrigir a sintaxe do Apache.
+sudo tee "/etc/httpd/conf.d/wordpress.conf" >/dev/null <<< "<Directory \"$MOUNT_POINT\"> AllowOverride All; Require all granted; </Directory>"
 tune_apache_and_phpfpm
 
 ### INÍCIO DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS MODIFICADA PARA X-RAY ###
@@ -451,7 +431,7 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "INFO: =================================================="
-echo "INFO: --- Script WordPress Setup (v2.4.0-XRAY) concluído! ($(date)) ---"
+echo "INFO: --- Script WordPress Setup (v2.4.1) concluído! ($(date)) ---"
 echo "INFO: Adicionado ProxySQL e instrumentação completa do AWS X-Ray."
 echo "INFO: WordPress agora envia traces para o X-Ray para cada requisição e chamada SQL."
 echo "INFO: =================================================="
