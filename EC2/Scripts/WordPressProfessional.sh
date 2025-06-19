@@ -1,19 +1,18 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.5.5 (Final e Robusto)
-# - Garante a limpeza de arquivos de instrumentação antigos no EFS para evitar problemas de cache.
-# - Corrige a porta de conexão do WordPress para o ProxySQL (6033).
-# - Corrige a chamada da API beginSegment do X-Ray.
-# - Corrige a lógica do db.php para a instalação do WordPress.
-# - Adiciona a função tune_apache_and_phpfpm e aumenta o memory_limit do PHP para 512M.
+# Versão: 3.0.0 (PHP 8.2 e Estável)
+# - ATUALIZADO: A versão do PHP foi alterada de 7.4 para 8.2, conforme recomendação da AWS.
+# - MANTIDO: Utiliza a instrumentação manual e robusta do X-Ray via UDP para o RDS,
+#   que é independente da versão do PHP e não requer Composer.
+# - OTIMIZADO: Removidos passos desnecessários (instalação do Composer, etc.).
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.5.5.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v3.0.0.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.5.5_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v3.0.0_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.5.5.log"
+LOG_FILE="/var/log/wordpress_setup_v3.0.0.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -211,30 +210,22 @@ setup_xray_instrumentation() {
     local wp_path="$1"
     echo "INFO (X-Ray): Iniciando a instrumentação manual e robusta do WordPress em '$wp_path'..."
 
-    # REMOVIDO: Não precisamos mais do Composer, o que elimina a fonte de falhas.
-    # A lógica de instrumentação agora é auto-contida.
-
     local db_dropin_path="$wp_path/wp-content/db.php"
     
+    # Garante que a instrumentação antiga seja removida antes de criar a nova.
+    sudo rm -f "$db_dropin_path"
+
     echo "INFO (X-Ray): Criando DB Drop-in com lógica de instrumentação manual via UDP."
-    # Este arquivo é a ÚNICA coisa necessária para a instrumentação.
     sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
 <?php
 /**
  * WordPress DB Drop-in for AWS X-Ray Tracing via Manual UDP Packet Submission.
- * Versão Final e Robusta: Esta abordagem não depende de pacotes Composer externos
- * e implementa a lógica de subsegmento diretamente, garantindo estabilidade e a
- * funcionalidade de tracing do RDS.
  */
 
-// Garante que a classe base wpdb do WordPress esteja sempre disponível.
 if (!class_exists('wpdb')) {
     require_once(ABSPATH . WPINC . '/wp-db.php');
 }
 
-/**
- * Classe auxiliar para criar e enviar subsegmentos do X-Ray manualmente.
- */
 class XRayManualTracer {
     private $is_sampled = false;
     private $trace_id;
@@ -245,12 +236,11 @@ class XRayManualTracer {
 
     public function __construct() {
         if (empty($_SERVER['HTTP_X_AMZN_TRACE_ID'])) {
-            return; // Nenhuma instrumentação se o cabeçalho não estiver presente.
+            return;
         }
 
         $trace_header = $_SERVER['HTTP_X_AMZN_TRACE_ID'];
         
-        // Exemplo: Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1
         foreach (explode(';', $trace_header) as $part) {
             list($key, $value) = explode('=', $part, 2);
             if ($key === 'Root') $this->trace_id = $value;
@@ -259,16 +249,10 @@ class XRayManualTracer {
         }
     }
 
-    /**
-     * Verifica se a requisição atual deve ser rastreada.
-     */
     public function isValid() {
         return $this->is_sampled && $this->trace_id && $this->parent_id;
     }
 
-    /**
-     * Envia o subsegmento formatado para o Daemon X-Ray via UDP.
-     */
     private function sendToDaemon(array $subsegment) {
         $socket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
         if ($socket) {
@@ -279,9 +263,6 @@ class XRayManualTracer {
         }
     }
 
-    /**
-     * Mede o tempo de uma função e envia o subsegmento.
-     */
     public function traceFunction(string $name, callable $func) {
         $start_time = microtime(true);
         try {
@@ -295,15 +276,11 @@ class XRayManualTracer {
                 'name'       => $name,
                 'start_time' => $start_time,
                 'end_time'   => $end_time,
-                'namespace'  => 'remote', // 'remote' para chamadas a outros serviços.
+                'namespace'  => 'remote',
             ];
             
-            // Adiciona informações específicas do SQL se o nome for 'RDS'
             if ($name === 'RDS') {
-                $subsegment['sql'] = [
-                    'database_type' => 'MySQL', // Ou o tipo do seu DB
-                    'user' => DB_USER
-                ];
+                $subsegment['sql'] = ['database_type' => 'MySQL', 'user' => DB_USER];
             }
 
             $this->sendToDaemon($subsegment);
@@ -311,9 +288,6 @@ class XRayManualTracer {
     }
 }
 
-/**
- * A classe wpdb personalizada que usa nosso tracer manual.
- */
 class XRay_wpdb extends wpdb {
     private $tracer;
 
@@ -323,36 +297,59 @@ class XRay_wpdb extends wpdb {
     }
 
     public function query($query) {
-        // Apenas instrumenta se o tracer for válido (cabeçalho presente e amostrado)
         if ($this->tracer->isValid()) {
             return $this->tracer->traceFunction('RDS', function() use ($query) {
                 return parent::query($query);
             });
         }
-        
-        // Caso contrário, executa a query normalmente.
         return parent::query($query);
     }
 }
 
-/**
- * Lógica final para instanciar a classe wpdb correta.
- */
 if (defined('WP_INSTALLING') && WP_INSTALLING) {
-    // Durante a instalação, use a classe padrão para evitar problemas.
     $wpdb = new wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 } else {
-    // Em operação normal, use nossa classe instrumentada.
     $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 }
 EOPHP
     echo "INFO (X-Ray): Instrumentação manual do WordPress concluída com sucesso."
 }
 
+tune_apache_and_phpfpm() {
+    echo "INFO (Performance Tuning): Otimizando Apache, PHP-FPM e limite de memória do PHP..."
+    
+    local APACHE_MPM_TUNING_CONF="/etc/httpd/conf.d/mpm_tuning.conf"
+    sudo tee "$APACHE_MPM_TUNING_CONF" >/dev/null <<EOF_APACHE_MPM
+<IfModule mpm_event_module>
+    StartServers             3
+    MinSpareThreads          25
+    MaxSpareThreads          75
+    ThreadsPerChild          25
+    ServerLimit              16
+    MaxRequestWorkers        400
+    MaxConnectionsPerChild   1000
+</IfModule>
+EOF_APACHE_MPM
+
+    local PHP_FPM_POOL_CONF="/etc/php-fpm.d/www.conf"
+    if [ -f "$PHP_FPM_POOL_CONF" ]; then
+        sudo sed -i 's/^pm.max_children = .*/pm.max_children = 50/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.start_servers = .*/pm.start_servers = 10/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.min_spare_servers = .*/pm.min_spare_servers = 10/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.max_spare_servers = .*/pm.max_spare_servers = 30/' "$PHP_FPM_POOL_CONF"
+    fi
+
+    local PHP_INI_FILE="/etc/php.ini"
+    if [ -f "$PHP_INI_FILE" ]; then
+        echo "INFO: Ajustando memory_limit do PHP para 512M em $PHP_INI_FILE..."
+        sudo sed -i 's/^;? *memory_limit *=.*/memory_limit = 512M/' "$PHP_INI_FILE"
+    fi
+}
+
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v2.5.5 - Final Robusto) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v3.0.0 - PHP 8.2) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -376,9 +373,10 @@ echo "INFO: Verificação de variáveis concluída."
 echo "INFO: Iniciando instalação de pacotes..."
 sudo yum update -y -q
 
-echo "INFO: Instalando dependências básicas e habilitando PHP 7.4..."
+# --- MUDANÇA PRINCIPAL: HABILITANDO O PHP 8.2 ---
+echo "INFO: Instalando dependências básicas e habilitando PHP 8.2..."
 sudo yum install -y amazon-efs-utils jq mysql
-sudo amazon-linux-extras enable php7.4 -y
+sudo amazon-linux-extras enable php8.2 -y
 
 echo "INFO: Instalando X-Ray Daemon manualmente via RPM para máxima compatibilidade..."
 if ! rpm -q xray > /dev/null; then
@@ -401,15 +399,8 @@ echo "INFO: Instalando pacotes restantes (PHP, ProxySQL)..."
 sudo yum install -y httpd php php-common php-fpm php-mysqlnd php-json php-cli php-xml php-zip php-gd php-mbstring php-soap php-opcache proxysql
 if [ $? -ne 0 ]; then echo "ERRO CRÍTICO: Falha durante o 'yum install' dos pacotes restantes."; exit 1; fi
 
-echo "INFO: Instalando Composer..."
-if ! command -v composer &> /dev/null; then
-    curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
-    sudo php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
-    rm /tmp/composer-setup.php
-fi
-
-echo "INFO: Verificando instalação do X-Ray..."
-if ! rpm -q xray > /dev/null; then echo "ERRO CRÍTICO: O pacote 'xray' não foi instalado com sucesso. Abortando."; exit 1; fi
+echo "INFO: Verificando instalação do X-Ray Daemon..."
+if ! rpm -q xray > /dev/null; then echo "ERRO CRÍTICO: O pacote 'xray' (daemon) não foi instalado com sucesso. Abortando."; exit 1; fi
 echo "INFO: Todos os pacotes e ferramentas foram instalados com sucesso."
 
 AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0="arn:aws:secretsmanager:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0}:${ACCOUNT}:secret:${AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0}"
@@ -434,12 +425,6 @@ if [ ! -d "$MOUNT_POINT/wp-includes" ]; then
     sudo -u "$APACHE_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
 fi
-
-# Apaga os arquivos de instrumentação antigos para forçar a recriação com o código corrigido.
-# Isso é crucial para implantações em EFS que já podem ter arquivos antigos com bugs.
-echo "INFO: Removendo arquivos de instrumentação antigos do EFS para garantir a recriação..."
-sudo rm -f "$MOUNT_POINT/wp-content/mu-plugins/xray-init.php"
-sudo rm -f "$MOUNT_POINT/wp-content/db.php"
 
 setup_xray_instrumentation "$MOUNT_POINT"
 
@@ -480,13 +465,9 @@ sudo systemctl enable "$PHP_FPM_SERVICE_NAME"
 sudo systemctl enable proxysql
 sudo systemctl enable xray
 
-echo "INFO: Reiniciando serviços na ordem correta para aplicar todas as mudanças e limpar o cache..."
-# Inicia/Reinicia serviços de baixo nível primeiro
+echo "INFO: Reiniciando serviços na ordem correta para aplicar todas as mudanças..."
 sudo systemctl restart xray
 sudo systemctl restart proxysql
-
-# Reinicia o PHP-FPM e o Apache POR ÚLTIMO para garantir que eles leiam
-# todas as configurações e arquivos de código mais recentes, limpando o OPcache.
 sudo systemctl restart "$PHP_FPM_SERVICE_NAME"
 sudo systemctl restart httpd
 
@@ -504,6 +485,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v2.5.5) concluído! ---"
+echo "--- Script WordPress Setup (v3.0.0) concluído! ---"
 echo "=================================================="
 exit 0
