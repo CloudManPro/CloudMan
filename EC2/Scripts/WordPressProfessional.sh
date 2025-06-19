@@ -314,6 +314,38 @@ EOPHP
     echo "INFO (X-Ray): Instrumentação do WordPress concluída."
 }
 
+tune_apache_and_phpfpm() {
+    echo "INFO (Performance Tuning): Otimizando Apache, PHP-FPM e limite de memória do PHP..."
+    
+    local APACHE_MPM_TUNING_CONF="/etc/httpd/conf.d/mpm_tuning.conf"
+    sudo tee "$APACHE_MPM_TUNING_CONF" >/dev/null <<EOF_APACHE_MPM
+<IfModule mpm_event_module>
+    StartServers             3
+    MinSpareThreads          25
+    MaxSpareThreads          75
+    ThreadsPerChild          25
+    ServerLimit              16
+    MaxRequestWorkers        400
+    MaxConnectionsPerChild   1000
+</IfModule>
+EOF_APACHE_MPM
+
+    local PHP_FPM_POOL_CONF="/etc/php-fpm.d/www.conf"
+    if [ -f "$PHP_FPM_POOL_CONF" ]; then
+        sudo sed -i 's/^pm.max_children = .*/pm.max_children = 50/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.start_servers = .*/pm.start_servers = 10/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.min_spare_servers = .*/pm.min_spare_servers = 10/' "$PHP_FPM_POOL_CONF"
+        sudo sed -i 's/^pm.max_spare_servers = .*/pm.max_spare_servers = 30/' "$PHP_FPM_POOL_CONF"
+    fi
+
+    local PHP_INI_FILE="/etc/php.ini"
+    if [ -f "$PHP_INI_FILE" ]; then
+        echo "INFO: Ajustando memory_limit do PHP para 512M em $PHP_INI_FILE..."
+        # Esta expressão regular encontra a linha memory_limit, mesmo que esteja comentada, e a substitui.
+        sudo sed -i 's/^;? *memory_limit *=.*/memory_limit = 512M/' "$PHP_INI_FILE"
+    fi
+}
+
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
