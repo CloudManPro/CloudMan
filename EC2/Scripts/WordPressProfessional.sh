@@ -243,8 +243,7 @@ EOF
     local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
     sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
     
-    # A remoção explícita já é feita na lógica principal do script.
-    # Esta verificação garante que não se sobrescreva um arquivo já corrigido.
+    # Esta verificação é intencional para idempotência. A limpeza explícita já é feita na lógica principal do script.
     if [ ! -f "$xray_init_plugin_path" ]; then
         echo "INFO (X-Ray): Criando Must-Use Plugin em '$xray_init_plugin_path'..."
         sudo -u "$APACHE_USER" tee "$xray_init_plugin_path" > /dev/null <<'EOPHP'
@@ -273,39 +272,38 @@ EOPHP
     fi
 
     local db_dropin_path="$wp_path/wp-content/db.php"
-    # A remoção explícita já é feita na lógica principal do script.
+    # A limpeza explícita já é feita na lógica principal do script.
     if [ ! -f "$db_dropin_path" ]; then
-        echo "INFO (X-Ray): Criando DB Drop-in com lógica corrigida para a instalação em '$db_dropin_path'..."
+        echo "INFO (X-Ray): Criando DB Drop-in com lógica e sintaxe finais e refatoradas em '$db_dropin_path'..."
         sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
 <?php
 /**
  * WordPress DB Drop-in for AWS X-Ray Tracing.
- * CORREÇÃO: A classe XRay_wpdb é definida incondicionalmente para estar sempre disponível.
- * A decisão de qual objeto instanciar ($wpdb) é feita com base na constante WP_INSTALLING.
+ * Versão Final: Código refatorado para ser mais limpo, eficiente e corrigir os bugs de instalação e execução.
  */
 
-// Garante que a classe base wpdb esteja disponível.
+// Garante que a classe base wpdb do WordPress esteja sempre disponível.
 if (!class_exists('wpdb')) {
     require_once(ABSPATH . WPINC . '/wp-db.php');
 }
 
 /**
- * Define a classe personalizada para o X-Ray. 
- * A definição deve SEMPRE existir para que o PHP a conheça.
+ * Define a classe personalizada para o X-Ray.
+ * Ela estende a classe 'wpdb' padrão e intercepta o método 'query'.
  */
 class XRay_wpdb extends wpdb {
     public function query($query) {
         $xray_client = $GLOBALS['xray_client'] ?? null;
-        
-        // Se o cliente X-Ray não estiver disponível, volta para o comportamento padrão.
+
+        // Se o cliente X-Ray não foi inicializado, executa a query normalmente.
         if (!$xray_client) {
             return parent::query($query);
         }
 
-        // Inicia um subsegmento para a consulta ao banco de dados.
-        $xray_client->beginSubsegment('RDS-Query');
+        // CORREÇÃO FINAL: A chamada para beginSubsegment agora usa a sintaxe de array correta.
+        $xray_client->beginSubsegment(['Name' => 'RDS-Query']);
         try {
-            $xray_client->addMetadata('sql', substr($query, 0, 500)); // Adiciona os primeiros 500 chars da query
+            $xray_client->addMetadata('sql', substr($query, 0, 500));
             $result = parent::query($query);
             if ($this->last_error) {
                 $xray_client->addAnnotation('db_error', true);
@@ -319,14 +317,14 @@ class XRay_wpdb extends wpdb {
 }
 
 /**
- * Decide QUAL classe instanciar baseado no contexto (instalação ou operação normal).
- * Esta é a correção crucial para o erro crítico na tela de instalação.
+ * LÓGICA FINAL: Decide QUAL classe instanciar para a variável global $wpdb.
+ * Esta é a correção crucial que resolve o erro na tela de instalação.
  */
 if (defined('WP_INSTALLING') && WP_INSTALLING) {
-    // Durante a instalação, use a classe padrão do WordPress para evitar problemas.
+    // Durante a instalação, usa a classe padrão do WordPress para evitar problemas.
     $wpdb = new wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 } else {
-    // Em operação normal, use nossa classe instrumentada com X-Ray.
+    // Em operação normal, usa nossa classe instrumentada com X-Ray.
     $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 }
 EOPHP
