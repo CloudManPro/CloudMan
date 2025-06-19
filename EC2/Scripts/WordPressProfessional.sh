@@ -1,15 +1,19 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.5.1 (Corrige a porta de conexão do WordPress para o ProxySQL)
-# Garante a remoção de composer.lock e vendor/ antes do 'composer install'.
+# Versão: 2.5.4 (Final e Robusto)
+# - Garante a limpeza de arquivos de instrumentação antigos no EFS.
+# - Corrige a porta de conexão do WordPress para o ProxySQL (6033).
+# - Corrige a chamada da API beginSegment do X-Ray.
+# - Corrige a lógica do db.php para a instalação do WordPress.
+# - Adiciona a função tune_apache_and_phpfpm e aumenta o memory_limit do PHP para 512M.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.5.1.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.5.4.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.5.1_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.5.4_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.5.1.log"
+LOG_FILE="/var/log/wordpress_setup_v2.5.4.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -180,21 +184,17 @@ setup_and_configure_proxysql() {
     fi
     sleep 5
 
-    # Limpa configurações antigas para garantir a idempotência
     run_proxysql_admin "DELETE FROM mysql_servers WHERE hostgroup_id = 10;"
     run_proxysql_admin "DELETE FROM mysql_users WHERE username = '${db_user}';"
     run_proxysql_admin "DELETE FROM mysql_query_rules WHERE rule_id = 1;"
 
-    # Insere as novas configurações para o APLICATIVO
     run_proxysql_admin "INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (10, '${rds_host}', ${rds_port});"
     run_proxysql_admin "INSERT INTO mysql_users (username, password, default_hostgroup) VALUES ('${db_user}', '${db_pass}', 10);"
     run_proxysql_admin "INSERT INTO mysql_query_rules (rule_id, active, username, destination_hostgroup, apply) VALUES (1, 1, '${db_user}', 10, 1);"
     
-    # === CORREÇÃO: Define as credenciais para o MONITORAMENTO INTERNO do ProxySQL ===
     run_proxysql_admin "UPDATE global_variables SET variable_value='${db_user}' WHERE variable_name='mysql-monitor_username';"
     run_proxysql_admin "UPDATE global_variables SET variable_value='${db_pass}' WHERE variable_name='mysql-monitor_password';"
     
-    # Carrega e salva TODAS as configurações
     run_proxysql_admin "LOAD MYSQL VARIABLES TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL SERVERS TO RUNTIME;"
     run_proxysql_admin "LOAD MYSQL USERS TO RUNTIME;"
@@ -243,7 +243,6 @@ EOF
     local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
     sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
     
-    # === CORREÇÃO 1: Corrige a chamada da API do X-Ray beginSegment ===
     if [ ! -f "$xray_init_plugin_path" ]; then
         echo "INFO (X-Ray): Criando Must-Use Plugin em '$xray_init_plugin_path'..."
         sudo -u "$APACHE_USER" tee "$xray_init_plugin_path" > /dev/null <<'EOPHP'
@@ -251,13 +250,11 @@ EOF
 /**
  * Plugin Name: AWS X-Ray Tracer Initializer
  */
-
 if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'healthcheck.php') !== false) { return; }
 if (file_exists(__DIR__ . '/../../vendor/autoload.php')) {
     require_once __DIR__ . '/../../vendor/autoload.php';
     $xray_client = new Aws\XRay\XRayClient(['version' => 'latest', 'region'  => getenv('AWS_REGION') ?: 'us-east-1', 'daemon_address' => '127.0.0.1:2000']);
     $segment_name = $_SERVER['HTTP_HOST'] ?? 'wordpress-site';
-    // CORREÇÃO: Passa os parâmetros como um array associativo, como esperado pelo AWS SDK v3.
     $xray_client->beginSegment(['Name' => $segment_name]);
     register_shutdown_function(function() use ($xray_client) { $xray_client->endSegment(); $xray_client->send(); });
     $GLOBALS['xray_client'] = $xray_client;
@@ -266,45 +263,28 @@ EOPHP
     fi
 
     local db_dropin_path="$wp_path/wp-content/db.php"
-    # === CORREÇÃO 2: Corrige a lógica do db.php para funcionar durante a instalação do WordPress ===
     if [ ! -f "$db_dropin_path" ]; then
         echo "INFO (X-Ray): Criando DB Drop-in em '$db_dropin_path'..."
         sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
 <?php
 /**
  * WordPress DB Drop-in for AWS X-Ray Tracing.
- * CORREÇÃO: Garante que $wpdb seja instanciado durante a instalação.
  */
-
-if (!class_exists('wpdb')) {
-    require_once(ABSPATH . WPINC . '/wp-db.php');
-}
-
-// Durante a instalação, use a classe wpdb padrão para evitar problemas.
+if (!class_exists('wpdb')) { require_once(ABSPATH . WPINC . '/wp-db.php'); }
 if (defined('WP_INSTALLING') && WP_INSTALLING) {
     $wpdb = new wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
-} 
-// Em operação normal, use a classe estendida para o X-Ray.
-else {
+} else {
     class XRay_wpdb extends wpdb {
         public function query($query) {
             $xray_client = $GLOBALS['xray_client'] ?? null;
-            if (!$xray_client) {
-                return parent::query($query);
-            }
-            
+            if (!$xray_client) { return parent::query($query); }
             $xray_client->beginSubsegment('RDS-Query');
             try {
                 $xray_client->addMetadata('sql', substr($query, 0, 500));
                 $result = parent::query($query);
-                if ($this->last_error) {
-                    $xray_client->addAnnotation('db_error', true);
-                    $xray_client->addMetadata('db_error_message', $this->last_error);
-                }
+                if ($this->last_error) { $xray_client->addAnnotation('db_error', true); $xray_client->addMetadata('db_error_message', $this->last_error); }
                 return $result;
-            } finally {
-                $xray_client->endSubsegment();
-            }
+            } finally { $xray_client->endSubsegment(); }
         }
     }
     $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
@@ -341,7 +321,6 @@ EOF_APACHE_MPM
     local PHP_INI_FILE="/etc/php.ini"
     if [ -f "$PHP_INI_FILE" ]; then
         echo "INFO: Ajustando memory_limit do PHP para 512M em $PHP_INI_FILE..."
-        # Esta expressão regular encontra a linha memory_limit, mesmo que esteja comentada, e a substitui.
         sudo sed -i 's/^;? *memory_limit *=.*/memory_limit = 512M/' "$PHP_INI_FILE"
     fi
 }
@@ -349,7 +328,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v2.5.1) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v2.5.4 - Final) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -421,8 +400,6 @@ DB_PASSWORD=$(echo "$SECRET_STRING_VALUE" | jq -r .password)
 DB_NAME_TO_USE="$AWS_DB_INSTANCE_TARGET_NAME_0"
 RDS_ACTUAL_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1)
 RDS_ACTUAL_PORT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f2); [ -z "$RDS_ACTUAL_PORT" ] && RDS_ACTUAL_PORT=3306
-# --- CORREÇÃO: Define o host e a porta do ProxySQL para a conexão do WordPress ---
-# O ProxySQL escuta clientes na porta 6033, não na porta padrão 3306 do MySQL.
 DB_HOST_FOR_WP_CONFIG="127.0.0.1:6033"
 setup_and_configure_proxysql "$RDS_ACTUAL_HOST_ENDPOINT" "$RDS_ACTUAL_PORT" "$DB_USER" "$DB_PASSWORD"
 
@@ -434,6 +411,12 @@ if [ ! -d "$MOUNT_POINT/wp-includes" ]; then
     sudo -u "$APACHE_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
 fi
+
+# Apaga os arquivos de instrumentação antigos para forçar a recriação com o código corrigido.
+# Isso é crucial para implantações em EFS que já podem ter arquivos antigos com bugs.
+echo "INFO: Removendo arquivos de instrumentação antigos do EFS para garantir a recriação..."
+sudo rm -f "$MOUNT_POINT/wp-content/mu-plugins/xray-init.php"
+sudo rm -f "$MOUNT_POINT/wp-content/db.php"
 
 setup_xray_instrumentation "$MOUNT_POINT"
 
@@ -452,7 +435,6 @@ echo "INFO: Configurando Apache..."
 sudo sed -i "s#^DocumentRoot \"/var/www/html\"#DocumentRoot \"$MOUNT_POINT\"#" /etc/httpd/conf/httpd.conf
 sudo sed -i "s#^<Directory \"/var/www/html\">#<Directory \"$MOUNT_POINT\">#" /etc/httpd/conf/httpd.conf
 
-# === CORREÇÃO: Usando "here document" para evitar erros de sintaxe do shell ===
 sudo tee "/etc/httpd/conf.d/wordpress.conf" >/dev/null <<EOF
 <Directory "$MOUNT_POINT">
     AllowOverride All
@@ -494,6 +476,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v2.5.1) concluído! ---"
+echo "--- Script WordPress Setup (v2.5.4) concluído! ---"
 echo "=================================================="
 exit 0
