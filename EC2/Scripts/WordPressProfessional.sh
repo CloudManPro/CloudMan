@@ -1,15 +1,15 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.4.7 (Corrige erro do composer.lock em EFS preexistente e garante legibilidade)
+# Versão: 2.4.8 (Corrige o nome do pacote Composer para o AWS SDK)
 # Garante a remoção de composer.lock e vendor/ antes do 'composer install'.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.7.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.4.8.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.7_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.4.8_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.4.7.log"
+LOG_FILE="/var/log/wordpress_setup_v2.4.8.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -200,10 +200,11 @@ setup_xray_instrumentation() {
 
     local composer_json_path="$wp_path/composer.json"
     echo "INFO (X-Ray): Criando/Atualizando '$composer_json_path'..."
+    # CORREÇÃO: O pacote 'aws/aws-xray' não existe. O correto é 'aws/aws-sdk-php', que contém o cliente X-Ray.
     sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
 {
     "require": {
-        "aws/aws-xray": "^1.0"
+        "aws/aws-sdk-php": "^3.0"
     },
     "config": {
         "platform": {
@@ -242,7 +243,7 @@ EOF
 if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'healthcheck.php') !== false) { return; }
 if (file_exists(__DIR__ . '/../../vendor/autoload.php')) {
     require_once __DIR__ . '/../../vendor/autoload.php';
-    $xray_client = new Aws\XRay\XRayClient(['version' => 'latest', 'region'  => getenv('AWS_REGION') ?: 'us-east-1', 'daemon_name' => '127.0.0.1:2000']);
+    $xray_client = new Aws\XRay\XRayClient(['version' => 'latest', 'region'  => getenv('AWS_REGION') ?: 'us-east-1', 'daemon_address' => '127.0.0.1:2000']);
     $segment_name = $_SERVER['HTTP_HOST'] ?? 'wordpress-site';
     $xray_client->beginSegment($segment_name, null);
     register_shutdown_function(function() use ($xray_client) { $xray_client->endSegment(); $xray_client->send(); });
@@ -260,8 +261,9 @@ EOPHP
  * WordPress DB Drop-in for AWS X-Ray Tracing.
  */
 
-if (file_exists(ABSPATH . WPINC . '/wp-db.php')) { require_once(ABSPATH . WPINC . '/wp-db.php'); }
-if (class_exists('wpdb')) {
+if (defined('WP_INSTALLING') && WP_INSTALLING) {
+    require_once(ABSPATH . WPINC . '/wp-db.php');
+} else {
     class XRay_wpdb extends wpdb {
         public function query($query) {
             $xray_client = $GLOBALS['xray_client'] ?? null;
@@ -310,7 +312,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v2.4.7) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v2.4.8) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -444,6 +446,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v2.4.7) concluído! ---"
+echo "--- Script WordPress Setup (v2.4.8) concluído! ---"
 echo "=================================================="
 exit 0
