@@ -1,15 +1,15 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 2.5.0 (Corrige erro de sintaxe na configuração do Apache)
+# Versão: 2.5.1 (Corrige a porta de conexão do WordPress para o ProxySQL)
 # Garante a remoção de composer.lock e vendor/ antes do 'composer install'.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.5.0.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v2.5.1.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.5.0_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v2.5.1_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v2.5.0.log"
+LOG_FILE="/var/log/wordpress_setup_v2.5.1.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -323,7 +323,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v2.5.0) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v2.5.1) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -395,7 +395,9 @@ DB_PASSWORD=$(echo "$SECRET_STRING_VALUE" | jq -r .password)
 DB_NAME_TO_USE="$AWS_DB_INSTANCE_TARGET_NAME_0"
 RDS_ACTUAL_HOST_ENDPOINT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f1)
 RDS_ACTUAL_PORT=$(echo "$AWS_DB_INSTANCE_TARGET_ENDPOINT_0" | cut -d: -f2); [ -z "$RDS_ACTUAL_PORT" ] && RDS_ACTUAL_PORT=3306
-DB_HOST_FOR_WP_CONFIG="127.0.0.1"
+# --- CORREÇÃO: Define o host e a porta do ProxySQL para a conexão do WordPress ---
+# O ProxySQL escuta clientes na porta 6033, não na porta padrão 3306 do MySQL.
+DB_HOST_FOR_WP_CONFIG="127.0.0.1:6033"
 setup_and_configure_proxysql "$RDS_ACTUAL_HOST_ENDPOINT" "$RDS_ACTUAL_PORT" "$DB_USER" "$DB_PASSWORD"
 
 if [ ! -d "$MOUNT_POINT/wp-includes" ]; then
@@ -466,6 +468,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v2.5.0) concluído! ---"
+echo "--- Script WordPress Setup (v2.5.1) concluído! ---"
 echo "=================================================="
 exit 0
