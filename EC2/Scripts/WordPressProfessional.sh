@@ -209,146 +209,144 @@ setup_and_configure_proxysql() {
 
 setup_xray_instrumentation() {
     local wp_path="$1"
-    echo "INFO (X-Ray): Iniciando instrumentação do WordPress em '$wp_path' com o SDK correto..."
+    echo "INFO (X-Ray): Iniciando a instrumentação manual e robusta do WordPress em '$wp_path'..."
 
-    local composer_json_path="$wp_path/composer.json"
-    echo "INFO (X-Ray): CORREÇÃO: Usando o SDK 'aws/aws-xray-sdk-php' para instrumentação."
-    sudo -u "$APACHE_USER" tee "$composer_json_path" >/dev/null <<'EOF'
-{
-    "require": {
-        "aws/aws-xray-sdk-php": "^1.0"
-    },
-    "config": {
-        "platform": {
-            "php": "7.4"
-        }
-    }
-}
-EOF
+    # REMOVIDO: Não precisamos mais do Composer, o que elimina a fonte de falhas.
+    # A lógica de instrumentação agora é auto-contida.
 
-    echo "INFO (X-Ray): Removendo arquivos antigos do Composer para garantir uma instalação limpa com o novo SDK..."
-    sudo -u "$APACHE_USER" rm -f "$wp_path/composer.lock"
-    sudo -u "$APACHE_USER" rm -rf "$wp_path/vendor"
-
-    echo "INFO (X-Ray): Executando 'composer install' para o SDK de instrumentação..."
-    local COMPOSER_CACHE_DIR="/tmp/composer_cache_apache"
-    sudo -u "$APACHE_USER" mkdir -p "$COMPOSER_CACHE_DIR"
-    (cd "$wp_path" && sudo -u "$APACHE_USER" COMPOSER_HOME="$COMPOSER_CACHE_DIR" COMPOSER_PROCESS_TIMEOUT=0 /usr/local/bin/composer install --no-dev -o)
-    if [ $? -ne 0 ]; then
-        echo "ERRO CRÍTICO (X-Ray): Falha no 'composer install' do SDK de instrumentação."
-        exit 1
-    fi
-    
-    local mu_plugin_dir="$wp_path/wp-content/mu-plugins"
-    local xray_init_plugin_path="$mu_plugin_dir/xray-init.php"
-    sudo -u "$APACHE_USER" mkdir -p "$mu_plugin_dir"
-    
-    echo "INFO (X-Ray): CORREÇÃO: Criando Must-Use Plugin com a lógica do Tracer do X-Ray SDK."
-    sudo -u "$APACHE_USER" tee "$xray_init_plugin_path" > /dev/null <<'EOPHP'
-<?php
-/**
- * Plugin Name: AWS X-Ray Tracer Initializer (SDK Corrigido)
- */
-if (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'healthcheck.php') !== false) { return; }
-
-if (file_exists(__DIR__ . '/../../vendor/autoload.php')) {
-    require_once __DIR__ . '/../../vendor/autoload.php';
-
-    try {
-        // Usa as classes corretas do SDK de instrumentação
-        $emitter = new Aws\XRay\Emitters\DaemonEmitter('127.0.0.1:2000');
-        $segment_name = $_SERVER['HTTP_HOST'] ?? 'wordpress-site';
-        $tracer = new Aws\XRay\Tracer($segment_name, null, $emitter);
-        
-        // Armazena o tracer globalmente para ser usado por outros componentes (como db.php)
-        $GLOBALS['xray_tracer'] = $tracer;
-
-        // Garante que os dados sejam enviados ao final da requisição
-        register_shutdown_function(function() use ($tracer) {
-            $tracer->send();
-        });
-    } catch (\Exception $e) {
-        // Falha silenciosamente se o tracer não puder ser criado
-    }
-}
-EOPHP
-    
     local db_dropin_path="$wp_path/wp-content/db.php"
-    echo "INFO (X-Ray): CORREÇÃO: Criando DB Drop-in que usa o Tracer para criar Subsegmentos."
+    
+    echo "INFO (X-Ray): Criando DB Drop-in com lógica de instrumentação manual via UDP."
+    # Este arquivo é a ÚNICA coisa necessária para a instrumentação.
     sudo -u "$APACHE_USER" tee "$db_dropin_path" > /dev/null <<'EOPHP'
 <?php
 /**
- * WordPress DB Drop-in for AWS X-Ray Tracing (SDK Corrigido).
+ * WordPress DB Drop-in for AWS X-Ray Tracing via Manual UDP Packet Submission.
+ * Versão Final e Robusta: Esta abordagem não depende de pacotes Composer externos
+ * e implementa a lógica de subsegmento diretamente, garantindo estabilidade e a
+ * funcionalidade de tracing do RDS.
  */
-if (!class_exists('wpdb')) { require_once(ABSPATH . WPINC . '/wp-db.php'); }
 
-class XRay_wpdb extends wpdb {
-    public function query($query) {
-        // Busca o Tracer global, não o XRayClient
-        $tracer = $GLOBALS['xray_tracer'] ?? null;
-        if (!$tracer) {
-            return parent::query($query);
+// Garante que a classe base wpdb do WordPress esteja sempre disponível.
+if (!class_exists('wpdb')) {
+    require_once(ABSPATH . WPINC . '/wp-db.php');
+}
+
+/**
+ * Classe auxiliar para criar e enviar subsegmentos do X-Ray manualmente.
+ */
+class XRayManualTracer {
+    private $is_sampled = false;
+    private $trace_id;
+    private $parent_id;
+    private $daemon_address = '127.0.0.1';
+    private $daemon_port = 2000;
+    const UDP_HEADER = "{\"format\": \"json\", \"version\": 1}\n";
+
+    public function __construct() {
+        if (empty($_SERVER['HTTP_X_AMZN_TRACE_ID'])) {
+            return; // Nenhuma instrumentação se o cabeçalho não estiver presente.
         }
 
-        // Usa os métodos corretos do Tracer
-        $tracer->beginSubsegment('RDS-Query');
+        $trace_header = $_SERVER['HTTP_X_AMZN_TRACE_ID'];
+        
+        // Exemplo: Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1
+        foreach (explode(';', $trace_header) as $part) {
+            list($key, $value) = explode('=', $part, 2);
+            if ($key === 'Root') $this->trace_id = $value;
+            if ($key === 'Parent') $this->parent_id = $value;
+            if ($key === 'Sampled') $this->is_sampled = ($value === '1');
+        }
+    }
+
+    /**
+     * Verifica se a requisição atual deve ser rastreada.
+     */
+    public function isValid() {
+        return $this->is_sampled && $this->trace_id && $this->parent_id;
+    }
+
+    /**
+     * Envia o subsegmento formatado para o Daemon X-Ray via UDP.
+     */
+    private function sendToDaemon(array $subsegment) {
+        $socket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+        if ($socket) {
+            $json_payload = json_encode($subsegment);
+            $udp_message = self::UDP_HEADER . $json_payload;
+            @socket_sendto($socket, $udp_message, strlen($udp_message), 0, $this->daemon_address, $this->daemon_port);
+            socket_close($socket);
+        }
+    }
+
+    /**
+     * Mede o tempo de uma função e envia o subsegmento.
+     */
+    public function traceFunction(string $name, callable $func) {
+        $start_time = microtime(true);
         try {
-            // Adiciona metadados ao subsegmento atual
-            $subsegment = $tracer->getCurrentSubsegment();
-            if ($subsegment) {
-                $subsegment->setMetadata(['sql' => substr($query, 0, 500)]);
-            }
-
-            $result = parent::query($query);
-
-            if ($this->last_error && $subsegment) {
-                $subsegment->setAnnotations(['db_error' => true]);
-                $subsegment->setMetadata(['db_error_message' => $this->last_error]);
-            }
-            return $result;
+            return $func();
         } finally {
-            $tracer->endSubsegment();
+            $end_time = microtime(true);
+            $subsegment = [
+                'id'         => bin2hex(random_bytes(8)),
+                'trace_id'   => $this->trace_id,
+                'parent_id'  => $this->parent_id,
+                'name'       => $name,
+                'start_time' => $start_time,
+                'end_time'   => $end_time,
+                'namespace'  => 'remote', // 'remote' para chamadas a outros serviços.
+            ];
+            
+            // Adiciona informações específicas do SQL se o nome for 'RDS'
+            if ($name === 'RDS') {
+                $subsegment['sql'] = [
+                    'database_type' => 'MySQL', // Ou o tipo do seu DB
+                    'user' => DB_USER
+                ];
+            }
+
+            $this->sendToDaemon($subsegment);
         }
     }
 }
 
+/**
+ * A classe wpdb personalizada que usa nosso tracer manual.
+ */
+class XRay_wpdb extends wpdb {
+    private $tracer;
+
+    public function __construct($dbuser, $dbpassword, $dbname, $dbhost) {
+        parent::__construct($dbuser, $dbpassword, $dbname, $dbhost);
+        $this->tracer = new XRayManualTracer();
+    }
+
+    public function query($query) {
+        // Apenas instrumenta se o tracer for válido (cabeçalho presente e amostrado)
+        if ($this->tracer->isValid()) {
+            return $this->tracer->traceFunction('RDS', function() use ($query) {
+                return parent::query($query);
+            });
+        }
+        
+        // Caso contrário, executa a query normalmente.
+        return parent::query($query);
+    }
+}
+
+/**
+ * Lógica final para instanciar a classe wpdb correta.
+ */
 if (defined('WP_INSTALLING') && WP_INSTALLING) {
+    // Durante a instalação, use a classe padrão para evitar problemas.
     $wpdb = new wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 } else {
+    // Em operação normal, use nossa classe instrumentada.
     $wpdb = new XRay_wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
 }
 EOPHP
-    echo "INFO (X-Ray): Instrumentação do WordPress concluída com sucesso usando o SDK correto."
-}
-tune_apache_and_phpfpm() {
-    echo "INFO (Performance Tuning): Otimizando Apache, PHP-FPM e limite de memória do PHP..."
-    
-    local APACHE_MPM_TUNING_CONF="/etc/httpd/conf.d/mpm_tuning.conf"
-    sudo tee "$APACHE_MPM_TUNING_CONF" >/dev/null <<EOF_APACHE_MPM
-<IfModule mpm_event_module>
-    StartServers             3
-    MinSpareThreads          25
-    MaxSpareThreads          75
-    ThreadsPerChild          25
-    ServerLimit              16
-    MaxRequestWorkers        400
-    MaxConnectionsPerChild   1000
-</IfModule>
-EOF_APACHE_MPM
-
-    local PHP_FPM_POOL_CONF="/etc/php-fpm.d/www.conf"
-    if [ -f "$PHP_FPM_POOL_CONF" ]; then
-        sudo sed -i 's/^pm.max_children = .*/pm.max_children = 50/' "$PHP_FPM_POOL_CONF"
-        sudo sed -i 's/^pm.start_servers = .*/pm.start_servers = 10/' "$PHP_FPM_POOL_CONF"
-        sudo sed -i 's/^pm.min_spare_servers = .*/pm.min_spare_servers = 10/' "$PHP_FPM_POOL_CONF"
-        sudo sed -i 's/^pm.max_spare_servers = .*/pm.max_spare_servers = 30/' "$PHP_FPM_POOL_CONF"
-    fi
-
-    local PHP_INI_FILE="/etc/php.ini"
-    if [ -f "$PHP_INI_FILE" ]; then
-        echo "INFO: Ajustando memory_limit do PHP para 512M em $PHP_INI_FILE..."
-        sudo sed -i 's/^;? *memory_limit *=.*/memory_limit = 512M/' "$PHP_INI_FILE"
-    fi
+    echo "INFO (X-Ray): Instrumentação manual do WordPress concluída com sucesso."
 }
 
 # --- Lógica Principal de Execução ---
