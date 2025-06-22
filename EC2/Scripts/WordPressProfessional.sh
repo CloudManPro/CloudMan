@@ -1,7 +1,7 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 3.1.0 (PHP 8.2 e WordPress 6.8.1 Fixo)
-# - ATUALIZADO: A instalação do WordPress foi fixada na versão 6.8.1 para garantir implantações consistentes.
+# Versão: 3.1.0 (PHP 8.2 e WordPress 5.9.10 Fixo)
+# - ATUALIZADO: A instalação do WordPress foi fixada na versão 5.9.10 para garantir implantações consistentes.
 # - MANTIDO: PHP 8.2 e instrumentação manual robusta do X-Ray via UDP.
 
 # --- Configurações Chave ---
@@ -347,7 +347,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v3.1.0 - PHP 8.2, WP 6.8.1) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v3.1.0 - PHP 8.2, WP 5.9.10) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -415,11 +415,11 @@ DB_HOST_FOR_WP_CONFIG="127.0.0.1:6033"
 setup_and_configure_proxysql "$RDS_ACTUAL_HOST_ENDPOINT" "$RDS_ACTUAL_PORT" "$DB_USER" "$DB_PASSWORD"
 
 if [ ! -d "$MOUNT_POINT/wp-includes" ]; then
-    echo "INFO: WordPress 6.8.1 não encontrado no EFS. Baixando e instalando..."
+    echo "INFO: WordPress 5.9.10 não encontrado no EFS. Baixando e instalando..."
     sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     # --- MUDANÇA PRINCIPAL: BAIXANDO UMA VERSÃO FIXA DO WORDPRESS ---
-    (cd "$WP_DOWNLOAD_DIR" && curl -sLO https://wordpress.org/wordpress-6.8.1.tar.gz && tar -xzf wordpress-6.8.1.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1)
+    (cd "$WP_DOWNLOAD_DIR" && curl -sLO https://wordpress.org/wordpress-5.9.10.tar.gz && tar -xzf wordpress-5.9.10.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1)
     if [ $? -ne 0 ]; then echo "ERRO CRÍTICO: Falha ao baixar ou extrair o WordPress."; exit 1; fi
     sudo -u "$APACHE_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
