@@ -1,16 +1,16 @@
 #!/bin/bash
 # === Script de Configuração do WordPress em EC2 com EFS, RDS, ProxySQL e X-Ray ===
-# Versão: 3.1.0 (PHP 8.2 e WordPress 5.9.10 Fixo)
-# - ATUALIZADO: A instalação do WordPress foi fixada na versão 5.9.10 para garantir implantações consistentes.
+# Versão: 3.2.0 (PHP 8.2 e WordPress Dinâmico)
+# - ADICIONADO: Variável de ambiente 'WP_VERSION' para controlar a versão do WordPress. Se vazia ou "latest", instala a mais recente.
 # - MANTIDO: PHP 8.2 e instrumentação manual robusta do X-Ray via UDP.
 
 # --- Configurações Chave ---
-readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v3.1.0.sh"
+readonly THIS_SCRIPT_TARGET_PATH="/usr/local/bin/wordpress_setup_v3.2.0.sh"
 readonly APACHE_USER="apache"
-readonly ENV_VARS_FILE="/etc/wordpress_setup_v3.1.0_env_vars.sh"
+readonly ENV_VARS_FILE="/etc/wordpress_setup_v3.2.0_env_vars.sh"
 
 # --- Variáveis Globais ---
-LOG_FILE="/var/log/wordpress_setup_v3.1.0.log"
+LOG_FILE="/var/log/wordpress_setup_v3.2.0.log"
 MOUNT_POINT="/var/www/html"
 WP_DOWNLOAD_DIR="/tmp/wp_download_temp"
 WP_FINAL_CONTENT_DIR="/tmp/wp_final_efs_content"
@@ -210,7 +210,6 @@ setup_xray_instrumentation() {
 
     local db_dropin_path="$wp_path/wp-content/db.php"
     
-    # Garante que a instrumentação antiga seja removida antes de criar a nova.
     sudo rm -f "$db_dropin_path"
 
     echo "INFO (X-Ray): Criando DB Drop-in com lógica de instrumentação manual via UDP."
@@ -347,7 +346,7 @@ EOF_APACHE_MPM
 # --- Lógica Principal de Execução ---
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "=================================================="
-echo "--- Iniciando Script WordPress Setup (v3.1.0 - PHP 8.2, WP 5.9.10) ($(date)) ---"
+echo "--- Iniciando Script WordPress Setup (v3.2.0 - PHP 8.2, WP Dinâmico) ($(date)) ---"
 echo "=================================================="
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -415,12 +414,39 @@ DB_HOST_FOR_WP_CONFIG="127.0.0.1:6033"
 setup_and_configure_proxysql "$RDS_ACTUAL_HOST_ENDPOINT" "$RDS_ACTUAL_PORT" "$DB_USER" "$DB_PASSWORD"
 
 if [ ! -d "$MOUNT_POINT/wp-includes" ]; then
-    echo "INFO: WordPress 5.9.10 não encontrado no EFS. Baixando e instalando..."
+    # --- INÍCIO DA LÓGICA DE VERSÃO DINÂMICA DO WORDPRESS ---
+    # Determina a versão a ser instalada com base na variável de ambiente WP_VERSION.
+    # Se WP_VERSION estiver vazia ou for "latest", usa a versão mais recente.
+    # Caso contrário, usa a versão específica fornecida.
+    if [ -z "${WP_VERSION:-}" ] || [ "${WP_VERSION}" == "latest" ]; then
+        TARGET_WP_VERSION="latest"
+    else
+        TARGET_WP_VERSION="${WP_VERSION}"
+    fi
+
+    echo "INFO: WordPress versão '$TARGET_WP_VERSION' não encontrado no EFS. Baixando e instalando..."
+
+    # Constrói a URL de download e o nome do arquivo com base na versão alvo.
+    if [ "$TARGET_WP_VERSION" == "latest" ]; then
+        WP_DOWNLOAD_URL="https://wordpress.org/latest.tar.gz"
+        WP_TARBALL_FILENAME="latest.tar.gz"
+    else
+        WP_DOWNLOAD_URL="https://wordpress.org/wordpress-${TARGET_WP_VERSION}.tar.gz"
+        WP_TARBALL_FILENAME="wordpress-${TARGET_WP_VERSION}.tar.gz"
+    fi
+    # --- FIM DA LÓGICA DE VERSÃO DINÂMICA DO WORDPRESS ---
+
     sudo mkdir -p "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
     sudo chown "$(id -u):$(id -g)" "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
-    # --- MUDANÇA PRINCIPAL: BAIXANDO UMA VERSÃO FIXA DO WORDPRESS ---
-    (cd "$WP_DOWNLOAD_DIR" && curl -sLO https://wordpress.org/wordpress-5.9.10.tar.gz && tar -xzf wordpress-5.9.10.tar.gz -C "$WP_FINAL_CONTENT_DIR" --strip-components=1)
-    if [ $? -ne 0 ]; then echo "ERRO CRÍTICO: Falha ao baixar ou extrair o WordPress."; exit 1; fi
+    
+    # Baixa e extrai a versão do WordPress determinada dinamicamente.
+    (cd "$WP_DOWNLOAD_DIR" && curl -f -sLO "$WP_DOWNLOAD_URL" && tar -xzf "$WP_TARBALL_FILENAME" -C "$WP_FINAL_CONTENT_DIR" --strip-components=1)
+    
+    if [ $? -ne 0 ]; then 
+        echo "ERRO CRÍTICO: Falha ao baixar ou extrair o WordPress versão '$TARGET_WP_VERSION'. Verifique se a versão existe e a URL '$WP_DOWNLOAD_URL' é válida."
+        exit 1
+    fi
+    
     sudo -u "$APACHE_USER" cp -aT "$WP_FINAL_CONTENT_DIR/" "$MOUNT_POINT/"
     sudo rm -rf "$WP_DOWNLOAD_DIR" "$WP_FINAL_CONTENT_DIR"
 fi
@@ -484,6 +510,6 @@ fi
 ### FIM DA SEÇÃO DE INICIALIZAÇÃO DE SERVIÇOS ###
 
 echo "=================================================="
-echo "--- Script WordPress Setup (v3.1.0) concluído! ---"
+echo "--- Script WordPress Setup (v3.2.0) concluído! ---"
 echo "=================================================="
 exit 0
