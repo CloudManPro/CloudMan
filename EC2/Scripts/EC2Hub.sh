@@ -57,9 +57,10 @@ test_connectivity || exit 1
 sudo yum update -y
 sudo yum install python3 python3-pip -y
 
-# --- CORREÇÃO APLICADA AQUI ---
-# Instalação das bibliotecas Python. A biblioteca 'watchtower' foi removida
-# para evitar conflitos e usar o método de logging via Agente do CloudWatch.
+# Instala uma versão da urllib3 compatível com o OpenSSL da AMI Amazon Linux 2
+sudo pip3 install "urllib3<2.0"
+
+# Agora instala as outras dependências
 sudo pip3 install --upgrade pip awscli boto3 fastapi uvicorn python-dotenv requests
 
 # Verificar e instalar o dnspython se a descoberta de serviço DNS estiver configurada
@@ -164,6 +165,12 @@ StandardError=inherit
 [Install]
 WantedBy=multi-user.target
 EOF
+
+        # --- CORREÇÃO DE PERMISSÃO ADICIONADA AQUI ---
+        # Cria o arquivo de log vazio e garante que o 'ec2-user' seja o proprietário.
+        # Isso evita o erro de "Permission denied" quando o serviço tenta escrever no log.
+        sudo touch /home/ec2-user/EC2Hub.log
+        sudo chown ec2-user:ec2-user /home/ec2-user/EC2Hub.log
 
         # Ativar e iniciar o serviço da aplicação
         sudo systemctl daemon-reload
