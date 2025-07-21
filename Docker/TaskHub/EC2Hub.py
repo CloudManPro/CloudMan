@@ -4,62 +4,69 @@ import boto3
 import json
 import os
 import logging
-import watchtower
 import datetime
 from dotenv import load_dotenv
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from threading import Semaphore
-from threading import Lock
+from threading import Semaphore, Lock
 import requests
-database = os.getenv(f"aws_db_instance_Target_Name_0")
+import random
+
+# Importações condicionais
+database = os.getenv(f"AWS_DB_INSTANCE_TARGET_NAME_0")
 if database is not None:
     import mysql.connector
     from mysql.connector import Error
     import pymysql
-# Carregar as variáveis de ambiente do arquivo .env e habilitar o patch automático
+
+# Carregar as variáveis de ambiente do arquivo .env
 load_dotenv()
 
-ClaudMapNamespaceName = os.environ.get('aws_service_discovery_service_Target_Name_0','')
-ClaudMapServiceRegion = os.environ.get('aws_service_discovery_service_Target_Region_0')
-if ClaudMapNamespaceName != "":
+ClaudMapNamespaceName = os.environ.get('AWS_SERVICE_DISCOVERY_SERVICE_TARGET_NAME_0', '')
+ClaudMapServiceRegion = os.environ.get('AWS_SERVICE_DISCOVERY_SERVICE_TARGET_REGION_0')
+if ClaudMapNamespaceName:
     import dns.resolver
 
-# Lendo as variáveis de ambiente
-Region = os.getenv("Region")
-AccountID = os.getenv("Account")
-InstanceName = os.getenv("Name", "DefaultInstanceName")  # Valor padrão se Name não estiver definido
-SegmentName = InstanceName
-InstanceID = os.environ.get('EC2_INSTANCE_ID',InstanceName)
-PrimesCount = int(os.environ.get('Primes', 0))
-VarLogs = os.environ.get('EnableStatusLogs', "True")
-CloudWatchName = os.environ.get('aws_cloudwatch_log_group_Target_Name_0', "")
-if VarLogs == "True" and CloudWatchName != "":
-    StatusLogsEnabled = True
-else:
-    StatusLogsEnabled = False
+# Lendo as variáveis de ambiente para configuração
+Region = os.getenv("REGION")
+AccountID = os.getenv("ACCOUNT")
+InstanceName = os.getenv("NAME", "DefaultInstanceName")
+SegmentName = InstanceName # Usado pelo X-Ray se ativado
+InstanceID = os.environ.get('EC2_INSTANCE_ID', InstanceName)
+PrimesFloor = int(os.environ.get('PRIMES_FLOOR', 0))
+PrimesCeil = int(os.environ.get('PRIMES_CEIL', 0))
 
+# Controle de logging baseado em variável de ambiente. Simplificado.
+StatusLogsEnabled = os.environ.get('ENABLESTATUSLOGS', 'True').lower() == 'true'
 
-# Configurar a sessão do Boto3 com a região
-boto3.setup_default_session(region_name=Region)
+# Configurar a sessão do Boto3 com a região correta
+if Region:
+    boto3.setup_default_session(region_name=Region)
 
-# Configurar logging
-if CloudWatchName != "":
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-    cw_handler = watchtower.CloudWatchLogHandler(
-        log_group=CloudWatchName,
-        stream_name=SegmentName
-    )
-    logger.addHandler(cw_handler)
-    logger.info(f"EC2 Host: {InstanceName} Region {Region}")
+# --- CORREÇÃO APLICADA AQUI ---
+# Configuração de Logging Simplificada.
+# Remove a dependência do Watchtower. Os logs agora são enviados para a saída padrão (stdout),
+# onde serão capturados pelo systemd e encaminhados para um arquivo. Este arquivo, por sua vez,
+# é monitorado pelo Agente do CloudWatch, que envia os logs para a AWS.
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
+# Obtém uma instância do logger para ser usada em toda a aplicação.
+logger = logging.getLogger(__name__)
+
+# Instancia a aplicação FastAPI
 app = FastAPI()
 
+# Função auxiliar para logar mensagens, respeitando a flag de habilitação.
 def LogMessage(Msg):
     if StatusLogsEnabled:
         logger.info(Msg)
 
-LogMessage(f"Inicio")
+# Log inicial para confirmar que a aplicação foi configurada e está iniciando
+LogMessage(f"Logging configurado. Instância '{InstanceName}' na região '{Region}' iniciando.")
 
 XRay = os.getenv('XRay_Enabled',"False")
 if XRay == "True":
