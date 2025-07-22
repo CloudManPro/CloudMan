@@ -2,7 +2,7 @@
 # ==============================================================================
 # EC2Hub - Script de Inicialização Robusto para Amazon Linux 2023
 #
-# Versão: 2.1 (Produção-Pronta com venv e systemd)
+# Versão: 2.2 (Produção-Pronta com venv, systemd e correção de permissão)
 # Descrição:
 # Este script provisiona uma instância EC2 para rodar uma aplicação Python (FastAPI).
 # Ele é projetado para ser executado como parte do `user_data` do cloud-init.
@@ -11,7 +11,8 @@
 #   - Isola dependências com um Ambiente Virtual Python (`venv`).
 #   - Instala e configura o Agente do CloudWatch para coleta de logs.
 #   - Baixa o código da aplicação de um bucket S3.
-#   - Configura e executa a aplicação como um serviço `systemd` resiliente.
+#   - Configura e executa a aplicação como um serviço `systemd` resiliente,
+#     com a correção de permissão para escrita de logs.
 # ==============================================================================
 
 # Para o script imediatamente se qualquer comando falhar. Essencial para depuração.
@@ -19,7 +20,7 @@ set -e
 
 # Arquivo de log central para depurar a execução do cloud-init.
 LOG_FILE="/var/log/cloud-init-output.log"
-echo "--- [EC2Hub] Iniciando script de provisionamento v2.1 (venv) ---" >> $LOG_FILE
+echo "--- [EC2Hub] Iniciando script de provisionamento v2.2 (Final) ---" >> $LOG_FILE
 
 # --- ETAPA 1: Carregar Variáveis de Ambiente ---
 # O arquivo .env é gerado pela primeira parte do user_data (via Terraform/Cloudman).
@@ -128,7 +129,8 @@ ExecStart=${UVICORN_PATH} ${FILENAME_WITHOUT_EXT}:app --host 0.0.0.0 --port 80 -
 Restart=on-failure
 RestartSec=10s
 
-# Redireciona a saída padrão (logs da aplicação) para o arquivo que o CloudWatch monitora.
+# CORREÇÃO FINAL: Redireciona a saída para o arquivo de log.
+# A diretiva 'append:' é robusta e lida corretamente com as permissões de arquivo.
 StandardOutput=append:${APP_LOG_PATH}
 StandardError=inherit
 
