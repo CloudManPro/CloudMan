@@ -18,16 +18,14 @@ fi
 # --- INSTALAÇÃO DE PACOTES DE SISTEMA ---
 echo "Instalando pacotes do sistema com DNF..." >> $LOG_FILE
 sudo dnf update -y
-# CORREÇÃO: mariadb-client agora é mariadb10.5-common ou pode ser omitido se não for usado na CLI.
-# Para simplificar, vamos instalar apenas os pacotes essenciais.
+# Omitindo mariadb-client por enquanto para garantir a execução do script principal
 sudo dnf install -y python3-pip amazon-cloudwatch-agent
 
 # --- INSTALAÇÃO GLOBAL DE PACOTES PYTHON ---
-# Instala as bibliotecas Python globalmente usando sudo. Isso garante que
-# fiquem disponíveis no PATH padrão do sistema (/usr/local/bin), que o systemd pode encontrar.
 echo "Instalando bibliotecas Python globalmente..." >> $LOG_FILE
-sudo pip3 install --upgrade pip
-sudo pip3 install awscli boto3 fastapi uvicorn python-dotenv requests pymysql dnspython
+# CORREÇÃO FINAL: Usa a flag --break-system-packages para permitir a instalação global no AL2023
+sudo pip3 install --upgrade pip --break-system-packages
+sudo pip3 install awscli boto3 fastapi uvicorn python-dotenv requests pymysql dnspython --break-system-packages
 
 # --- CONFIGURAÇÃO DO AGENTE CLOUDWATCH ---
 echo "Configurando Agente CloudWatch..." >> $LOG_FILE
@@ -57,7 +55,6 @@ if [ -n "$AWS_S3_BUCKET_TARGET_NAME_SOURCE_FILE" ]; then
         sudo chown ec2-user:ec2-user "/home/ec2-user/$FILENAME"
         FILENAME_WITHOUT_EXT=$(basename "$FILENAME" .py)
 
-        # O caminho para o uvicorn agora é o global, que o systemd encontrará automaticamente.
         UVICORN_PATH="/usr/local/bin/uvicorn"
 
         sudo tee /etc/systemd/system/ec2hub.service >/dev/null <<EOF
