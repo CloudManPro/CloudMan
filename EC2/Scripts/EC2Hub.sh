@@ -1,60 +1,55 @@
 # Este script é ANEXADO a um user_data já existente.
+# Ele assume que o arquivo /home/ec2-user/.env já foi criado pela primeira parte do user_data.
 
-# Carrega as variáveis do arquivo .env que foi criado na etapa anterior do user_data.
+set -e # Para o script se qualquer comando falhar.
+LOG_FILE="/var/log/cloud-init-output.log"
+
+# Carrega as variáveis de ambiente para uso neste script.
 if [ -f /home/ec2-user/.env ]; then
     set -a
     source /home/ec2-user/.env
     set +a
-    echo "Arquivo .env carregado com sucesso no ambiente do script." >> /var/log/cloud-init-output.log
+    echo "Arquivo .env carregado com sucesso no ambiente do script." >> $LOG_FILE
 else
-    echo "ERRO CRÍTICO: Arquivo /home/ec2-user/.env não encontrado. Abortando." >> /var/log/cloud-init-output.log
+    echo "ERRO CRÍTICO: /home/ec2-user/.env não encontrado!" >> $LOG_FILE
     exit 1
 fi
 
-LOG_FILE="/var/log/cloud-init-output.log"
-
-# --- Instalação de pacotes do sistema como ROOT ---
+# --- INSTALAÇÃO DE PACOTES DE SISTEMA ---
 echo "Instalando pacotes do sistema com DNF..." >> $LOG_FILE
-# (Opcional) Teste de conectividade
-for attempt in {1..10}; do if curl -s --head "https://www.google.com" >/dev/null; then break; fi; sleep 3; done
-
-# Instalação de pacotes do sistema (executado como root)
 sudo dnf update -y
-# CORRIGIDO: usa mariadb-client
-sudo dnf install -y python3-pip amazon-cloudwatch-agent amazon-efs-utils mariadb-client
+# CORREÇÃO: mariadb-client agora é mariadb10.5-common ou pode ser omitido se não for usado na CLI.
+# Para simplificar, vamos instalar apenas os pacotes essenciais.
+sudo dnf install -y python3-pip amazon-cloudwatch-agent
 
+# --- INSTALAÇÃO GLOBAL DE PACOTES PYTHON ---
+# Instala as bibliotecas Python globalmente usando sudo. Isso garante que
+# fiquem disponíveis no PATH padrão do sistema (/usr/local/bin), que o systemd pode encontrar.
+echo "Instalando bibliotecas Python globalmente..." >> $LOG_FILE
+sudo pip3 install --upgrade pip
+sudo pip3 install awscli boto3 fastapi uvicorn python-dotenv requests pymysql dnspython
 
-# --- Instalação das bibliotecas Python como EC2-USER ---
-echo "Instalando bibliotecas Python para o ec2-user..." >> $LOG_FILE
-# CORREÇÃO DEFINITIVA: Executa o 'pip3 install' como o usuário 'ec2-user'
-# Isso garante que as bibliotecas fiquem visíveis para a aplicação.
-sudo -u ec2-user -i <<'EOF'
-pip3 install --user --upgrade pip
-pip3 install --user awscli boto3 fastapi uvicorn python-dotenv requests pymysql dnspython
-EOF
-
-
-# --- Configuração do Agente CloudWatch como ROOT ---
+# --- CONFIGURAÇÃO DO AGENTE CLOUDWATCH ---
 echo "Configurando Agente CloudWatch..." >> $LOG_FILE
-sudo tee /opt/aws/amazon-cloudwatch-agent/etc/config.json >/dev/null <<CW_EOF
+sudo tee /opt/aws/amazon-cloudwatch-agent/etc/config.json >/dev/null <<EOF
 {
   "agent": {"run_as_user": "root"},
   "logs": { "logs_collected": { "files": { "collect_list": [
     {"file_path": "/home/ec2-user/EC2Hub.log", "log_group_name": "$AWS_CLOUDWATCH_LOG_GROUP_TARGET_NAME_0", "log_stream_name": "{instance_id}-app"}
   ]}}}}
 }
-CW_EOF
-sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json -s
+EOF
 sudo systemctl enable --now amazon-cloudwatch-agent
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json -s
 
 
-# --- Download e configuração da aplicação como ROOT ---
+# --- DOWNLOAD E CONFIGURAÇÃO DA APLICAÇÃO ---
 if [ -n "$AWS_S3_BUCKET_TARGET_NAME_SOURCE_FILE" ]; then
     echo "Baixando script do S3: $AWS_S3_BUCKET_TARGET_NAME_SOURCE_FILE" >> $LOG_FILE
     FIRST_PY_FILE=$(aws s3 ls "s3://$AWS_S3_BUCKET_TARGET_NAME_SOURCE_FILE/" --recursive | grep '\.py$' | head -n 1 | awk '{print $4}')
     
     if [ -z "$FIRST_PY_FILE" ]; then
-        echo "ERRO: Nenhum arquivo .py encontrado no bucket S3. Abortando." >>$LOG_FILE
+        echo "ERRO: Nenhum arquivo .py encontrado no bucket S3. Abortando." >> $LOG_FILE
         exit 1
     else
         FILENAME=$(basename "$FIRST_PY_FILE")
@@ -62,10 +57,10 @@ if [ -n "$AWS_S3_BUCKET_TARGET_NAME_SOURCE_FILE" ]; then
         sudo chown ec2-user:ec2-user "/home/ec2-user/$FILENAME"
         FILENAME_WITHOUT_EXT=$(basename "$FILENAME" .py)
 
-        # O caminho para o uvicorn agora será no diretório local do usuário
-        UVICORN_PATH="/home/ec2-user/.local/bin/uvicorn"
+        # O caminho para o uvicorn agora é o global, que o systemd encontrará automaticamente.
+        UVICORN_PATH="/usr/local/bin/uvicorn"
 
-        sudo tee /etc/systemd/system/ec2hub.service >/dev/null <<SERVICE_EOF
+        sudo tee /etc/systemd/system/ec2hub.service >/dev/null <<EOF
 [Unit]
 Description=EC2Hub FastAPI Application
 After=network-online.target
@@ -81,7 +76,7 @@ StandardOutput=file:/home/ec2-user/EC2Hub.log
 StandardError=inherit
 [Install]
 WantedBy=multi-user.target
-SERVICE_EOF
+EOF
         
         sudo touch /home/ec2-user/EC2Hub.log
         sudo chown ec2-user:ec2-user /home/ec2-user/EC2Hub.log
@@ -91,7 +86,7 @@ SERVICE_EOF
         echo "Aplicação ${FILENAME_WITHOUT_EXT} iniciada e gerenciada pelo systemd." >>$LOG_FILE
     fi
 else
-    echo "Variável AWS_S3_BUCKET_TARGET_NAME_SOURCE_FILE não definida. Pulando configuração." >>$LOG_FILE
+    echo "Variável AWS_S3_BUCKET_TARGET_NAME_SOURCE_FILE não definida." >>$LOG_FILE
 fi
 
 echo "Script de inicialização (anexo) concluído!" >> $LOG_FILE
