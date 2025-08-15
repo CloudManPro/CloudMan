@@ -1,74 +1,45 @@
 version: 0.2
 
-env:
-  variables:
-    TERRAFORM_VERSION: "1.5.5"
-
 phases:
   install:
     commands:
-      # --- CORREÇÃO DE PERMISSÃO APLICADA AQUI ---
+      - echo "Bucket Backend name:${AWS_S3_BUCKET_TARGET_NAME_0}"
+      - echo "Reading and initializing the Command variable..."
       - |
-        echo "Instalando o Terraform ${TERRAFORM_VERSION}..."
-        ARCH=$(uname -m | sed -e 's/aarch64/arm64/' -e 's/x86_64/amd64/')
-        wget -q "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip"
-        
-        # 1. Descompacta o arquivo no diretório atual (que é gravável)
-        unzip terraform_*.zip
-        
-        # 2. Cria um diretório 'bin' no diretório home do usuário (gravável)
-        mkdir -p $HOME/bin
-        
-        # 3. Move o executável do Terraform para esse diretório
-        mv terraform $HOME/bin/
-        
-        # 4. Adiciona o novo diretório ao PATH para que o comando 'terraform' seja encontrado
-        export PATH="$HOME/bin:$PATH"
-        
-        echo "Verificando a instalação do Terraform..."
-        terraform --version
+        command_array=(${Command//,/ })
+        command_type=${command_array[0]}
+        path=${command_array[1]}
+        echo "Command Type: $command_type"
+        echo "Path: $path"
+      - echo "Installing Python dependencies..."
+      - pip install boto3  # Instala boto3
+      - echo "Downloading List.txt file from S3..."
+      - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/${path}/List.txt ./List.txt
+      - echo "Content of the List.txt file:"
+      - cat ./List.txt
+      - echo "Installing Terraform..."
+      - wget -q https://releases.hashicorp.com/terraform/1.5.5/terraform_1.5.5_linux_amd64.zip
+      - unzip terraform_1.5.5_linux_amd64.zip
+      - mkdir -p ~/.local/bin
+      - mv terraform ~/.local/bin/
+      - export PATH=$PATH:~/.local/bin
+      - terraform --version  # Verifica se o Terraform foi instalado corretamente
 
   pre_build:
     commands:
-      - |
-        echo "Construindo o caminho do S3 para o arquivo main.tf..."
-        TF_CODE_PATH="s3://${AWS_S3_BUCKET_TARGET_NAME_0}/states/${STATE_NAME}/main.tf"
-        
-        echo "Baixando o arquivo main.tf de: ${TF_CODE_PATH}"
-        aws s3 cp "${TF_CODE_PATH}" .
-        
-        echo "Arquivo main.tf baixado com sucesso."
-        echo "Listando arquivos no diretório atual para confirmação:"
-        ls -la
+      - echo "Preparing build..."
+      - echo "Syncing Terraform plugins from S3 to avoid re-downloading during init..."
+      - mkdir -p /tmp/terraform/plugins/
+      - aws s3 sync s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform/ /tmp/terraform/plugins/ --quiet
+      - echo "Accessing the file from S3 bucket..."
 
   build:
     commands:
-      - |
-        echo "Inicializando o Terraform..."
-        terraform init -reconfigure
-
-        echo "Executando o comando Terraform: ${COMMAND}"
-        case ${COMMAND} in
-          plan)
-            echo "Gerando o plano do Terraform..."
-            terraform plan
-            ;;
-          apply)
-            echo "Gerando o plano para aplicação..."
-            terraform plan -out=tfplan
-            echo "Aplicando as configurações do Terraform..."
-            terraform apply -auto-approve tfplan
-            ;;
-          destroy)
-            echo "Destruindo a infraestrutura..."
-            terraform destroy -auto-approve
-            ;;
-          *)
-            echo "Comando '${COMMAND}' inválido. Use 'plan', 'apply' ou 'destroy'."
-            exit 1
-            ;;
-        esac
+      - echo "Executing TerraBatch script..."
+      - python TerraBatch.py
 
   post_build:
     commands:
-      - echo "Build para o comando '${COMMAND}' concluído."
+      - echo "Syncing updated Terraform plugins back to S3..."
+      - aws s3 sync /tmp/terraform/plugins/ s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform/ --quiet
+      - echo "Build completed successfully!"
