@@ -1,45 +1,86 @@
 version: 0.2
 
+env:
+  variables:
+    TF_PLUGIN_CACHE_DIR: "/tmp/.terraform.d/plugin-cache"
+    TERRAFORM_VERSION: "1.5.5"
+
 phases:
   install:
     commands:
-      - echo "Bucket Backend name:${AWS_S3_BUCKET_TARGET_NAME_0}"
+      - echo "Bucket Backend name v2:${AWS_S3_BUCKET_TARGET_NAME_0}"
       - echo "Reading and initializing the Command variable..."
       - |
+        # Split the Command variable into command_type and path
         command_array=(${Command//,/ })
         command_type=${command_array[0]}
         path=${command_array[1]}
         echo "Command Type: $command_type"
         echo "Path: $path"
+      - echo "Exporting COMMAND and path variables..."
+      - echo "export COMMAND=${command_type}" > exported_env_vars.sh
+      - echo "export PATH_VAR=${path}" >> exported_env_vars.sh
+      - cat exported_env_vars.sh
       - echo "Installing Python dependencies..."
-      - pip install boto3  # Instala boto3
+      - pip install boto3
+      - echo "Downloading TerraBatch.py, InitTerraform.py, and modify_main_tf.py from S3..."
+      - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/TerraBatch.py ./TerraBatch.py
+      - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/InitTerraform.py ./InitTerraform.py
+      - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/modify_main_tf.py ./modify_main_tf.py
+      - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/Copy.py ./Copy.py
       - echo "Downloading List.txt file from S3..."
       - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/${path}/List.txt ./List.txt
       - echo "Content of the List.txt file:"
       - cat ./List.txt
-      - echo "Installing Terraform..."
-      - wget -q https://releases.hashicorp.com/terraform/1.5.5/terraform_1.5.5_linux_amd64.zip
-      - unzip terraform_1.5.5_linux_amd64.zip
+      - echo "Detecting system architecture..."
+      - ARCH=$(uname -m)
+      - echo "Detected architecture:$ARCH"
+      - |
+        if [ "$ARCH" = "x86_64" ]; then
+          ARCH_TYPE="amd64"
+        elif [ "$ARCH" = "aarch64" ]; then
+          ARCH_TYPE="arm64"
+        else
+          echo "Unsupported architecture: $ARCH"
+          exit 1
+        fi
+      - echo "Architecture type:$ARCH_TYPE"
+      - echo "Installing Terraform version ${TERRAFORM_VERSION} for architecture:$ARCH_TYPE..."
+      - wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH_TYPE}.zip
+      - unzip -q terraform_${TERRAFORM_VERSION}_linux_${ARCH_TYPE}.zip
       - mkdir -p ~/.local/bin
       - mv terraform ~/.local/bin/
+      - chmod +x ~/.local/bin/terraform
+      - mkdir -p ${TF_PLUGIN_CACHE_DIR}
+      - unset TF_CLI_CONFIG_FILE  # Ensure the variable is not set
       - export PATH=$PATH:~/.local/bin
-      - terraform --version  # Verifica se o Terraform foi instalado corretamente
+      - echo "Terraform version:"
+      - terraform --version
 
   pre_build:
     commands:
       - echo "Preparing build..."
+      - echo "Loading exported environment variables..."
+      - source exported_env_vars.sh
+      - echo "Cleaning existing Terraform plugin cache to avoid conflicts..."
+      - rm -rf ${TF_PLUGIN_CACHE_DIR}/registry.terraform.io/
       - echo "Syncing Terraform plugins from S3 to avoid re-downloading during init..."
-      - mkdir -p /tmp/terraform/plugins/
-      - aws s3 sync s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform/ /tmp/terraform/plugins/ --quiet
-      - echo "Accessing the file from S3 bucket..."
+      - aws s3 sync s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform.d/plugin-cache/ ${TF_PLUGIN_CACHE_DIR}/ --quiet
+      - echo "Terraform plugin cache synced from S3."
 
   build:
     commands:
-      - echo "Executing TerraBatch script..."
-      - python TerraBatch.py
+      - |
+        echo "Loading exported environment variables and executing TerraBatch script..."
+        source exported_env_vars.sh
+        python TerraBatch.py
 
   post_build:
     commands:
-      - echo "Syncing updated Terraform plugins back to S3..."
-      - aws s3 sync /tmp/terraform/plugins/ s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform/ --quiet
-      - echo "Build completed successfully!"
+      - echo "Syncing updated Terraform plugin cache back to S3..."
+      - aws s3 sync ${TF_PLUGIN_CACHE_DIR}/ s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform.d/plugin-cache/ --quiet
+      - echo "Terraform plugin cache synced back to S3."
+
+cache:
+  paths:
+    - '/tmp/.terraform.d/plugin-cache/**'
