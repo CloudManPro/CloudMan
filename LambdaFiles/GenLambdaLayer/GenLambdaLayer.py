@@ -180,9 +180,9 @@ def lambda_handler(event, context):
     # Ler os parâmetros do evento
     dependency = event.get("dependency", "whoosh")  # Dependência padrão
     layer_name = event.get("layer_name", "generic_layer")  # Nome da camada
-    # Pode ser ignorado ou validado
+    # python_version_input pode ser usado para outras validações se necessário
     python_version_input = event.get("python_version")
-    architecture = event.get("architecture", "x86_64")  # Arquitetura padrão
+    
     # Nome do bucket S3 obtido da variável de ambiente
     bucket_name = os.environ.get("AWS_S3_BUCKET_TARGET_NAME_0")
 
@@ -197,22 +197,18 @@ def lambda_handler(event, context):
             "message": error_msg
         }
 
-    # Verificar a arquitetura do ambiente da Lambda
+    # Detectar a arquitetura do ambiente Lambda e definir a variável a ser utilizada
     runtime_architecture = platform.machine()
     print(f"Arquitetura detectada da Lambda: {runtime_architecture}")
-    if (architecture == "x86_64" and runtime_architecture != "x86_64") or \
-       (architecture == "arm64" and runtime_architecture != "aarch64"):
-        error_msg = f"Ambiente da Lambda ({runtime_architecture}) não é compatível com a arquitetura {architecture}."
-        print(error_msg)
-        return {
-            "statusCode": 400,
-            "message": error_msg
-        }
+    if runtime_architecture == "aarch64":
+        architecture = "arm64"
+    else:
+        architecture = "x86_64"
+    print(f"Arquitetura utilizada para o pacote: {architecture}")
 
     try:
-        # Criar o arquivo ZIP com nome dinâmico
-        zip_file_path, zip_file_name = create_layer_zip(
-            dependency, layer_name, architecture)
+        # Criar o arquivo ZIP com nome dinâmico, utilizando a arquitetura detectada
+        zip_file_path, zip_file_name = create_layer_zip(dependency, layer_name, architecture)
 
         # Fazer upload para o bucket S3
         upload_to_s3(zip_file_path, bucket_name, zip_file_name)
