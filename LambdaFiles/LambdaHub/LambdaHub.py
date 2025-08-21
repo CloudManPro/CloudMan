@@ -1,3 +1,4 @@
+# version 1.0.0
 import boto3
 import os
 import json
