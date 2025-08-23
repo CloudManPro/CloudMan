@@ -1,4 +1,4 @@
-# version 1.0.1
+import traceback
 import boto3
 import os
 import json
@@ -9,7 +9,7 @@ from urllib.parse import unquote
 try:
     from aws_xray_sdk.core import xray_recorder
     from aws_xray_sdk.core import patch_all
-    # Habilita o rastreamento automático do X-Ray
+    # Enable automatic X-Ray tracing
     patch_all()
     xray_enabled = True
 except:
@@ -19,7 +19,6 @@ XRay = os.getenv('XRAY_ENABLED', "False")
 if XRay == "False":
     xray_enabled = False
 
-
 try:
     import pymysql
     from pymysql import MySQLError
@@ -28,7 +27,7 @@ except:
     MySQLEnabled = False
     print("Pymysql not found!")
 
-# Cria um clientes para acessar os serviço AWS
+# Create clients to access AWS services
 
 Region = os.getenv("REGION")
 AccountID = os.getenv("ACCOUNT")
@@ -40,25 +39,44 @@ s3 = boto3.client('s3')
 LambdaName = os.getenv("LAMBDA_NAME")
 
 
+# Assuming that xray_enabled is a previously defined boolean variable
+# and that you have already configured X-Ray (for example, with xray_recorder.configure(...))
+
 def execute_with_xray(segment_name, function, *args, **kwargs):
     """
-    Executa uma função dentro de um subsegmento do X-Ray se ele estiver habilitado.
-    :param segment_name: Nome do subsegmento do X-Ray.
-    :param function: Função a ser executada.
-    :param args: Argumentos posicionais para a função.
-    :param kwargs: Argumentos nomeados para a função.
-    :return: O resultado da função executada.
+    Executes a function. If the function is for SQS (send_message), it executes within an X-Ray subsegment;
+    for other services, it executes the function normally, as they already have X-Ray integration.
+
+    :param segment_name: Name of the subsegment (used only for SQS).
+    :param function: Function to be executed.
+    :param args: Positional arguments for the function.
+    :param kwargs: Keyword arguments for the function.
+    :return: Result of the executed function.
     """
-    if xray_enabled:
-        with xray_recorder.in_subsegment(segment_name):
+    # If the function is SQS send_message, wrap it with a subsegment
+    if function.__name__ == 'send_message':
+        if xray_enabled:
+            with xray_recorder.in_subsegment(segment_name) as subsegment:
+                try:
+                    result = function(*args, **kwargs)
+                    # Add annotation with the queue URL, if available
+                    if "QueueUrl" in kwargs:
+                        subsegment.put_annotation(
+                            "QueueUrl", kwargs["QueueUrl"])
+                    return result
+                except Exception as e:
+                    subsegment.add_exception(e, traceback.format_exc())
+                    raise
+        else:
             return function(*args, **kwargs)
     else:
+        # For other services, simply execute the function normally
         return function(*args, **kwargs)
 
 
-# ***************************Resources Target***********************************
+# *************************** Target Resources ***********************************
 
-# ****************Identifica a URL de cada SQS Target***************************
+# **************** Identify the URL of each SQS Target ***************************
 SQSTargetMaxNumber = 0
 SQSTargetName = []
 QueueTargetUrl = []
@@ -73,12 +91,11 @@ while True:
         QueueTargetUrl.append(URL)
     else:
         SQSTargetMaxNumber = i
-
         break
     i += 1
-print(f"SQS Target Total: {i} {SQSTargetName}")
+print(f"Total SQS Targets: {i} {SQSTargetName}")
 
-# **********Identifica a ARN Target de cada SNS Target**************************
+# ********** Identify the ARN of each SNS Target **************************
 SNSTargetMaxNumber = 0
 SNSTargetName = []
 TopicTargetARN = []
@@ -95,9 +112,9 @@ while True:
         SNSTargetMaxNumber = i
         break
     i += 1
-print(f"SNS Target Total: {i} {SNSTargetName}")
+print(f"Total SNS Targets: {i} {SNSTargetName}")
 
-# **************Inicializa cada tabela Dynamodb*********************************
+# ************** Initialize each DynamoDB table *********************************
 DynamoDBTargetMaxNumber = 0
 TableNameTargetList = []
 ListDynamo = []
@@ -113,14 +130,14 @@ while True:
         response = Table.get_item(Key={'ID': "1"})
         if 'Item' not in response:
             Table.put_item(
-                Item={'ID': "1", "LambdaName": "Criado por " + LambdaName, 'Cont': 0})
+                Item={'ID': "1", "LambdaName": "Created by " + LambdaName, 'Cont': 0})
     else:
         DynamoDBTargetMaxNumber = i
         break
     i += 1
-print(f"Dynamodb Target Total: {i} {ListDynamo}")
+print(f"Total DynamoDB Targets: {i} {ListDynamo}")
 
-# *************Inicializa cada Lambda a ser invocada***************************
+# ************* Initialize each Lambda to be invoked ***************************
 LambdaMaxNumber = 0
 LambdaNameList = []
 i = 0
@@ -134,9 +151,9 @@ while True:
     else:
         break
     i += 1
-print(f"Lambda Target Total: {i} {LambdaNameList}")
+print(f"Total Lambda Targets: {i} {LambdaNameList}")
 
-# *************Inicializa cada CodeBuid target***************************
+# ************* Initialize each CodeBuild target ***************************
 CodeBuildMaxNumber = 0
 CodeBuildNameList = []
 i = 0
@@ -150,9 +167,9 @@ while True:
     else:
         break
     i += 1
-print(f"CodeBuild Target Total: {i} {CodeBuildNameList}")
+print(f"Total CodeBuild Targets: {i} {CodeBuildNameList}")
 
-# **********Identifica cada S3 target **************************
+# ********** Identify each S3 target **************************
 S3TargetMaxNumber = 0
 S3BucketTarget = []
 i = 0
@@ -166,9 +183,9 @@ while True:
         S3TargetMaxNumber = i
         break
     i += 1
-print(f"S3 Target Total: {i} ")
+print(f"Total S3 Targets: {i} ")
 
-# **********Identifica EC2 target **************************
+# ********** Identify EC2 targets **************************
 EC2TargetDNS = []
 EC2TargetName = []
 i = 0
@@ -180,16 +197,16 @@ while True:
         EC2TargetName.append(Name)
         if public_dns is not None:
             EC2TargetDNS.append(public_dns)
-            print("achou dns publico")
+            print("Found public DNS")
         else:
             EC2TargetDNS.append(private_dns)
-            print("achou dns privado")
+            print("Found private DNS")
     else:
         break
     i += 1
-print(f"EC2 Target Total: {i} {EC2TargetName}")
+print(f"Total EC2 Targets: {i} {EC2TargetName}")
 
-# **************Inicializa EFS*********************************
+# ************** Initialize EFS *********************************
 EFSList = []
 EFSNameList = []
 i = 0
@@ -203,9 +220,9 @@ while True:
         EFSMaxNumber = i
         break
     i += 1
-print(f"EFS Target Total: {i} {EFSNameList}")
+print(f"Total EFS Targets: {i} {EFSNameList}")
 
-# **************Inicializa SSM Parameter*********************************
+# ************** Initialize SSM Parameter *********************************
 SSMParameterTargetName = []
 SSMParameterTargetRegion = []
 i = 0
@@ -220,11 +237,11 @@ while True:
         SSMParameterMaxNumber = i
         break
     i += 1
-print(f"SSM Parameter Target Total: {i} {SSMParameterTargetName}")
+print(f"Total SSM Parameters: {i} {SSMParameterTargetName}")
 
-# ***************************Resources Source***********************************
+# *************************** Source Resources ***********************************
 
-# *****************Identifica a URL de cada SQS Source*************************
+# ***************** Identify the URL of each SQS Source *************************
 SQSSourceMaxNumber = 4
 SQSSourceName = []
 i = 0
@@ -236,9 +253,9 @@ while True:
         SQSSourceMaxNumber = i
         break
     i += 1
-print(f"SQS Source Total: {i} {SQSSourceName}")
+print(f"Total SQS Sources: {i} {SQSSourceName}")
 
-# **********Identifica a ARN Source de cada SNS Source**************************
+# ********** Identify the ARN of each SNS Source **************************
 SNSSourceMaxNumber = 4
 SNSSourceName = []
 i = 0
@@ -252,9 +269,9 @@ while True:
         SNSSourceMaxNumber = i
         break
     i += 1
-print(f"SNS Source Total: {i} {SNSSourceName}")
+print(f"Total SNS Sources: {i} {SNSSourceName}")
 
-# **********Identifica cada S3 source **************************
+# ********** Identify each S3 Source **************************
 S3SourceMaxNumber = 4
 S3BucketSourceName = []
 i = 0
@@ -266,9 +283,9 @@ while True:
         S3SourceMaxNumber = i
         break
     i += 1
-print(f"S3 Notification Source Total: {i} {S3BucketSourceName}")
+print(f"Total S3 Notification Sources: {i} {S3BucketSourceName}")
 
-# ********* Lista para armazenar informações de username e password de cada secret
+# ********* List to store username and password information for each secret
 SecretsCredentials = []
 SecretNameList = []
 i = 0
@@ -287,7 +304,7 @@ while True:
     else:
         break
     i += 1
-print(f"Secret Source Total: {i} {SecretNameList}")
+print(f"Total Secret Sources: {i} {SecretNameList}")
 
 
 def create_connection(host_name, user_name, user_password, db_name):
@@ -301,9 +318,9 @@ def create_connection(host_name, user_name, user_password, db_name):
             charset='utf8mb4',
             cursorclass=pymysql.cursors.DictCursor
         )
-        print("Conexão ao MySQL DB bem-sucedida")
+        print("Connection to MySQL DB successful")
     except MySQLError as e:
-        print(f"O erro '{e}' ocorreu")
+        print(f"The error '{e}' occurred")
     return connection
 
 
@@ -315,12 +332,12 @@ def execute_query(connection, query, values=None):
             else:
                 cursor.execute(query)
             connection.commit()
-            print("Query executada com sucesso")
+            print("Query executed successfully")
         except MySQLError as e:
-            print(f"O erro '{e}' ocorreu")
+            print(f"The error '{e}' occurred")
 
 
-# ******************* inicializa Lista para armazenar as conexões RDS e criação de tabela.
+# ******************* Initialize list to store RDS connections and create table. *******************
 RDSConnections = []
 i = 0
 if MySQLEnabled:
@@ -343,8 +360,9 @@ if MySQLEnabled:
             else:
                 username = "TypeNewUserName"
                 password = "TypeNewPassword"
-            print(f"database e endpoint {i} : {database}, {Host}, {username}")
-            # Estabeleça a conexão e crie a tabela
+            print(
+                f"Database and endpoint {i} : {database}, {Host}, {username}")
+            # Establish the connection and create the table
             connection = create_connection(Host, username, password, database)
             if connection is not None:
                 RDSConnections.append([connection, database])
@@ -356,7 +374,7 @@ if MySQLEnabled:
                     )
                 """
                 execute_query(connection, create_table_query)
-                print(f"Passou aqui A")
+                print(f"Checkpoint A passed")
         else:
             print(f"Total RDS Targets: {i}")
             break
@@ -366,29 +384,36 @@ if MySQLEnabled:
 
 
 def lambda_handler(event, context):
+    print("event", event)
     # print("context", context)
-    print("Event:", event)
-    Information = "Source unknown!!"
-    Message = "No Message!!"
-    EventSource = ""
+    try:
+        EventSource = event['Records'][0]['source']
+    except Exception as e:
+        EventSource = "API"
     if 'CodePipeline.job' in event:
         EventSource = "aws:codepipeline"
-    elif 'Records' in event:
-        try:
-            EventSource = event['Records'][0]['eventSource']
-        except:
-            EventSource = "API"
+    elif 'source' in event:
+        EventSource = event['source']
     Subject = "None"
     if EventSource == "aws:sns":
         SNSName = event['Records'][0]['Sns']['TopicArn'].split(":")[-1]
         EventSource += SNSName
         Subject = event['Records'][0]['Sns']['Subject']
         Message = event['Records'][0]['Sns']['Message']
-        Information = "Message from SNS "+SNSName
+        Information = "Message from SNS " + SNSName
     elif EventSource == "aws:sqs":
         SQSName = event['Records'][0]['eventSourceARN'].split(":")[-1]
         Message = event['Records'][0]['body']
         Information = "Message from SQS " + SQSName
+    elif EventSource == "aws.events":
+        EBName = event['resources'][0].split("/")[-1]
+        Message = f"Event from {EBName}"
+        Information = f"Message from EventBridge {EBName}"
+    elif EventSource == "aws:lambda":
+        SourceLambdaName = "Lambda"
+        Information = "Event from Lambda"
+        Message = event["message"]
+        print("Message", Message)
     elif EventSource == "aws:s3":
         s3 = boto3.client('s3')
         EventSource += event['Records'][0]['s3']["bucket"]['arn'].split(
@@ -396,11 +421,11 @@ def lambda_handler(event, context):
         FileSize = str(event['Records'][0]['s3']['object']["size"])
         bucket_name = event['Records'][0]['s3']['bucket']["name"]
         file_path_encoded = event['Records'][0]['s3']['object']["key"]
-        # Decodifica o nome do arquivo
+        # Decode the file name
         file_path = unquote(file_path_encoded).replace('+', ' ')
         Ext = file_path.split(".")[-1]
         print("bucket_name", bucket_name, file_path)
-        # lê o conteúdo do arquivo
+        # Read the file content
         if Ext == "txt":
             response = execute_with_xray(
                 bucket_name, s3.get_object, Bucket=bucket_name, Key=file_path)
@@ -408,8 +433,8 @@ def lambda_handler(event, context):
             # print("File Content: ",file_content)
         else:
             Message = "File is not .txt"
-        Information = "File "+file_path+" from S3 bucket " + \
-            bucket_name + ", with size of "+FileSize
+        Information = "File " + file_path + " from S3 bucket " + \
+            bucket_name + ", with size of " + FileSize
     elif 'requestContext' in event and 'elb' in event['requestContext']:
         EventSource = "aws:elb"
         ALBName = event['requestContext']['elb']['targetGroupArn'].split(
@@ -429,9 +454,6 @@ def lambda_handler(event, context):
         except:
             Source = "API"
             Message = str(event)
-        if Source == "aws:lambda":
-            EventSource = "Lambda"
-            Information = "Event from Lambda"
         if Source == "aws:ec2":
             Information = "Event from EC2"
             EventSource = "EC2"
@@ -439,22 +461,30 @@ def lambda_handler(event, context):
             Information = "Event from API"
 
     print("Source of Event: ", EventSource)
+    if LambdaName in Message:
+        print("Loop Found!")
+        return
     Agora = datetime.datetime.now()
     NewMessage = f"Lambda: {LambdaName}. Source: {EventSource}. Date/Time: {str(Agora)}. <- {Message}"
     print("Message to be sent: ", NewMessage)
 
-    # *************************Bloco SQS**************************************
-    # Define o nome da fila para envio da mensagem
+    # ************************* SQS Block **************************************
+    # Define the queue name for sending the message
     for i in range(SQSTargetMaxNumber):
         message_body = NewMessage
-        print("SQSTargetName[i], sqs.send_message, QueueUrl=QueueTargetUrl[i]",
-              SQSTargetName[i], QueueTargetUrl[i])
+        print("Sending message to queue:",
+              SQSTargetName[i], "with QueueUrl:", QueueTargetUrl[i])
         response = execute_with_xray(
-            SQSTargetName[i], sqs.send_message, QueueUrl=QueueTargetUrl[i], MessageBody=message_body)
-        print('Mensagem SQS' + str(i) +
-              ' enviada com ID:', response['MessageId'])
-
-    # *************************Bloco DynamoDB**********************************
+            # Subsegment name (can be the queue name)
+            SQSTargetName[i],
+            # Function to be executed (sending the message)
+            sqs.send_message,
+            QueueUrl=QueueTargetUrl[i],  # Named parameter for the queue URL
+            MessageBody=message_body    # Message body
+        )
+        print('SQS message ' + str(i) +
+              ' sent with ID:', response['MessageId'])
+    # ************************* DynamoDB Block **********************************
     for i in range(DynamoDBTargetMaxNumber):
         Table = TableNameTargetList[i][0]
         TableName = TableNameTargetList[i][1]
@@ -467,42 +497,41 @@ def lambda_handler(event, context):
         ID = LambdaName + ":" + str(Agora)
         put_item_response = execute_with_xray(TableName, Table.put_item, Item={
                                               'ID': ID, "Message": NewMessage})
-        print("DynamDB response", put_item_response)
+        print("DynamoDB response", put_item_response)
 
-    # *************************Bloco SNS**********************************
+    # ************************* SNS Block **********************************
     for i in range(SNSTargetMaxNumber):
         topic_arn = TopicTargetARN[i]
         message = NewMessage
-        response = execute_with_xray(topic_arn, sns.publish,  TopicArn=topic_arn,
+        response = execute_with_xray(topic_arn, sns.publish, TopicArn=topic_arn,
                                      Message=json.dumps({'default': json.dumps(message)}), MessageStructure='json')
-        print("Response SNS", response)
+        print("SNS response", response)
 
-    # *************************Bloco Lambda ********************
+    # ************************* Lambda Block ********************
     lambda_client = boto3.client('lambda')
     for function_name in LambdaNameList:
         response = execute_with_xray(function_name, lambda_client.invoke, FunctionName=function_name,
                                      InvocationType='Event', Payload=json.dumps({"message": NewMessage, "source": "aws:lambda"}))
         if response.get('StatusCode') == 202:
-            print(f"Invoke lambda: {function_name}")
+            print(f"Invoked lambda: {function_name}")
         else:
-            print(f'Invokation error {function_name}.')
-
-    # *************************Bloco S3**********************************
+            print(f"Invocation error for {function_name}.")
+    # ************************* S3 Block **********************************
     for i in range(S3TargetMaxNumber):
         bucket_name = S3BucketTarget[i][0]
         S3Region = S3BucketTarget[i][1]
         s3 = boto3.client('s3', region_name=S3Region)
-        folder_name = LambdaName+"/"
+        folder_name = LambdaName + "/"
         file_name = LambdaName + ":" + str(Agora) + ".txt"
         file_content = NewMessage
         file_path = folder_name + file_name
         response = execute_with_xray(
             bucket_name, s3.put_object, Bucket=bucket_name, Key=file_path, Body=file_content)
-        print(f"Objeto inserido na bucket '{bucket_name}'")
+        print(f"Object inserted in bucket '{bucket_name}'")
 
-    # *************************Bloco EFS **********************************
+    # ************************* EFS Block **********************************
     for efs_mount_path in EFSList:
-        # Escreva um arquivo de teste no EFS
+        # Write a test file to EFS
         file_name = LambdaName + ":" + str(Agora) + ".txt"
         test_file_path = os.path.join(efs_mount_path, file_name)
         with open(test_file_path, "w") as file:
@@ -514,11 +543,11 @@ def lambda_handler(event, context):
             Data = json.dumps(NewMessage)
             execute_query(connection, insert_query, (Data,))
             print(
-                f"Item inserido na tabela 'exemplo' do banco de dados '{db_name}'")
+                f"Item inserted into table 'exemplo' of database '{db_name}'")
         except MySQLError as e:
-            print(f"Erro ao inserir item no banco de dados '{db_name}': {e}")
+            print(f"Error inserting item into database '{db_name}': {e}")
 
-    # *************************Bloco SSM Parameter **********************************
+    # ************************* SSM Parameter Block **********************************
     for Name, region in zip(SSMParameterTargetName, SSMParameterTargetRegion):
         ssm_client = boto3.client('ssm', region_name=region)
         try:
@@ -532,12 +561,11 @@ def lambda_handler(event, context):
                 new_value = '0'
             execute_with_xray(Name, ssm_client.put_parameter, Name=Name,
                               Value=new_value, Type='String', Overwrite=True)
-            print(f"SSM PArameter {Name} updated: {new_value}")
+            print(f"SSM Parameter {Name} updated: {new_value}")
         except Exception as e:
-            print(
-                f"Erro ao processar o parâmetro {Name} na região {region}: {e}")
+            print(f"Error processing parameter {Name} in region {region}: {e}")
 
-    # *************************Bloco EC2 **********************************
+    # ************************* EC2 Block **********************************
     MessageJSON = json.dumps(NewMessage).encode('utf-8')
     for DNS, EC2Name in zip(EC2TargetDNS, EC2TargetName):
         try:
@@ -548,15 +576,15 @@ def lambda_handler(event, context):
                 EC2Name, Conn.request, "POST", Path, body=MessageJSON, headers=Headers)
             Response = Conn.getresponse()
             if Response.status == 200:
-                print(f'Message sent with Success to {EC2Name}.')
+                print(f'Message sent with success to {EC2Name}.')
             else:
                 print(
-                    f'Message sent error to {EC2Name}. Código : {Response.status}')
+                    f'Error sending message to {EC2Name}. Code: {Response.status}')
             Conn.close()
         except Exception as e:
-            print(f'Message sent error {EC2Name}: {str(e)}')
+            print(f'Error sending message {EC2Name}: {str(e)}')
 
-    # *************************Retorno ALB **********************************
+    # ************************* ALB Response **********************************
     if EventSource == "aws:elb":
         response = {
             'statusCode': 200,
@@ -569,11 +597,11 @@ def lambda_handler(event, context):
         }
         return response
 
-    # *************************Retorno API **********************************
+    # ************************* API Response **********************************
     if EventSource == "API":
         return NewMessage
 
-    # *************************Retorno CodePipeline **********************************
+    # ************************* CodePipeline Response **********************************
     if EventSource == "aws:codepipeline":
         print("aws:codepipeline")
         # Temporary Credentials and get object from S3
@@ -585,36 +613,36 @@ def lambda_handler(event, context):
                           aws_access_key_id=access_key,
                           aws_secret_access_key=secret_key,
                           aws_session_token=session_token)
-        # Obter os artefatos de entrada e saída
+        # Get input and output artifacts
         input_artifacts = event['CodePipeline.job']['data']['inputArtifacts']
         output_artifacts = event['CodePipeline.job']['data']['outputArtifacts']
         print("input_artifacts", input_artifacts, output_artifacts)
 
-        # Processar apenas o primeiro artefato de entrada
+        # Process only the first input artifact
         if input_artifacts:
             artifact = input_artifacts[0]
             artifact_location = artifact['location']['s3Location']
             bucket = artifact_location['bucketName']
             key = artifact_location['objectKey']
 
-            # Verificar se o arquivo é um arquivo de texto
+            # Check if the file is a text file
             if key.endswith(".txt"):
-                # Ler o conteúdo do arquivo
+                # Read the file content
                 response = s3.get_object(Bucket=bucket, Key=key)
                 file_content = response['Body'].read().decode('utf-8')
                 print(f"File content from {key}: {file_content}")
 
-                # Converter o conteúdo do arquivo para maiúsculas
+                # Convert the file content to uppercase
                 upper_case_content = file_content.upper()
 
-                # Salvar o arquivo modificado de volta no bucket S3 com o nome do primeiro artefato de saída
+                # Save the modified file back to the S3 bucket with the name of the first output artifact
                 if output_artifacts:
                     output = output_artifacts[0]
                     output_location = output['location']['s3Location']
                     output_bucket = output_location['bucketName']
                     output_key = output_location['objectKey']
 
-                    # Salvar o arquivo modificado de volta no bucket S3 com o nome do artefato de saída
+                    # Save the modified file back to the S3 bucket with the output artifact name
                     s3.put_object(Bucket=output_bucket, Key=output_key,
                                   Body=upper_case_content.encode('utf-8'))
                     print(f"Modified file saved to {output_key}")
@@ -628,10 +656,9 @@ def lambda_handler(event, context):
             })
         }
 
-    # *************************Bloco CodeBuild ********************
+    # ************************* CodeBuild Block ********************
     codebuild = boto3.client('codebuild')
     environment_variables = [
         {'name': 'EVENT', 'value': NewMessage, 'type': 'PLAINTEXT'}]
     for CodeBuildName in CodeBuildNameList:
-        response = execute_with_xray(CodeBuildName, codebuild.start_build, projectName=CodeBuildName,
-                                     environmentVariablesOverride=environment_variables)
+        response = execute_with_xray(CodeBuildName, codebuild.start_build, projectName=CodeBuildName,environmentVariablesOverride=environment_variables)
