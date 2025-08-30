@@ -19,8 +19,8 @@ echo "Atualizando pacotes do sistema..."
 yum update -y
 
 echo "Instalando Apache, MariaDB e PHP..."
-# CORREÇÃO: Trocado 'mysql-server' por 'mariadb-server'
-yum install -y httpd mariadb-server php php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json
+# CORREÇÃO FINAL: Usando o nome de pacote versionado para AL2023
+yum install -y httpd mariadb10.5-server php php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json
 
 # --- 2. Configuração de Segurança (SELinux) ---
 echo "Configurando a política do SELinux para o banco de dados..."
@@ -30,15 +30,16 @@ setsebool -P httpd_can_network_connect_db 1
 echo "Iniciando e habilitando os serviços httpd e mariadb..."
 systemctl start httpd
 systemctl enable httpd
-# CORREÇÃO: O nome do serviço do MariaDB é 'mariadb'.
+# O nome do serviço 'mariadb' está correto.
 systemctl start mariadb
 systemctl enable mariadb
 
 echo "Aguardando 10 segundos para o MariaDB iniciar completamente..."
 sleep 10
 
+# ... (o resto do script continua exatamente igual) ...
+
 # --- 4. Configuração do Banco de Dados ---
-# Os comandos 'mysql -e' são compatíveis e não precisam de alteração.
 echo "Criando o banco de dados e o usuário para o WordPress..."
 mysql -e "CREATE DATABASE ${DB_NAME};"
 mysql -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';"
