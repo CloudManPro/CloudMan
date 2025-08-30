@@ -1,4 +1,10 @@
 #!/bin/bash
+# As primeiras linhas .env não afetam a instalação, podem ser mantidas ou removidas
+echo "NAME=Instance" > /home/ec2-user/.env
+echo "REGION=sa-east-1" >> /home/ec2-user/.env
+echo "ACCOUNT=061051249868" >> /home/ec2-user/.env
+
+#!/bin/bash
 yum update -y
 
 # Instalar Apache
@@ -12,11 +18,17 @@ amazon-linux-extras enable php7.4
 yum clean metadata
 yum install php php-{pdo,mysqlnd,opcache,xml,gd,curl,mbstring,json,zip} -y
 
+# --- ADIÇÃO 1: Permitir que o Apache se conecte ao banco de dados via SELinux ---
+setsebool -P httpd_can_network_connect_db 1
+
 # Iniciar e habilitar serviços
 systemctl start httpd
 systemctl enable httpd
 systemctl start mariadb
 systemctl enable mariadb
+
+# --- ADIÇÃO 2: Aguardar 10 segundos para o MariaDB iniciar completamente ---
+sleep 10
 
 # Configurar banco de dados para WordPress
 mysql -e "CREATE DATABASE wordpress;"
@@ -40,4 +52,3 @@ sed -i 's/password_here/password/g' wp-config.php
 
 # Reiniciar serviços
 systemctl restart httpd
-systemctl restart mariadb
