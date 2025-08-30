@@ -12,33 +12,33 @@ DB_PASSWORD="a_strong_password_here"
 LOG_FILE="/var/log/wordpress-install.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
 
-echo "--- Início do script de configuração do WordPress com MySQL (Versão para AL2023) ---"
+echo "--- Início do script de configuração do WordPress com MariaDB (Versão para AL2023) ---"
 
 # --- 1. Atualização do Sistema e Instalação de Pacotes ---
 echo "Atualizando pacotes do sistema..."
 yum update -y
 
-echo "Instalando Apache, MySQL e PHP..."
-# TROCA: Substituímos MariaDB por MySQL Community Server.
-yum install -y httpd mysql-server php php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json
+echo "Instalando Apache, MariaDB e PHP..."
+# CORREÇÃO: Trocado 'mysql-server' por 'mariadb-server'
+yum install -y httpd mariadb-server php php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json
 
 # --- 2. Configuração de Segurança (SELinux) ---
 echo "Configurando a política do SELinux para o banco de dados..."
 setsebool -P httpd_can_network_connect_db 1
 
 # --- 3. Gerenciamento de Serviços ---
-echo "Iniciando e habilitando os serviços httpd e mysqld..."
+echo "Iniciando e habilitando os serviços httpd e mariadb..."
 systemctl start httpd
 systemctl enable httpd
-# TROCA: O nome do serviço do MySQL é 'mysqld'.
-systemctl start mysqld
-systemctl enable mysqld
+# CORREÇÃO: O nome do serviço do MariaDB é 'mariadb'.
+systemctl start mariadb
+systemctl enable mariadb
 
-echo "Aguardando 10 segundos para o MySQL iniciar completamente..."
+echo "Aguardando 10 segundos para o MariaDB iniciar completamente..."
 sleep 10
 
 # --- 4. Configuração do Banco de Dados ---
-# Os comandos 'mysql -e' são os mesmos, pois o cliente mysql é compatível.
+# Os comandos 'mysql -e' são compatíveis e não precisam de alteração.
 echo "Criando o banco de dados e o usuário para o WordPress..."
 mysql -e "CREATE DATABASE ${DB_NAME};"
 mysql -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';"
