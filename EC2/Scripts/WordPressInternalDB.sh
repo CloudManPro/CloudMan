@@ -1,20 +1,13 @@
-#!/bin/bash
-
 # --- Error Handling ---
-# Continua perfeito, sem mudanças.
+# Para o script imediatamente se qualquer comando falhar.
 set -e -o pipefail
 
-# --- Centralized Configuration ---
-DB_NAME="wordpress_db"
-DB_USER="wordpress_user"
-# MELHORIA: Gerar uma senha aleatória e segura em vez de fixá-la no código.
-# Isso é mais seguro e torna o script reutilizável sem expor credenciais.
-DB_PASSWORD=$(openssl rand -base64 12) 
-
 # --- Logging ---
-# Continua perfeito, sem mudanças.
+# Cria um log detalhado da instalação.
 LOG_FILE="/var/log/wordpress-install.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
+
+chown ec2-user:ec2-user /home/ec2-user/.env
 
 echo "--- Início do script de configuração do WordPress com MariaDB (Versão para AL2023) ---"
 
@@ -23,8 +16,10 @@ echo "Atualizando pacotes do sistema..."
 yum update -y
 
 echo "Instalando Apache, MariaDB, PHP e utilitários..."
-# Adicionado 'openssl' para gerar a senha e 'curl' para obter o IP
-yum install -y httpd mariadb105-server php php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json openssl curl
+# CORREÇÃO: Adicionado --allowerasing para resolver conflitos de pacotes na AMI do AL2023
+yum install -y httpd mariadb105-server php php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json openssl curl --allowerasing
+
+# --- O RESTO DO SCRIPT CONTINUA IGUAL ---
 
 # --- 2. Configuração de Segurança (SELinux) ---
 echo "Configurando a política do SELinux para o banco de dados..."
@@ -41,9 +36,11 @@ echo "Aguardando 10 segundos para o MariaDB iniciar completamente..."
 sleep 10
 
 # --- 4. Configuração do Banco de Dados ---
+DB_NAME="wordpress_db"
+DB_USER="wordpress_user"
+DB_PASSWORD=$(openssl rand -base64 12) 
+
 echo "Criando o banco de dados e o usuário para o WordPress..."
-# MELHORIA: Usar "heredoc" para rodar todos os comandos SQL em uma única conexão.
-# É mais eficiente e organizado. Também adiciona "IF NOT EXISTS" para tornar o script idempotente.
 mysql <<EOF
 CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
@@ -67,11 +64,8 @@ echo "Criando e configurando o arquivo wp-config.php..."
 cp wp-config-sample.php wp-config.php
 sed -i "s/database_name_here/${DB_NAME}/g" wp-config.php
 sed -i "s/username_here/${DB_USER}/g" wp-config.php
-# Atenção aqui: como a senha pode ter caracteres especiais, precisamos escapar para o sed
-# Uma forma mais segura é usar um delimitador diferente que não apareça na senha, como '#'
 sed -i "s#password_here#${DB_PASSWORD}#g" wp-config.php
 
-# A sua forma de inserir as chaves de segurança já era excelente. Mantida.
 SALT=$(curl -L https://api.wordpress.org/secret-key/1.1/salt/)
 STRING='put your unique phrase here'
 printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
@@ -80,7 +74,6 @@ printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
 echo "Reiniciando o Apache para aplicar todas as configurações..."
 systemctl restart httpd
 
-# MELHORIA: Fornecer feedback útil para o usuário final.
 PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || echo "Não foi possível obter o IP público")
 
 echo "--- Script de configuração do WordPress concluído com sucesso! ---"
