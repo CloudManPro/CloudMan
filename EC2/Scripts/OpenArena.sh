@@ -28,7 +28,7 @@ fi
 # 4. DOWNLOAD E EXTRAÇÃO DO SERVIDOR DEDICADO DO OPENARENA
 echo ">>> Baixando e extraindo o servidor OpenArena..."
 cd /home/openarena
-wget "https://downloads.sourceforge.net/project/openarena/openarena/0.8.8/openarena-0.8.8-ded.zip" -O openarena-0.8.8-ded.zip
+wget "https://downloads.sourceforge.net/project/openarena/openarena/0.8.8/openarena-0.8.8-linux.zip" -O openarena-0.8.8-linux.zip
 unzip openarena-0.8.8-ded.zip
 mv openarena-0.8.8-ded openarena-server
 rm openarena-0.8.8-ded.zip
