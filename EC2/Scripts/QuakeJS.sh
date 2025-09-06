@@ -1,7 +1,9 @@
 #!/bin/bash
-# Script FINAL para configurar um servidor de QuakeJS usando Docker
-# em uma instância EC2 ARM (Graviton), como a t4g.micro.
-# Este script usa uma imagem Docker multi-arquitetura que é compatível com ARM64.
+# Script FINAL E CORRIGIDO para configurar um servidor de QuakeJS
+# em uma instância EC2 ARM (Graviton).
+#
+# Esta versão usa uma imagem do Amazon ECR Public Gallery para evitar
+# os problemas de limite de taxa (rate limit) do Docker Hub.
 
 # Faz o script parar se qualquer comando falhar
 set -e
@@ -19,17 +21,16 @@ systemctl enable docker
 # 3. ADICIONAR O USUÁRIO PADRÃO AO GRUPO DOCKER
 usermod -a -G docker ec2-user
 
-# 4. EXECUTAR O CONTAINER DO SERVIDOR QUAKEJS (IMAGEM CORRETA)
-echo ">>> Baixando e executando o container QuakeJS multi-arquitetura..."
-# A imagem 'treyyoder/quakejs-server' tem suporte nativo para ARM64.
-# O Docker irá automaticamente baixar a versão correta para esta instância.
+# 4. EXECUTAR O CONTAINER DO SERVIDOR QUAKEJS (IMAGEM DO ECR PÚBLICO)
+echo ">>> Baixando e executando o container QuakeJS a partir do Amazon ECR Public..."
+# Esta é a mudança crucial. A imagem vem de um repositório da Amazon.
 docker run \
     -d \
     --restart=always \
     -p 80:80/tcp \
     -p 27960:27960/udp \
     --name quakejs-server \
-    treyyoder/quakejs-server
+    public.ecr.aws/l6m2p1w3/quakejs:latest
 
 echo ">>> Instalação com Docker finalizada!"
 echo ">>> O servidor QuakeJS já está rodando e acessível via navegador."
