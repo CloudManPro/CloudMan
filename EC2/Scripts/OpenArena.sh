@@ -27,7 +27,7 @@ fi
 echo ">>> Baixando e extraindo o servidor OpenArena..."
 cd /home/openarena
 # Link para a versão 0.8.8 do servidor dedicado para Linux
-wget http://download.tuxfamily.org/openarena/0.8.8/openarena-0.8.8-ded.zip
+wget https://files.ioquake3.org/openarena/openarena-0.8.8-ded.zip
 unzip openarena-0.8.8-ded.zip
 # Renomeia a pasta para algo mais simples
 mv openarena-0.8.8-ded openarena-server
