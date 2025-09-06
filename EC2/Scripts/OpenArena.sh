@@ -7,6 +7,15 @@ echo ">>> Atualizando o sistema e instalando dependências (wget, unzip)..."
 dnf update -y
 dnf install -y wget unzip
 
+echo ">>> Testando conectividade geral com a internet..."
+curl -v google.com
+if [ $? -eq 0 ]; then
+    echo ">>> Conectividade com a internet (google.com) FUNCIONOU."
+else
+    echo ">>> FALHA na conectividade com a internet. O problema está na rede (VPC, Rota, NACL)."
+    exit 1 # Para o script aqui se não houver internet
+fi
+
 # 2. CRIAÇÃO DE UM USUÁRIO DEDICADO PARA O SERVIDOR
 # Boa prática de segurança não rodar o serviço como root.
 if ! id "openarena" &>/dev/null; then
