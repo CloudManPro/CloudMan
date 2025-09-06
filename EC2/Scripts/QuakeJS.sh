@@ -1,6 +1,7 @@
 #!/bin/bash
-# Script para configurar um servidor de QuakeJS usando Docker
+# Script FINAL para configurar um servidor de QuakeJS usando Docker
 # em uma instância EC2 ARM (Graviton), como a t4g.micro.
+# Este script usa uma imagem Docker multi-arquitetura que é compatível com ARM64.
 
 # Faz o script parar se qualquer comando falhar
 set -e
@@ -16,21 +17,19 @@ systemctl start docker
 systemctl enable docker
 
 # 3. ADICIONAR O USUÁRIO PADRÃO AO GRUPO DOCKER
-# Permite que o usuário ec2-user execute comandos docker sem 'sudo' (boa prática)
 usermod -a -G docker ec2-user
 
-# 4. EXECUTAR O CONTAINER DO SERVIDOR QUAKEJS
-echo ">>> Baixando e executando o container QuakeJS..."
-# Este container é especial:
-# - Ele serve o site do jogo na porta 80 (TCP)
-# - Ele roda o servidor do jogo na porta 27960 (UDP)
+# 4. EXECUTAR O CONTAINER DO SERVIDOR QUAKEJS (IMAGEM CORRETA)
+echo ">>> Baixando e executando o container QuakeJS multi-arquitetura..."
+# A imagem 'treyyoder/quakejs-server' tem suporte nativo para ARM64.
+# O Docker irá automaticamente baixar a versão correta para esta instância.
 docker run \
     -d \
     --restart=always \
     -p 80:80/tcp \
     -p 27960:27960/udp \
     --name quakejs-server \
-    inolen/quakejs-server
+    treyyoder/quakejs-server
 
 echo ">>> Instalação com Docker finalizada!"
 echo ">>> O servidor QuakeJS já está rodando e acessível via navegador."
