@@ -19,10 +19,12 @@ git clone https://github.com/inolen/quakejs.git /opt/quakejs
 echo ">>> [PASSO 3 de 4] Compilando o projeto QuakeJS..."
 # Entra no diretório do projeto
 cd /opt/quakejs
-# Instala as dependências de JavaScript (Node.js)
+# Instala as dependências de JavaScript (Node.js) listadas no package.json
 npm install
-# Executa o processo de build (compilação do servidor C++ e preparação dos arquivos web)
-# npx é usado para rodar a ferramenta 'gulp' que está listada no projeto
+# O build requer o 'gulp', mas ele não é uma dependência do projeto.
+# Instalamos ele manualmente no diretório do projeto.
+npm install gulp
+# Agora, executa o processo de build
 npx gulp build
 
 echo ">>> [PASSO 4 de 4] Configurando o QuakeJS para rodar como um serviço de sistema..."
