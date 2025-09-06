@@ -13,8 +13,8 @@ dnf update -y
 dnf install -y git gcc make cmake nginx
 
 echo ">>> [PASSO 2 de 6] Baixando o código-fonte do ioquake3..."
-# Clonamos o repositório recursivamente para incluir todos os submódulos necessários
-git clone --recursive https://github.com/ioquake/ioquake3.git /opt/ioquake3
+# Clonamos o repositório usando o protocolo 'git://' para evitar prompts de autenticação em scripts
+git clone --recursive git://github.com/ioquake/ioquake3.git /opt/ioquake3
 cd /opt/ioquake3
 
 echo ">>> [PASSO 3 de 6] Compilando o motor do jogo (servidor e cliente WebAssembly)..."
