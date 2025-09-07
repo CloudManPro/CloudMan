@@ -42,18 +42,22 @@ sudo yum install -y aws-cli
 sudo systemctl start httpd
 sudo systemctl enable httpd
 
+# --- INÍCIO DA CORREÇÃO ---
+
 # Definição das variáveis
 EC2NAME=$NAME
-SECRET_NAME_ARN=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0
+# Corrigido: Usa a variável com o NOME do segredo, não o ARN
+SECRET_NAME=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0
 DBNAME=$AWS_DB_INSTANCE_TARGET_NAME_0
 SECRETREGION=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0
 RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
 # Extração do endereço e da porta do endpoint
 ENDPOINT_ADDRESS=$(echo $RDS_ENDPOINT | cut -d: -f1)
 
-if [ ! -z "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" ] && [ "$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0" != "none" ]; then
-    # Recupera os valores dos segredos do AWS Secrets Manager
-    SOURCE_NAME_VALUE=$(aws secretsmanager get-secret-value --secret-id $AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0 --query 'SecretString' --output text --region $SECRETREGION)
+# Corrigido: Verifica a variável com o NOME do segredo
+if [ ! -z "$SECRET_NAME" ] && [ "$SECRET_NAME" != "none" ]; then
+    # Recupera os valores dos segredos do AWS Secrets Manager usando o NOME do segredo
+    SOURCE_NAME_VALUE=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query 'SecretString' --output text --region "$SECRETREGION")
     DB_USER=$(echo $SOURCE_NAME_VALUE | jq -r .username)
     DB_PASSWORD=$(echo $SOURCE_NAME_VALUE | jq -r .password)
 else
@@ -61,6 +65,9 @@ else
     DB_USER="TypeNewUserName"
     DB_PASSWORD="TypeNewPassword"
 fi
+
+# --- FIM DA CORREÇÃO ---
+
 
 # Instala o client MySQL
 sudo yum install -y mysql
