@@ -1,74 +1,60 @@
 #!/bin/bash
 
-# Carrega as variáveis de ambiente a partir do arquivo correto
+# Carrega as variáveis de ambiente a partir do arquivo .env
 set -a
 source /home/ec2-user/.env
 set +a
 
-# Atualiza os pacotes e instala o servidor web Apache
-sudo yum update -y
-sudo yum install -y httpd
-
-# Instala JSON
-sudo yum install -y jq
-
-# Habilita o repositório EPEL
-sudo yum install -y epel-release
-
-# Habilita o repositório do Amazon Linux Extra para PHP 7.4
-sudo amazon-linux-extras enable php7.4
-
-# Instala PHP 7.4 e módulos necessários
-sudo yum install -y php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring
-
-# Instalação do AWS CLI para Red Hat-based (Amazon Linux, RHEL, CentOS)
-sudo yum install -y aws-cli
+# --- Instalação de Pacotes para Amazon Linux 2023 ---
+sudo dnf update -y
+sudo dnf install -y httpd jq php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring mysql amazon-efs-utils
 
 # Inicia o servidor Apache e configura para iniciar na inicialização
 sudo systemctl start httpd
 sudo systemctl enable httpd
 
-# Lê as variáveis de ambiente
-ID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
-
-# Definição das variáveis
-EC2NAME=$NAME
-SECRET_NAME_ARN=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_0
-DBNAME=$AWS_DB_INSTANCE_TARGET_NAME_0
+# --- Recuperação de Segredos ---
+SECRET_NAME=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0
 SECRETREGION=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0
+DBNAME=$AWS_DB_INSTANCE_TARGET_NAME_0
 RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
-S3_BUCKET_ARN=$AWS_S3_BUCKET_TARGET_ARN_0
 
-# Extração do endereço e da porta do endpoint
+# Extração do endereço do endpoint (sem a porta)
 ENDPOINT_ADDRESS=$(echo $RDS_ENDPOINT | cut -d: -f1)
 
 # Recupera os valores dos segredos do AWS Secrets Manager
-SOURCE_NAME_VALUE=$(aws secretsmanager get-secret-value --secret-id $SECRET_NAME_ARN --query 'SecretString' --output text --region $SECRETREGION)
-DB_USER=$(echo $SOURCE_NAME_VALUE | jq -r .username)
-DB_PASSWORD=$(echo $SOURCE_NAME_VALUE | jq -r .password)
+SECRET_VALUE_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query 'SecretString' --output text --region "$SECRETREGION")
+DB_USER=$(echo "$SECRET_VALUE_JSON" | jq -r .username)
+DB_PASSWORD=$(echo "$SECRET_VALUE_JSON" | jq -r .password)
 
-# Instala o client MySQL
-sudo yum install -y mysql
+# --- Montagem do EFS ---
+sudo mkdir -p /var/www/html
+# A variável EFS_ID é injetada pelo Terraform no arquivo .env
+sudo mount -t efs "$EFS_ID":/ /var/www/html
 
-# Montagem do EFS
-EFS_TARGET_ARN=$AWS_EFS_FILE_SYSTEM_TARGET_ARN_0
-sudo mkdir /var/www/html
-sudo yum install -y amazon-efs-utils
-sudo mount -t efs $EFS_TARGET_ARN:/ /var/www/html
+# Adiciona entrada no fstab para remontar após reinicialização (Boa Prática)
+echo "$EFS_ID:/ /var/www/html efs _netdev,tls 0 0" | sudo tee -a /etc/fstab
 
-# Download do WordPress
-wget https://wordpress.org/latest.tar.gz
-# Mover o WordPress para o diretório do servidor web
-tar -xzf latest.tar.gz
-sudo mv wordpress/* /var/www/html/
+# --- Instalação do WordPress (Apenas se não estiver instalado) ---
+if [ ! -f /var/www/html/wp-config.php ]; then
+    cd /tmp
+    wget https://wordpress.org/latest.tar.gz
+    tar -xzf latest.tar.gz
+    sudo mv wordpress/* /var/www/html/
 
-# Configuração do arquivo wp-config.php
-cd /var/www/html/
-sudo cp wp-config-sample.php wp-config.php
-sudo sed -i "s/database_name_here/$DBNAME/" wp-config.php
-sudo sed -i "s/username_here/$DB_USER/" wp-config.php
-sudo sed -i "s/password_here/$DB_PASSWORD/" wp-config.php
-sudo sed -i "s/localhost/$ENDPOINT_ADDRESS/" wp-config.php
+    # Configuração do arquivo wp-config.php
+    cd /var/www/html/
+    sudo cp wp-config-sample.php wp-config.php
+    sudo sed -i "s/database_name_here/$DBNAME/" wp-config.php
+    sudo sed -i "s/username_here/$DB_USER/" wp-config.php
+    sudo sed -i "s/password_here/$DB_PASSWORD/" wp-config.php
+    sudo sed -i "s/localhost/$ENDPOINT_ADDRESS/" wp-config.php
+
+    # Adicionar chaves de segurança (Melhoria de Segurança)
+    SALT=$(curl -L https://api.wordpress.org/secret-key/1.1/salt/)
+    STRING_TO_REPLACE="'put your unique phrase here'"
+    printf '%s\n' "g/$STRING_TO_REPLACE/d" a "$SALT" . w | ed -s wp-config.php
+fi
 
 # Ajusta permissões
 sudo chown -R apache:apache /var/www/html/
