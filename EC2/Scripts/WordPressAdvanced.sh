@@ -16,56 +16,53 @@ sudo systemctl start httpd
 sudo systemctl enable httpd
 
 # --- Recuperação de Segredos ---
+# (Nenhuma mudança aqui, mantendo como está)
 SECRET_NAME=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_0
 SECRETREGION=$AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_REGION_0
 DBNAME=$AWS_DB_INSTANCE_TARGET_NAME_0
 RDS_ENDPOINT=$AWS_DB_INSTANCE_TARGET_ENDPOINT_0
-
-# Extração do endereço do endpoint (sem a porta)
 ENDPOINT_ADDRESS=$(echo $RDS_ENDPOINT | cut -d: -f1)
-
-# Recupera os valores dos segredos do AWS Secrets Manager
 SECRET_VALUE_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query 'SecretString' --output text --region "$SECRETREGION")
 DB_USER=$(echo "$SECRET_VALUE_JSON" | jq -r .username)
 DB_PASSWORD=$(echo "$SECRET_VALUE_JSON" | jq -r .password)
 
-# --- Montagem do EFS com Retry Logic ---
+# --- Montagem do EFS com Lógica de Repetição Corrigida ---
 sudo mkdir -p /var/www/html
 MAX_RETRIES=12
-RETRY_COUNT=0
+COUNT=0
 MOUNT_SUCCESS=false
-until [ $RETRY_COUNT -ge $MAX_RETRIES ]
-do
-    echo "Tentando montar o EFS (tentativa $((RETRY_COUNT+1))/$MAX_RETRIES)..."
-    mount -t efs "$EFS_ID":/ /var/www/html
-    if [ $? -eq 0 ]; then
-        MOUNT_SUCCESS=true
+until [ $COUNT -ge $MAX_RETRIES ]; do
+    echo "Tentando montar o EFS (tentativa $((COUNT+1))/$MAX_RETRIES)..."
+    # CORREÇÃO: Colocamos o 'mount' dentro de um 'if' para que sua falha não acione o 'set -e'
+    if mount -t efs "$EFS_ID":/ /var/www/html; then
         echo "EFS montado com sucesso."
+        MOUNT_SUCCESS=true
         break
+    else
+        echo "Falha na tentativa. Aguardando 10s para a próxima..."
+        sleep 10
     fi
-    RETRY_COUNT=$((RETRY_COUNT+1))
-    sleep 10
+    COUNT=$((COUNT+1))
 done
 
 if [ "$MOUNT_SUCCESS" = false ]; then
-    echo "Falha ao montar o EFS após $MAX_RETRIES tentativas."
-    exit 1
+    echo "ERRO CRÍTICO: Falha ao montar o EFS após $MAX_RETRIES tentativas."
+    exit 1 # Sai explicitamente se a montagem falhar
 fi
 
-
-# Adiciona entrada no fstab para remontar após reinicialização (Boa Prática)
+# Adiciona entrada no fstab para remontar após reinicialização
 if ! grep -q "$EFS_ID" /etc/fstab; then
   echo "$EFS_ID:/ /var/www/html efs _netdev,tls 0 0" | sudo tee -a /etc/fstab
 fi
 
 # --- Instalação do WordPress (Apenas se não estiver instalado) ---
+# (Nenhuma mudança aqui, mantendo como está)
 if [ ! -f /var/www/html/wp-config.php ]; then
     cd /tmp
     wget https://wordpress.org/latest.tar.gz
     tar -xzf latest.tar.gz
     sudo mv wordpress/* /var/www/html/
 
-    # Configuração do arquivo wp-config.php
     cd /var/www/html/
     sudo cp wp-config-sample.php wp-config.php
     sudo sed -i "s/database_name_here/$DBNAME/" wp-config.php
@@ -73,7 +70,6 @@ if [ ! -f /var/www/html/wp-config.php ]; then
     sudo sed -i "s/password_here/$DB_PASSWORD/" wp-config.php
     sudo sed -i "s/localhost/$ENDPOINT_ADDRESS/" wp-config.php
 
-    # Adicionar chaves de segurança (Melhoria de Segurança)
     SALT=$(curl -L https://api.wordpress.org/secret-key/1.1/salt/)
     STRING_TO_REPLACE="'put your unique phrase here'"
     printf '%s\n' "g/$STRING_TO_REPLACE/d" a "$SALT" . w | ed -s wp-config.php
