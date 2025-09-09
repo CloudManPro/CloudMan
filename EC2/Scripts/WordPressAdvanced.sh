@@ -1,4 +1,6 @@
-
+#!/bin/bash
+# Adicionado para parar o script no primeiro erro, facilitando o debug.
+set -e
 
 # Carrega as variáveis de ambiente a partir do arquivo .env
 set -a
@@ -6,10 +8,10 @@ source /home/ec2-user/.env
 set +a
 
 # --- Instalação de Pacotes para Amazon Linux 2023 ---
-# Correção: O Amazon Linux 2023 usa 'dnf' e os nomes dos pacotes são consistentes,
-# mas garantimos que todos os módulos PHP necessários estejam listados.
 sudo dnf update -y
-sudo dnf install -y httpd jq php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring mariadb10.5-common amazon-efs-utils
+# CORREÇÃO: Removido o pacote 'mysql' que não existe nesse nome nos repositórios do AL2023 e causava a falha.
+# O pacote 'php-mysqlnd' é o driver necessário para o PHP conectar ao banco de dados.
+sudo dnf install -y httpd jq php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring amazon-efs-utils
 
 # Inicia o servidor Apache e configura para iniciar na inicialização
 sudo systemctl start httpd
@@ -62,12 +64,8 @@ if [ ! -f /var/www/html/wp-config.php ]; then
 fi
 
 # Ajusta permissões
-# Correção: No Amazon Linux 2023, o usuário e o grupo do Apache são ambos 'apache'.
-# O comando estava correto, mas falhava porque a instalação do httpd não ocorria.
-# Agora que a instalação está corrigida, este comando funcionará.
 sudo chown -R apache:apache /var/www/html/
 sudo chmod -R 755 /var/www/html/
 
 # Reinicia o servidor Apache para aplicar as alterações
-# Correção: O nome do serviço 'httpd' está correto. O problema era que ele não existia.
 sudo systemctl restart httpd
