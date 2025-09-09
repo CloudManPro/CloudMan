@@ -39,7 +39,7 @@ until [ $COUNT -ge $MAX_RETRIES ]; do
         break
     else
         echo "Falha na tentativa. Aguardando 10s para a próxima..."
-        sleep 10
+        sleep 30
     fi
     COUNT=$((COUNT+1))
 done
