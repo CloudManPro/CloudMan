@@ -7,7 +7,7 @@ set -a
 source /home/ec2-user/.env
 set +a
 
-# CORREÇÃO: Atribui o valor da variável longa do Terraform à variável curta que o script usa.
+# Atribui o valor da variável longa do Terraform à variável curta que o script usa.
 EFS_ID=$AWS_EFS_FILE_SYSTEM_TARGET_ID_0
 
 # --- Instalação de Pacotes para Amazon Linux 2023 ---
@@ -61,7 +61,8 @@ if [ ! -f /var/www/html/wp-config.php ]; then
     cd /tmp
     wget https://wordpress.org/latest.tar.gz
     tar -xzf latest.tar.gz
-    sudo mv wordpress/* /var/www/html/
+    # CORREÇÃO: Usar 'cp -R' para copiar recursivamente sem falhar em diretórios existentes
+    sudo cp -R wordpress/* /var/www/html/
 
     cd /var/www/html/
     sudo cp wp-config-sample.php wp-config.php
