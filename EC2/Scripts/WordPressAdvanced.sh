@@ -1,5 +1,5 @@
 #!/bin/bash
-# Adicionado para parar o script no primeiro erro, facilitando o debug.
+# Para o script no primeiro erro, facilitando o debug.
 set -e
 
 # Carrega as variáveis de ambiente a partir do arquivo .env
@@ -9,8 +9,6 @@ set +a
 
 # --- Instalação de Pacotes para Amazon Linux 2023 ---
 sudo dnf update -y
-# CORREÇÃO: Removido o pacote 'mysql' que não existe nesse nome nos repositórios do AL2023 e causava a falha.
-# O pacote 'php-mysqlnd' é o driver necessário para o PHP conectar ao banco de dados.
 sudo dnf install -y httpd jq php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring amazon-efs-utils
 
 # Inicia o servidor Apache e configura para iniciar na inicialização
@@ -31,13 +29,31 @@ SECRET_VALUE_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAM
 DB_USER=$(echo "$SECRET_VALUE_JSON" | jq -r .username)
 DB_PASSWORD=$(echo "$SECRET_VALUE_JSON" | jq -r .password)
 
-# --- Montagem do EFS ---
+# --- Montagem do EFS com Retry Logic ---
 sudo mkdir -p /var/www/html
-# A variável EFS_ID é injetada pelo Terraform no arquivo .env
-sudo mount -t efs "$EFS_ID":/ /var/www/html
+MAX_RETRIES=12
+RETRY_COUNT=0
+MOUNT_SUCCESS=false
+until [ $RETRY_COUNT -ge $MAX_RETRIES ]
+do
+    echo "Tentando montar o EFS (tentativa $((RETRY_COUNT+1))/$MAX_RETRIES)..."
+    mount -t efs "$EFS_ID":/ /var/www/html
+    if [ $? -eq 0 ]; then
+        MOUNT_SUCCESS=true
+        echo "EFS montado com sucesso."
+        break
+    fi
+    RETRY_COUNT=$((RETRY_COUNT+1))
+    sleep 10
+done
+
+if [ "$MOUNT_SUCCESS" = false ]; then
+    echo "Falha ao montar o EFS após $MAX_RETRIES tentativas."
+    exit 1
+fi
+
 
 # Adiciona entrada no fstab para remontar após reinicialização (Boa Prática)
-# Verifica se a entrada já não existe antes de adicionar
 if ! grep -q "$EFS_ID" /etc/fstab; then
   echo "$EFS_ID:/ /var/www/html efs _netdev,tls 0 0" | sudo tee -a /etc/fstab
 fi
