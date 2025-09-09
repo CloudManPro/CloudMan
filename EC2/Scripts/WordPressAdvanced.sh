@@ -1,4 +1,4 @@
-#!/bin/bash
+
 
 # Carrega as variáveis de ambiente a partir do arquivo .env
 set -a
