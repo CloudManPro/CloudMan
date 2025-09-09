@@ -1,5 +1,5 @@
 #!/bin/bash
-# Para o script no primeiro erro, facilitando o debug.
+# Para o script no primeiro erro.
 set -e
 
 # Carrega as variáveis de ambiente a partir do arquivo .env
@@ -7,9 +7,12 @@ set -a
 source /home/ec2-user/.env
 set +a
 
-# --- Instalação de Pacotes para Amazon Linux 2023 (COM FERRAMENTAS DE DEBUG) ---
+# CORREÇÃO: Atribui o valor da variável longa do Terraform à variável curta que o script usa.
+EFS_ID=$AWS_EFS_FILE_SYSTEM_TARGET_ID_0
+
+# --- Instalação de Pacotes para Amazon Linux 2023 ---
 sudo dnf update -y
-sudo dnf install -y httpd jq php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring amazon-efs-utils bind-utils nmap-ncat
+sudo dnf install -y httpd jq php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring amazon-efs-utils
 
 # Inicia o servidor Apache e configura para iniciar na inicialização
 sudo systemctl start httpd
@@ -25,38 +28,19 @@ SECRET_VALUE_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAM
 DB_USER=$(echo "$SECRET_VALUE_JSON" | jq -r .username)
 DB_PASSWORD=$(echo "$SECRET_VALUE_JSON" | jq -r .password)
 
-# --- Montagem do EFS com Lógica de Repetição e Depuração Detalhada ---
+# --- Montagem do EFS com Lógica de Repetição ---
 sudo mkdir -p /var/www/html
 MAX_RETRIES=12
 COUNT=0
 MOUNT_SUCCESS=false
-EFS_DNS_NAME="${EFS_ID}.efs.${REGION}.amazonaws.com"
-
 until [ $COUNT -ge $MAX_RETRIES ]; do
-    echo "==================== TENTATIVA $((COUNT+1))/$MAX_RETRIES ===================="
-    
-    echo "--- [DEBUG] Testando resolução de DNS para ${EFS_DNS_NAME} ---"
-    # O '|| true' garante que o script não pare se o dig falhar
-    dig ${EFS_DNS_NAME} || true
-    
-    EFS_IP=$(dig +short ${EFS_DNS_NAME})
-    
-    if [ -n "$EFS_IP" ]; then
-        echo "--- [DEBUG] DNS RESOLVIDO. IP encontrado: ${EFS_IP} ---"
-        echo "--- [DEBUG] Testando conectividade na porta 2049 para ${EFS_IP} ---"
-        # O '-w 5' define um timeout de 5 segundos para o nc
-        nc -zv -w 5 ${EFS_IP} 2049 || true
-    else
-        echo "--- [DEBUG] DNS NÃO RESOLVIDO. Nenhum IP retornado. ---"
-    fi
-
-    echo "--- Tentando montar o EFS... ---"
+    echo "Tentando montar o EFS (tentativa $((COUNT+1))/$MAX_RETRIES)..."
     if mount -t efs "$EFS_ID":/ /var/www/html; then
         echo "EFS montado com sucesso."
         MOUNT_SUCCESS=true
         break
     else
-        echo "Falha na tentativa de montagem. Aguardando 10s para a próxima..."
+        echo "Falha na tentativa. Aguardando 10s para a próxima..."
         sleep 10
     fi
     COUNT=$((COUNT+1))
@@ -72,8 +56,7 @@ if ! grep -q "$EFS_ID" /etc/fstab; then
   echo "$EFS_ID:/ /var/www/html efs _netdev,tls 0 0" | sudo tee -a /etc/fstab
 fi
 
-# --- Instalação do WordPress (continua normalmente) ---
-# (O resto do script permanece o mesmo)
+# --- Instalação do WordPress ---
 if [ ! -f /var/www/html/wp-config.php ]; then
     cd /tmp
     wget https://wordpress.org/latest.tar.gz
