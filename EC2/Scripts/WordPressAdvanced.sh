@@ -6,8 +6,10 @@ source /home/ec2-user/.env
 set +a
 
 # --- Instalação de Pacotes para Amazon Linux 2023 ---
+# Correção: O Amazon Linux 2023 usa 'dnf' e os nomes dos pacotes são consistentes,
+# mas garantimos que todos os módulos PHP necessários estejam listados.
 sudo dnf update -y
-sudo dnf install -y httpd jq php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring mysql amazon-efs-utils
+sudo dnf install -y httpd jq php php-mysqlnd php-fpm php-json php-cli php-xml php-zip php-gd php-mbstring mariadb10.5-common amazon-efs-utils
 
 # Inicia o servidor Apache e configura para iniciar na inicialização
 sudo systemctl start httpd
@@ -33,7 +35,10 @@ sudo mkdir -p /var/www/html
 sudo mount -t efs "$EFS_ID":/ /var/www/html
 
 # Adiciona entrada no fstab para remontar após reinicialização (Boa Prática)
-echo "$EFS_ID:/ /var/www/html efs _netdev,tls 0 0" | sudo tee -a /etc/fstab
+# Verifica se a entrada já não existe antes de adicionar
+if ! grep -q "$EFS_ID" /etc/fstab; then
+  echo "$EFS_ID:/ /var/www/html efs _netdev,tls 0 0" | sudo tee -a /etc/fstab
+fi
 
 # --- Instalação do WordPress (Apenas se não estiver instalado) ---
 if [ ! -f /var/www/html/wp-config.php ]; then
@@ -57,8 +62,12 @@ if [ ! -f /var/www/html/wp-config.php ]; then
 fi
 
 # Ajusta permissões
+# Correção: No Amazon Linux 2023, o usuário e o grupo do Apache são ambos 'apache'.
+# O comando estava correto, mas falhava porque a instalação do httpd não ocorria.
+# Agora que a instalação está corrigida, este comando funcionará.
 sudo chown -R apache:apache /var/www/html/
 sudo chmod -R 755 /var/www/html/
 
 # Reinicia o servidor Apache para aplicar as alterações
+# Correção: O nome do serviço 'httpd' está correto. O problema era que ele não existia.
 sudo systemctl restart httpd
