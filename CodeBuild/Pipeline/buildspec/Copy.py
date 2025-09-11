@@ -1,3 +1,4 @@
+# Copy.py 1.0.0
 import boto3
 import os
 import json
@@ -153,3 +154,4 @@ for pair in s3_list:
         sync_s3_buckets(source_bucket_name, target_bucket_name, source_region)
     else:
         logger.warning(f"Par inválido encontrado em ListS3: {pair}")
+
