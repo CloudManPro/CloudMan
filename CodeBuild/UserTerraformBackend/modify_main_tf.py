@@ -1,4 +1,4 @@
-# modify_main_tf.py (Versão 2.0 - Com injeção de Role ARN)
+# modify_main_tf.py (Versão 2.0.1 - Com injeção de Role ARN)
 import os
 import re
 import requests
@@ -227,3 +227,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
