@@ -5,6 +5,20 @@ phases:
     runtime-versions:
       python: 3.11
     commands:
+          # ===================================================================
+      # INÍCIO DO BLOCO DE DEPURAÇÃO ADICIONADO
+      # ===================================================================
+      - echo "--- [DEBUG] Imprimindo variáveis de ambiente recebidas do CodePipeline ---"
+      - echo "Command: ${Command}"
+      - echo "DYNAMIC_ASSUMABLE_ROLE_ARN: ${DYNAMIC_ASSUMABLE_ROLE_ARN}"
+      - echo "USER_ID: ${USER_ID}"
+      - echo "STATE_NAME: ${STATE_NAME}"
+      - echo "GITHUB_TOKENS_JSON: ${GITHUB_TOKENS_JSON}"
+      - echo "SOURCE_STRUCTURE_JSON: ${SOURCE_STRUCTURE_JSON}"
+      - echo "--- [DEBUG] Fim do bloco de impressão de variáveis ---"
+      # ===================================================================
+      # FIM DO BLOCO DE DEPURAÇÃO
+      # ===================================================================
       - echo "Bucket Backend name:${AWS_S3_BUCKET_SOURCE_NAME_0}"
       - echo "Instalando dependências do Terraform..."
       - |
@@ -43,3 +57,4 @@ phases:
       - python InitTerraform.py
       - echo "Verificando se o terraform.lock.hcl foi criado..."
       - ls -al /tmp/states/${STATE_NAME}/
+
