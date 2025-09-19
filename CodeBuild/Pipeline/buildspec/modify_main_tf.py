@@ -180,6 +180,11 @@ def modify_terraform_file(file_path, repo, branch, copied_files, role_arn):
         else:
             logger.warning(
                 f"'{local_file}' não encontrado no conteúdo do main.tf para substituição.")
+        logger.info("======================================================")
+        logger.info("--- CONTEÚDO FINAL DO main.tf ANTES DE SALVAR ---")
+        print(content) # Usamos print() para uma saída limpa, sem formatação do logger
+        logger.info("--- FIM DO CONTEÚDO FINAL ---")
+        logger.info("======================================================")
 
     # Escrever o conteúdo final (com ambas as modificações) de volta ao arquivo
     try:
@@ -227,3 +232,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
