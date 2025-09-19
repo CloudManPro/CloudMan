@@ -1,11 +1,10 @@
-#Terrabach.py 2.0.0 (Com download dinâmico de fontes do GitHub)
+#Terrabach.py 1.0.0
 import os
 import json
 import logging
 import subprocess
 import sys
 import boto3
-import requests # ADIÇÃO: Necessário para chamadas de API do GitHub
 
 # Configure the main logger
 logging.basicConfig(level=logging.INFO,
@@ -63,133 +62,7 @@ NextTestStageName = json_data.get("NextTestStageName", "")
 IsNextTest = NextTestStageName == CurrentStageName
 
 
-# ==============================================================================
-# INÍCIO DA SEÇÃO DE CÓDIGO ADICIONADA CIRURGICAMENTE
-# ==============================================================================
-
-def download_recursive_from_api(repo_full_name, path, token, target_dir):
-    """
-    Função auxiliar para baixar o conteúdo de um diretório do GitHub recursivamente via API.
-    """
-    api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{path}"
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-    
-    try:
-        response = requests.get(api_url, headers=headers)
-        response.raise_for_status()  # Lança exceção para códigos de erro HTTP
-        
-        for item in response.json():
-            item_path = item['path']
-            local_item_path = os.path.join(target_dir, item_path)
-
-            if item['type'] == 'dir':
-                download_recursive_from_api(repo_full_name, item_path, token, target_dir)
-            elif item['type'] == 'file':
-                logger.info(f"      -> Baixando arquivo: {item_path}")
-                file_response = requests.get(item['download_url'], headers=headers)
-                file_response.raise_for_status()
-                
-                os.makedirs(os.path.dirname(local_item_path), exist_ok=True)
-                with open(local_item_path, 'wb') as f:
-                    f.write(file_response.content)
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Erro de rede ao acessar a API do GitHub para {repo_full_name}/{path}: {e}")
-        sys.exit(1)
-
-
-def download_github_sources(structure, tokens):
-    """
-    Função principal que itera sobre a estrutura definida em SOURCE_STRUCTURE_JSON
-    e baixa o código-fonte necessário do GitHub.
-    """
-    for repo_info in structure:
-        repo_full_name = repo_info['repo']
-        repo_owner = repo_full_name.split('/')[0]
-        repo_name = repo_full_name.split('/')[1]
-        
-        token = tokens.get(repo_owner)
-        if not token:
-            logger.error(f"ERRO: Token para o owner '{repo_owner}' não foi encontrado no GITHUB_TOKENS_JSON. Abortando.")
-            sys.exit(1)
-
-        logger.info(f"Processando repositório: {repo_full_name}")
-
-        items_to_download = repo_info.get('items', [])
-        if not items_to_download:
-            logger.info(f"  -> A lista 'items' está vazia. Clonando o repositório completo para o diretório '{repo_name}'...")
-            clone_url = f"https://oauth2:{token}@github.com/{repo_full_name}.git"
-            try:
-                subprocess.run(['git', 'clone', '--depth', '1', clone_url, repo_name], check=True, capture_output=True, text=True)
-                logger.info(f"  -> Repositório {repo_name} clonado com sucesso.")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"ERRO ao clonar o repositório {repo_full_name}. Detalhes: {e.stderr}")
-                sys.exit(1)
-        else:
-            logger.info(f"  -> Encontrados {len(items_to_download)} itens para download seletivo.")
-            for item in items_to_download:
-                item_path = item['path']
-                item_type = item['type']
-
-                if item_type == "dir":
-                    logger.info(f"    -> Baixando diretório recursivamente: {item_path}")
-                    # Para downloads seletivos, criamos um diretório com o nome do repo para evitar conflitos
-                    target_dir = repo_name
-                    os.makedirs(target_dir, exist_ok=True)
-                    download_recursive_from_api(repo_full_name, item_path, token, target_dir)
-                elif item_type == "file":
-                    logger.info(f"    -> Baixando arquivo específico: {item_path}")
-                    # Lógica para baixar um único arquivo via API
-                    api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{item_path}"
-                    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-                    try:
-                        file_meta = requests.get(api_url, headers=headers).json()
-                        file_response = requests.get(file_meta['download_url'], headers=headers)
-                        file_response.raise_for_status()
-
-                        # Salva no diretório com nome do repo para manter a estrutura
-                        target_dir = repo_name
-                        local_file_path = os.path.join(target_dir, item_path)
-                        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-                        with open(local_file_path, 'wb') as f:
-                            f.write(file_response.content)
-                    except requests.exceptions.RequestException as e:
-                        logger.error(f"Erro de rede ao baixar o arquivo {item_path}: {e}")
-                        sys.exit(1)
-
-# ==============================================================================
-# FIM DA SEÇÃO DE CÓDIGO ADICIONADA
-# ==============================================================================
-
-
 def main():
-    # ==============================================================================
-    # INÍCIO DO BLOCO DE LÓGICA ADICIONADO DENTRO DE main()
-    # ==============================================================================
-    logger.info("--- Verificando a necessidade de baixar fontes externas do GitHub ---")
-    source_structure_str = os.getenv('SOURCE_STRUCTURE_JSON')
-    github_tokens_str = os.getenv('GITHUB_TOKENS_JSON')
-
-    if source_structure_str and github_tokens_str:
-        logger.info("Variáveis 'SOURCE_STRUCTURE_JSON' e 'GITHUB_TOKENS_JSON' encontradas.")
-        try:
-            source_structure = json.loads(source_structure_str)
-            github_tokens = json.loads(github_tokens_str)
-            
-            logger.info("Iniciando o download de fontes externas...")
-            download_github_sources(source_structure, github_tokens)
-            logger.info("--- Download de fontes externas concluído com sucesso. ---")
-
-        except json.JSONDecodeError as e:
-            logger.error(f"ERRO CRÍTICO: Falha ao decodificar o JSON de uma das variáveis de ambiente. Verifique o formato. Detalhes: {e}")
-            sys.exit(1)
-    else:
-        logger.info("Nenhuma estrutura para download de fontes do GitHub foi fornecida (variáveis não encontradas). Pulando esta etapa.")
-    # ==============================================================================
-    # FIM DO BLOCO DE LÓGICA ADICIONADO
-    # ==============================================================================
-
-
     if command_type == "destroy":
         states_to_process = ListStates[::-
                                        1] if IsTest else ListStatesBlue[::-1]
