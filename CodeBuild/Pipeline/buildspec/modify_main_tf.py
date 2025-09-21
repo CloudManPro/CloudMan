@@ -1,236 +1,133 @@
-# modify_main_tf.py (Versão 2.0.1 - Com injeção de Role ARN)
+# modify_main_tf.py (Versão 3.0.0 - Simplificada e Alinhada com TerraBatch Unificado)
 import os
 import re
-import requests
 import logging
-import json
-import sys  # Adicionado para sys.exit
+import sys
 
-# Configure o logger
+# --- CONFIGURAÇÃO ---
+# Diretório padrão onde o TerraBatch.py prepara os artefatos
+ARTIFACTS_DIR = '/tmp/artifacts'
+
+# Padrão de caminho de desenvolvimento a ser substituído
+DEV_PATH_PREFIX = 'C:/Cloudman/'
+
+# Configurar o logger
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
-# Definir o caminho para armazenar o estado dos arquivos copiados
-COPIED_FILES_PATH = '/tmp/copied_files.json'
-
-
-def load_copied_files():
-    """
-    Carrega a lista de arquivos já copiados a partir de um arquivo JSON.
-    Se o arquivo não existir, retorna um conjunto vazio.
-    """
-    if os.path.exists(COPIED_FILES_PATH):
-        try:
-            with open(COPIED_FILES_PATH, 'r') as f:
-                copied = set(json.load(f))
-                logger.info(
-                    f"Carregados {len(copied)} arquivos copiados anteriormente.")
-                return copied
-        except Exception as e:
-            logger.error(f"Erro ao carregar {COPIED_FILES_PATH}: {e}")
-            return set()
-    else:
-        logger.info("Nenhum arquivo copiado anteriormente encontrado.")
-        return set()
-
-
-def save_copied_files(copied_files):
-    """
-    Salva a lista de arquivos copiados em um arquivo JSON.
-    """
-    try:
-        with open(COPIED_FILES_PATH, 'w') as f:
-            json.dump(list(copied_files), f)
-        logger.info(
-            f"Salvo {len(copied_files)} arquivos copiados em {COPIED_FILES_PATH}.")
-    except Exception as e:
-        logger.error(f"Erro ao salvar {COPIED_FILES_PATH}: {e}")
-
-
-def download_file_from_github(repo, file_path, branch, local_path):
-    """
-    Baixa um arquivo específico do GitHub.
-    :param repo: O repositório no formato 'usuario/repositorio'.
-    :param file_path: Caminho do arquivo no repositório.
-    :param branch: A branch do repositório (ex: 'refs/heads/main').
-    :param local_path: Caminho local onde o arquivo será salvo.
-    """
-    # Ajustar o formato do URL com 'refs/heads' para a branch
-    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{file_path}"
-    logger.info(f"Baixando {file_path} de {url}")
-
-    response = requests.get(url)
-
-    if response.status_code == 200:
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        with open(local_path, 'wb') as file:
-            file.write(response.content)
-        logger.info(f"Arquivo baixado e salvo em: {local_path}")
-    else:
-        logger.error(
-            f"Erro ao baixar arquivo do GitHub: {response.status_code} - {response.text}")
-        raise Exception(
-            f"Erro ao baixar arquivo do GitHub: {response.status_code} - {response.text}")
-
-
-# --- INÍCIO DA SEÇÃO DE LÓGICA ADAPTADA DO ExecTerraform ---
+# --- LÓGICA DE INJEÇÃO DE ROLE (FUNCIONALIDADE PRESERVADA) ---
 def inject_assume_role(code, role_arn):
     """
     Injeta o bloco 'assume_role' em todos os provedores 'aws' encontrados no código.
-    Esta lógica foi adaptada diretamente da função LoadFiles da Lambda ExecTerraform.
+    Esta funcionalidade crítica para cross-account foi mantida intacta.
     """
     if not role_arn:
-        logger.info("Nenhuma Role ARN encontrada na variável de ambiente DYNAMIC_ASSUMABLE_ROLE_ARN. Pulando injeção.")
+        logger.info("Nenhuma Role ARN para assume_role foi fornecida. Pulando injeção.")
         return code
 
-    logger.info(f"Role ARN detectada. Iniciando injeção do bloco assume_role para: {role_arn}")
+    logger.info(f"Role ARN detectada. Injetando bloco assume_role para: {role_arn}")
 
-    # Bloco 'assume_role' que será injetado
     assume_role_block = f'''
   assume_role {{
     role_arn     = "{role_arn}"
     session_name = "Cloudman_CodeBuild_CrossAccount_Session"
   }}
 '''
-    # Expressão regular robusta para encontrar todos os blocos de provedor 'aws'
     provider_regex = r'(provider\s+(?:"aws"|aws)\s*\{)([\s\S]*?)(\})'
-    all_providers = re.findall(provider_regex, code, flags=re.MULTILINE)
-
-    modified_code = code
-
-    if not all_providers:
+    
+    # Se nenhum provedor 'aws' for encontrado, injeta um provedor padrão.
+    if not re.search(provider_regex, code, flags=re.MULTILINE):
         logger.warning("Nenhum provedor 'aws' encontrado. Injetando um provedor padrão no início do arquivo.")
-        # Se nenhum provedor existe, adiciona um no topo do arquivo.
         provider_config_to_inject = f'''
-# Provedor padrão injetado pelo modify_main_tf.py para execução cross-account
-provider "aws" {{
-  {assume_role_block}
-}}
+provider "aws" {{{assume_role_block}}}
 '''
-        modified_code = provider_config_to_inject + "\n\n" + modified_code
-    else:
-        logger.info(f"{len(all_providers)} provedor(es) 'aws' encontrado(s). Processando...")
-        # Itera, modifica e substitui cada provedor encontrado
-        for opening, body, closing in all_providers:
-            original_block_text = f"{opening}{body}{closing}"
-            
-            # Reconstrói o bloco, injetando 'assume_role' antes do '}' final
-            modified_block_text = f"{opening}{body}{assume_role_block}{closing}"
-            
-            # Substitui o bloco original exato pela sua versão modificada
-            modified_code = modified_code.replace(original_block_text, modified_block_text)
-            logger.info("Bloco de provedor substituído com sucesso.")
+        return provider_config_to_inject + "\n\n" + code
+    
+    # Se provedores 'aws' existem, modifica cada um deles.
+    def add_assume_role_to_provider(match):
+        opening, body, closing = match.groups()
+        # Evita adicionar o bloco se ele já existir
+        if 'assume_role' in body:
+            return match.group(0)
+        return f"{opening}{body}{assume_role_block}{closing}"
 
+    modified_code = re.sub(provider_regex, add_assume_role_to_provider, code, flags=re.MULTILINE)
+    logger.info("Bloco(s) de provedor 'aws' atualizado(s) com assume_role.")
     return modified_code
-# --- FIM DA SEÇÃO DE LÓGICA ADAPTADA ---
 
-
-def modify_terraform_file(file_path, repo, branch, copied_files, role_arn):
+# --- FUNÇÃO PRINCIPAL DE MODIFICAÇÃO ---
+def modify_terraform_file(file_path, role_arn):
     """
-    Função principal que aplica todas as modificações necessárias no arquivo Terraform.
+    Aplica todas as modificações necessárias no arquivo Terraform:
+    1. Injeta a configuração 'assume_role' para execução cross-account.
+    2. Mapeia os caminhos de arquivos de desenvolvimento para os caminhos locais do CodeBuild.
     """
-    # Ler o conteúdo do arquivo main.tf
-    with open(file_path, 'r') as file:
-        content = file.read()
-
-    # PASSO 1: Injetar a configuração 'assume_role' (NOVA FUNCIONALIDADE)
-    content = inject_assume_role(content, role_arn)
-
-    # PASSO 2: Tratar caminhos de arquivos locais (FUNCIONALIDADE EXISTENTE)
-    local_files = re.findall(r'C:/Cloudman[^"\\]*', content)
-
-    if not local_files:
-        logger.info("Nenhum 'local_file' (C:/Cloudman/...) encontrado no arquivo main.tf.")
-    else:
-        logger.info(f"Local files encontrados: {local_files}")
-
-    for local_file in local_files:
-        logger.info(f"Processando local_file: {local_file}")
-        relative_path = os.path.relpath(local_file, 'C:/Cloudman')
-        local_tmp_path = os.path.join('/tmp', relative_path.lstrip('/\\'))
-        logger.info(f"Local tmp path: {local_tmp_path}")
-
-        if not local_tmp_path.startswith('/tmp'):
-            logger.error(f"Caminho fora de /tmp detectado: {local_tmp_path}")
-            continue
-
-        os.makedirs(os.path.dirname(local_tmp_path), exist_ok=True)
-
-        if local_file not in copied_files:
-            github_file_path = relative_path.replace("\\", "/")
-            github_file_path = re.sub(r'^cloudman/', '', github_file_path)
-
-            logger.info(
-                f"Tentando baixar do GitHub: repo={repo}, branch={branch}, path={github_file_path}")
-            try:
-                download_file_from_github(
-                    repo, github_file_path, branch, local_tmp_path)
-                copied_files.add(local_file)
-            except Exception as e:
-                logger.error(f"Erro ao baixar o arquivo do GitHub: {e}")
-                sys.exit(1)
-        else:
-            logger.info(f"Arquivo já copiado anteriormente: {local_file}")
-
-        if local_file in content:
-            logger.info(
-                f"Substituindo '{local_file}' por '{local_tmp_path}' no arquivo main.tf")
-            content = content.replace(local_file, local_tmp_path)
-        else:
-            logger.warning(
-                f"'{local_file}' não encontrado no conteúdo do main.tf para substituição.")
-      logger.info("======================================================")
-      logger.info("--- CONTEÚDO FINAL DO main.tf ANTES DE SALVAR ---")
-      print(content) # Usamos print() para uma saída limpa, sem formatação do logger
-      logger.info("--- FIM DO CONTEÚDO FINAL ---")
-      logger.info("======================================================")
-
-    # Escrever o conteúdo final (com ambas as modificações) de volta ao arquivo
+    logger.info(f"Processando arquivo: {file_path}")
+    
     try:
-        with open(file_path, 'w') as file:
-            file.write(content)
-        logger.info(f"Arquivo main.tf atualizado e salvo em: {file_path}")
-    except Exception as e:
-        logger.error(f"Erro ao salvar o arquivo main.tf: {e}")
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+    except FileNotFoundError:
+        logger.error(f"Arquivo não encontrado: {file_path}")
         sys.exit(1)
 
-    logger.info("Modificação do main.tf concluída com sucesso.")
+    # PASSO 1: Injetar a configuração 'assume_role' (FUNCIONALIDADE PRESERVADA)
+    content = inject_assume_role(content, role_arn)
+
+    # PASSO 2: Mapear caminhos de arquivos (LÓGICA SIMPLIFICADA)
+    # Função auxiliar para ser usada com re.sub
+    def path_replacer(match):
+        # O caminho completo encontrado, ex: "C:/Cloudman/lambdas/my_func.zip"
+        full_dev_path = match.group(0)
+        
+        # Remove o prefixo para obter o caminho relativo, ex: "lambdas/my_func.zip"
+        relative_path = full_dev_path.replace(DEV_PATH_PREFIX, '')
+        
+        # Constrói o novo caminho absoluto dentro do ambiente do CodeBuild
+        new_path = os.path.join(ARTIFACTS_DIR, relative_path).replace("\\", "/")
+        
+        logger.info(f"Mapeando caminho: '{full_dev_path}' -> '{new_path}'")
+        return new_path
+
+    # Usa regex para encontrar e substituir todos os caminhos de desenvolvimento
+    # O padrão busca pelo prefixo seguido de qualquer caractere exceto aspas
+    dev_path_pattern = f'{re.escape(DEV_PATH_PREFIX)}[^"]*'
+    content, num_replacements = re.subn(dev_path_pattern, path_replacer, content)
+
+    if num_replacements > 0:
+        logger.info(f"{num_replacements} caminho(s) de desenvolvimento foram remapeados.")
+    else:
+        logger.info("Nenhum caminho de desenvolvimento encontrado para remapear.")
+    
+    # Salva o conteúdo modificado de volta no arquivo
+    try:
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write(content)
+        logger.info(f"Arquivo '{file_path}' atualizado e salvo com sucesso.")
+    except Exception as e:
+        logger.error(f"Erro ao salvar o arquivo '{file_path}': {e}")
+        sys.exit(1)
 
 
 def main():
-    state_name = os.getenv('STATE_NAME')
-    if not state_name:
-        logger.error("A variável de ambiente 'STATE_NAME' não está definida.")
-        sys.exit(1)
+    """
+    Ponto de entrada do script. Lê variáveis de ambiente e inicia o processo de modificação.
+    """
+    # O TerraBatch.py define o CWD, então podemos referenciar 'main.tf' diretamente.
+    main_tf_path = 'main.tf' 
 
-    # Nova Lógica: Ler a variável de ambiente para a role cross-account
+    # Lê a role ARN da variável de ambiente (se existir)
     role_arn_to_assume = os.getenv('DYNAMIC_ASSUMABLE_ROLE_ARN')
 
-    repo = "CloudManPro/CloudMan"
-    branch = "refs/heads/main"
-
-    terraform_dir = f'/tmp/states/{state_name}'
-    main_tf_path = os.path.join(terraform_dir, 'main.tf')
-
-    logger.info(
-        f"Verificando a existência do arquivo main.tf em: {main_tf_path}")
     if not os.path.exists(main_tf_path):
-        logger.error(
-            f"O arquivo main.tf não foi encontrado em: {main_tf_path}")
+        logger.error(f"O arquivo 'main.tf' não foi encontrado no diretório de trabalho atual: {os.getcwd()}")
         sys.exit(1)
 
-    copied_files = load_copied_files()
-
-    # Modificar o main.tf, passando o role_arn para ser injetado
-    modify_terraform_file(main_tf_path, repo, branch, copied_files, role_arn_to_assume)
-
-    save_copied_files(copied_files)
+    modify_terraform_file(main_tf_path, role_arn_to_assume)
 
     logger.info("modify_main_tf.py concluído com sucesso.")
 
 
 if __name__ == "__main__":
     main()
-
-
