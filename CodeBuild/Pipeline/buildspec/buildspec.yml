@@ -22,7 +22,7 @@ phases:
       - echo "export PATH_VAR=${path}" >> exported_env_vars.sh
       - cat exported_env_vars.sh
       - echo "Installing Python dependencies..."
-      - pip install boto3
+      - pip install boto3 hcl-lang
       - echo "Downloading TerraBatch.py, InitTerraform.py, and modify_main_tf.py from S3..."
       - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/TerraBatch.py ./TerraBatch.py
       - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/InitTerraform.py ./InitTerraform.py
@@ -84,3 +84,4 @@ phases:
 cache:
   paths:
     - '/tmp/.terraform.d/plugin-cache/**'
+
