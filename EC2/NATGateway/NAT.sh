@@ -1,4 +1,4 @@
-#!/bin/bash
+
 # Script robusto para configurar NAT em uma instância Amazon Linux AL2023 ---
 # Para o serviço de firewall padrão e o desabilita para não interferir
 sudo systemctl stop firewalld
