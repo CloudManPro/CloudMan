@@ -125,41 +125,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ec2hub.service
 echo "[EC2Hub] Sucesso: Serviço 'ec2hub.service' iniciado e habilitado." >> $LOG_FILE
 
-# --- ETAPA 8: Registrar a Instância no AWS Cloud Map (via IMDSv2) ---
-echo "[EC2Hub] Etapa 8/8: Registrando a instância no Cloud Map (IMDSv2)" >> $LOG_FILE
-TOKEN=$(curl -s -X PUT "http://169.24.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-if [ -z "$TOKEN" ]; then
-    echo "[EC2Hub] ERRO CRÍTICO: Falha ao obter token do IMDSv2. Não é possível obter metadados." >> $LOG_FILE
-    exit 1
-fi
 
-INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-INSTANCE_IPV4=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
-
-for i in {0..9}; do
-    VAR_NAME="AWS_SERVICE_DISCOVERY_SERVICE_TARGET_ARN_${i}"
-    SERVICE_ARN="${!VAR_NAME}"
-    
-    if [ -n "$SERVICE_ARN" ]; then
-        echo "[EC2Hub] Encontrado: ${VAR_NAME}. Registrando instância..." >> $LOG_FILE
-        n=0
-        until [ "$n" -ge 3 ]; do
-           ${APP_ENV_PATH}/bin/aws servicediscovery register-instance \
-             --service-id "$SERVICE_ARN" \
-             --instance-id "$INSTANCE_ID" \
-             --attributes "AWS_INSTANCE_IPV4=${INSTANCE_IPV4},AWS_INSTANCE_PORT=80" \
-             --region "$REGION" && break
-           n=$((n+1))
-           echo "[EC2Hub] Falha no registro para ${VAR_NAME}. Tentativa ${n}/3. Aguardando 15s..." >> $LOG_FILE
-           sleep 15
-        done
-
-        if [ "$n" -lt 3 ]; then
-            echo "[EC2Hub] Sucesso: Instância '${INSTANCE_ID}' registrada no serviço (ARN: ${SERVICE_ARN})." >> $LOG_FILE
-        else
-            echo "[EC2Hub] ERRO CRÍTICO: Falha ao registrar em ${VAR_NAME} após 3 tentativas." >> $LOG_FILE
-        fi
-    fi
-done
 
 echo "--- [EC2Hub] Script de provisionamento concluído com sucesso! ---" >> $LOG_FILE
