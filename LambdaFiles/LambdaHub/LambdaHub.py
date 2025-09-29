@@ -445,7 +445,7 @@ def lambda_handler(event, context):
         job_id = event['CodePipeline.job']['id']
         Message = "Job ID: " + job_id
         Information = "Event from CodePipeline"
-    elif EventSource == "aws:ec2":
+    elif EventSource == "AWS:EC2":
         Information = "Event from EC2"
         EventSource = "EC2"
         Message = event["message"]
