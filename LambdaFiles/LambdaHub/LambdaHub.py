@@ -395,6 +395,7 @@ def lambda_handler(event, context):
     elif 'source' in event:
         EventSource = event['source']
     Subject = "None"
+    Message = ""
     if EventSource == "aws:sns":
         SNSName = event['Records'][0]['Sns']['TopicArn'].split(":")[-1]
         EventSource += SNSName
@@ -416,8 +417,7 @@ def lambda_handler(event, context):
         print("Message", Message)
     elif EventSource == "aws:s3":
         s3 = boto3.client('s3')
-        EventSource += event['Records'][0]['s3']["bucket"]['arn'].split(
-            ":")[-1]
+        EventSource += event['Records'][0]['s3']["bucket"]['arn'].split(":")[-1]
         FileSize = str(event['Records'][0]['s3']['object']["size"])
         bucket_name = event['Records'][0]['s3']['bucket']["name"]
         file_path_encoded = event['Records'][0]['s3']['object']["key"]
@@ -437,8 +437,7 @@ def lambda_handler(event, context):
             bucket_name + ", with size of " + FileSize
     elif 'requestContext' in event and 'elb' in event['requestContext']:
         EventSource = "aws:elb"
-        ALBName = event['requestContext']['elb']['targetGroupArn'].split(
-            ":")[-1]
+        ALBName = event['requestContext']['elb']['targetGroupArn'].split(":")[-1]
         Message = "HTTP request from ALB"
         Information = "Request from ALB " + ALBName
     elif 'CodePipeline.job' in event:
@@ -446,6 +445,11 @@ def lambda_handler(event, context):
         job_id = event['CodePipeline.job']['id']
         Message = "Job ID: " + job_id
         Information = "Event from CodePipeline"
+    elif EventSource == "aws:ec2":
+        Information = "Event from EC2"
+        EventSource = "EC2"
+        Message = event["message"]
+        print("Message XXX", Message)
     elif EventSource == "API":
         Subject = "None"
         try:
@@ -454,9 +458,6 @@ def lambda_handler(event, context):
         except:
             Source = "API"
             Message = str(event)
-        if Source == "aws:ec2":
-            Information = "Event from EC2"
-            EventSource = "EC2"
         else:
             Information = "Event from API"
 
