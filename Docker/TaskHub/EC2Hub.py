@@ -65,8 +65,17 @@ enable_custom_health_check = os.getenv('CLOUDMAP_CUSTOM_HEALTHCHECK', 'false').l
 if Region:
     boto3.setup_default_session(region_name=Region)
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
+APP_LOG_PATH = "/var/log/ec2hub/EC2Hub.log"
+
+# Configura o logging para escrever no arquivo
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filename=APP_LOG_PATH,   # <-- Direciona a saída para o arquivo
+    filemode='a',            # <-- 'a' para adicionar (append), não sobrescrever
+    force=True               # <-- Garante que esta configuração se sobreponha a qualquer outra (ex: do uvicorn)
+)
+
 logger = logging.getLogger(__name__)
 
 if watchtower and CloudWatchName and StatusLogsEnabled:
