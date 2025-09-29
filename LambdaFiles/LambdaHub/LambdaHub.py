@@ -449,7 +449,6 @@ def lambda_handler(event, context):
         Information = "Event from EC2"
         EventSource = "EC2"
         Message = event["message"]
-        print("Message XXX", Message)
     elif EventSource == "API":
         Subject = "None"
         try:
