@@ -60,7 +60,7 @@ sudo setsebool -P httpd_can_network_connect 1
 
 # --- ETAPA 5: Configurar e Iniciar o Agente do CloudWatch ---
 echo "[EC2Hub] Etapa 5/8: Configurando o Agente do CloudWatch" >> $LOG_FILE
-sudo tee /opt/aws/amazon-cloudwatch-agent/etc/config.json >/dev/null <<EOF
+sudo tee /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json >/dev/null <<EOF
 {
   "agent": { "run_as_user": "root" },
   "logs": {
@@ -78,7 +78,7 @@ sudo tee /opt/aws/amazon-cloudwatch-agent/etc/config.json >/dev/null <<EOF
   }
 }
 EOF
-sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json -s
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
 sudo systemctl enable --now amazon-cloudwatch-agent
 
 # --- ETAPA 6: Fazer o Download da Aplicação a partir do S3 ---
