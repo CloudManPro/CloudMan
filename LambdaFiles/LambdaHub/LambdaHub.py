@@ -494,9 +494,9 @@ def lambda_handler(event, context):
         cont = item['Cont'] + 1
         execute_with_xray(TableName, Table.update_item, Key={'ID': "1"},
                           UpdateExpression='SET Cont = :val1', ExpressionAttributeValues={':val1': cont})
+        ttl_timestamp = int((datetime.datetime.now() + datetime.timedelta(days=1)).timestamp())
         ID = LambdaName + ":" + str(Agora)
-        put_item_response = execute_with_xray(TableName, Table.put_item, Item={
-                                              'ID': ID, "Message": NewMessage})
+        put_item_response = execute_with_xray(TableName, Table.put_item, Item={'ID': ID,"Message": NewMessage,'TTL': ttl_timestamp})
         print("DynamoDB response", put_item_response)
 
     # ************************* SNS Block **********************************
