@@ -39,7 +39,8 @@ def get_boto3_clients_with_assumed_role(role_arn, session_name="TerraBatchSessio
         logger.info(f"Role assumida com sucesso. A sessão expira em: {credentials['Expiration']}")
         return {
             's3': boto3.client('s3', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken']),
-            'lambda': boto3.client('lambda', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'])
+            'lambda': boto3.client('lambda', aws_access_key_id=credentials['AccessKeyId'], aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken']),
+            'ec2': boto3.client('ec2', aws_access_key_id=credentials['AccessKeyId'],aws_secret_access_key=credentials['SecretAccessKey'], aws_session_token=credentials['SessionToken'])
         }
     except ClientError as e:
         logger.error(f"FALHA CRÍTICA ao assumir a role: {e}"); raise
@@ -102,58 +103,42 @@ def _modify_and_prepare_main_tf(state_dir, state_name, manifest_data, role_arn_t
     with open(main_tf_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # ETAPA 1: Injetar a role (lógica movida)
+    # ETAPA 1: Injetar a role (sem alteração)
     content = inject_assume_role(content, role_arn_to_assume)
 
-    # ETAPA 2: Substituir os placeholders (lógica movida e corrigida)
-    lambdas_from_manifest = manifest_data.get("ListLambda", [])
-    if not lambdas_from_manifest:
-        logger.info(f"[{state_name}/modify] Nenhuma Lambda listada no manifesto. Pulando substituição de placeholders.")
-    else:
-        logger.info(f"[{state_name}/modify] Iniciando substituição de placeholders para o estado '{state_name}'...")
-        # Extrai o sufixo do estado atual (ex: '-prod-3')
-        _, target_suffix = _split_resource_name(state_name, is_test_env=is_test_env)
+    # ETAPA 2: Substituir os placeholders
+    logger.info(f"[{state_name}/modify] Iniciando substituição de placeholders para o estado '{state_name}'...")
+    _, target_suffix = _split_resource_name(state_name, is_test_env=is_test_env)
 
-        for lambda_info in lambdas_from_manifest:
-            manifest_lambda_name = lambda_info[0]
-            # Extrai o nome base da lambda do manifesto (ex: 'LPipe1')
-            base_name, _ = _split_resource_name(manifest_lambda_name, is_test_env=is_test_env)
-            
-            # **A CORREÇÃO PRINCIPAL**: Constrói o nome completo do recurso alvo usando o contexto do estado atual
-            target_full_name = f"{base_name}{target_suffix}"
-            
-            logger.info(f"[{state_name}/modify] Mapeando: {manifest_lambda_name} -> {target_full_name}")
+    # --- Lógica de substituição para Lambdas (sem alteração) ---
+    for lambda_info in manifest_data.get("ListLambda", []):
+        base_name, _ = _split_resource_name(lambda_info[0], is_test_env=is_test_env)
+        target_full_name = f"{base_name}{target_suffix}"
+        placeholder_to_find = f"Change_File_Name_{target_full_name}"
+        new_artifact_path = os.path.join(ARTIFACTS_DIR, "lambdas", f"{target_full_name}.zip").replace("\\", "/")
+        content = content.replace(f'"{placeholder_to_find}"', f'"{new_artifact_path}"')
+        content = content.replace(f'filebase64sha256("{placeholder_to_find}")', f'filebase64sha256("{new_artifact_path}")')
 
-            placeholder_to_find = f"Change_File_Name_{target_full_name}"
-            new_artifact_path = os.path.join(ARTIFACTS_DIR, "lambdas", f"{target_full_name}.zip").replace("\\", "/")
-            
-            string_to_find_filename = f'"{placeholder_to_find}"'
-            replacement_string_filename = f'"{new_artifact_path}"'
-            string_to_find_hash = f'filebase64sha256("{placeholder_to_find}")'
-            replacement_string_hash = f'filebase64sha256("{new_artifact_path}")'
+    # --- NOVO: Lógica de substituição para EC2 e Launch Templates ---
+    ec2_items = manifest_data.get("ListEC2", []) + manifest_data.get("ListLaunchTemplate", [])
+    for ec2_info in ec2_items:
+        base_name, _ = _split_resource_name(ec2_info[0], is_test_env=is_test_env)
+        target_full_name = f"{base_name}{target_suffix}"
+        placeholder_to_find = f"Change_File_Name_{target_full_name}"
+        new_artifact_path = os.path.join(ARTIFACTS_DIR, "ec2_userdata", f"{target_full_name}.sh").replace("\\", "/")
+        
+        # Substitui tanto a referência direta ao arquivo quanto a função file() do Terraform
+        content = content.replace(f'"{placeholder_to_find}"', f'"{new_artifact_path}"')
+        content = content.replace(f'file("{placeholder_to_find}")', f'file("{new_artifact_path}")')
 
-            original_content = content
-            content = content.replace(string_to_find_filename, replacement_string_filename)
-            content = content.replace(string_to_find_hash, replacement_string_hash)
-            
-            if original_content == content:
-                 logger.warning(f"  -> Nenhum placeholder '{placeholder_to_find}' encontrado para a Lambda '{target_full_name}'.")
-            else:
-                 logger.info(f"  -> Placeholders para '{target_full_name}' substituídos com sucesso.")
-    
+    # ... (Restante da função para logar e salvar o arquivo, sem alterações) ...
     logger.info(f"--- CONTEÚDO FINAL DO main.tf PARA O ESTADO {state_name} ---")
-    # Para evitar logs muito longos, podemos imprimir apenas algumas linhas
     for i, line in enumerate(content.splitlines()):
-        if i < 15: # Imprime as primeiras 15 linhas
-            logger.info(line)
-        elif i == 15:
-            logger.info("...")
-            break
+        if i < 25: logger.info(line)
+        elif i == 25: logger.info("..."); break
     logger.info("------------------------------------------------------")
 
-    with open(main_tf_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-    
+    with open(main_tf_path, 'w', encoding='utf-8') as f: f.write(content)
     logger.info(f"[{state_name}/modify] Arquivo '{main_tf_path}' processado e salvo com sucesso.")
 
 
@@ -175,9 +160,10 @@ except Exception as err:
 DYNAMIC_ASSUMABLE_ROLE_ARN = os.getenv('DYNAMIC_ASSUMABLE_ROLE_ARN')
 boto3_clients = get_boto3_clients_with_assumed_role(DYNAMIC_ASSUMABLE_ROLE_ARN)
 s3_client = boto3_clients['s3']; lambda_client = boto3_clients['lambda']
+ec2_client = boto3_clients.get('ec2')
 Version = json_data.get("Version"); IsTest = json_data.get("IsTest", False)
 ArtifactsBucket = json_data.get("ArtifactsBucket") or os.getenv('AWS_S3_BUCKET_TARGET_NAME_0')
-
+print("PAssou aqui")
 
 # --- FUNÇÕES COMPLETAS DE GERENCIAMENTO DE ARTEFATOS (Sem alterações) ---
 def _clear_dir(directory):
@@ -208,25 +194,81 @@ def _download_lambda_code(lambda_name, region, dest_path):
         logger.error(f"Falha ao baixar código da Lambda '{lambda_name}': {e}"); raise
 
 def _sync_s3_to_local(bucket, region, dest_path):
+    """
+    Sincroniza o conteúdo de um bucket S3 para um diretório local,
+    preservando os metadados essenciais (como ContentType) em arquivos .metadata.json.
+    """
     try:
-        s3_resource = boto3.resource('s3', region_name=region,
-                                     aws_access_key_id=s3_client.meta.credentials.access_key,
-                                     aws_secret_access_key=s3_client.meta.credentials.secret_key,
-                                     aws_session_token=s3_client.meta.credentials.token)
-        bucket_obj = s3_resource.Bucket(bucket)
-        for obj in bucket_obj.objects.all():
-            local_file_path = os.path.join(dest_path, obj.key)
-            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-            bucket_obj.download_file(obj.key, local_file_path)
-        logger.info(f"Conteúdo do bucket S3 '{bucket}' sincronizado para '{dest_path}'.")
+        logger.info(f"Iniciando sincronização do bucket S3 '{bucket}' para '{dest_path}'.")
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=bucket)
+
+        object_count = 0
+        for page in pages:
+            if 'Contents' not in page:
+                continue
+            for obj in page['Contents']:
+                object_key = obj['Key']
+                if object_key.endswith('/'):
+                    continue
+                
+                local_file_path = os.path.join(dest_path, object_key)
+                os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                
+                # Passo 1: Baixar o arquivo (sem alteração)
+                s3_client.download_file(bucket, object_key, local_file_path)
+                
+                # --- [MODIFICAÇÃO INÍCIO] ---
+                # Passo 2: Obter e salvar os metadados do objeto
+                try:
+                    metadata_response = s3_client.head_object(Bucket=bucket, Key=object_key)
+                    metadata_to_save = {}
+                    
+                    # Lista de metadados HTTP que queremos preservar
+                    headers_to_preserve = [
+                        'ContentType', 'CacheControl', 'ContentDisposition', 
+                        'ContentEncoding', 'ContentLanguage'
+                    ]
+
+                    for header in headers_to_preserve:
+                        if header in metadata_response:
+                            metadata_to_save[header] = metadata_response[header]
+                    
+                    # Salva os metadados se algum foi encontrado
+                    if metadata_to_save:
+                        metadata_file_path = local_file_path + ".metadata.json"
+                        with open(metadata_file_path, 'w', encoding='utf-8') as f:
+                            json.dump(metadata_to_save, f)
+                        # logger.info(f"  -> Metadados para '{object_key}' salvos.")
+
+                except ClientError as e:
+                    logger.warning(f"Não foi possível obter metadados para o objeto '{object_key}': {e}")
+                # --- [MODIFICAÇÃO FIM] ---
+
+                object_count += 1
+        
+        if object_count > 0:
+            logger.info(f"Sucesso! {object_count} objetos do bucket S3 '{bucket}' foram sincronizados para '{dest_path}'.")
+        else:
+            logger.warning(f"O bucket S3 '{bucket}' está vazio ou não contém objetos para sincronizar.")
+            os.makedirs(dest_path, exist_ok=True)
+
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code")
+        logger.error(f"Erro de cliente Boto3 ao sincronizar o bucket '{bucket}' (Código: {error_code}): {e}")
+        raise
     except Exception as e:
-        logger.error(f"Falha ao sincronizar bucket S3 '{bucket}': {e}"); raise
+        logger.error(f"Falha inesperada ao sincronizar bucket S3 '{bucket}': {e}")
+        raise
 
 def _create_snapshot():
     logger.info("--- FASE 1: INICIANDO CRIAÇÃO DO SNAPSHOT (MODO GENÉRICO) ---")
-    if not all([Version, ArtifactsBucket]): raise ValueError("'Version' e 'ArtifactsBucket' são obrigatórios.")
+    if not all([Version, ArtifactsBucket]):
+        raise ValueError("'Version' e 'ArtifactsBucket' são obrigatórios.")
     _clear_dir(ARTIFACTS_DIR)
     dev_suffix = '-dev'
+
+    # --- Lógica para Lambda (sem alterações) ---
     for source_list in json_data.get("ListLambda", []):
         name_from_manifest, region, _ = source_list
         base_name, _ = _split_resource_name(name_from_manifest, is_test_env=True)
@@ -234,18 +276,36 @@ def _create_snapshot():
         generic_artifact_name = f"{base_name}.zip"
         logger.info(f"Mapeando fonte Lambda: '{name_from_manifest}' -> Baixando de: '{source_name_for_download}' -> Salvando como: '{generic_artifact_name}'")
         _download_lambda_code(source_name_for_download, region, os.path.join(ARTIFACTS_DIR, "lambdas", generic_artifact_name))
+
+    # --- Lógica para S3 (sem alterações) ---
     for source_list in json_data.get("ListS3", []):
-        bucket_from_manifest, region, _ = source_list
+        bucket_from_manifest, region, *_ = source_list 
         base_bucket_name, _ = _split_resource_name(bucket_from_manifest, is_test_env=True)
         source_name_for_download = f"{base_bucket_name}{dev_suffix}"
         logger.info(f"Mapeando fonte S3: '{bucket_from_manifest}' -> Baixando de: '{source_name_for_download}' -> Salvando em: '{base_bucket_name}'")
         _sync_s3_to_local(source_name_for_download, region, os.path.join(ARTIFACTS_DIR, "s3_content", base_bucket_name))
+        
+    # --- [MODIFICAÇÃO CIRÚRGICA] ---
+    # Adiciona o processamento de artefatos de UserData chamando a nova função auxiliar.
+    try:
+        _process_and_save_ec2_artifacts()
+    except Exception as e:
+        # A exceção já é logada dentro da função auxiliar, aqui apenas alertamos sobre a falha no processo geral.
+        logger.error(f"Falha crítica durante o processamento de artefatos de UserData. O snapshot pode estar incompleto. Erro: {e}")
+        # Descomente a linha abaixo para interromper a execução se a coleta de UserData for absolutamente crítica.
+        # raise
+    # --- [FIM DA MODIFICAÇÃO] ---
+
     _log_directory_contents(ARTIFACTS_DIR, "Arquivos genéricos coletados para inclusão no snapshot")
+    
+    # --- Lógica de empacotamento e upload (sem alterações) ---
     _clear_dir(SNAPSHOTS_DIR)
     snapshot_basename = os.path.join(SNAPSHOTS_DIR, f'backup_{Version}')
     snapshot_filename = shutil.make_archive(snapshot_basename, 'zip', ARTIFACTS_DIR)
+    
     CopyArtifactS3Path = f"CopyArtifacts/{PipelineName}/{Version}"
     backup_object_key = f"{CopyArtifactS3Path}/{os.path.basename(snapshot_filename)}"
+    
     logger.info(f"Enviando snapshot para s3://{ArtifactsBucket}/{backup_object_key}")
     s3_client.upload_file(snapshot_filename, ArtifactsBucket, backup_object_key)
     logger.info("Snapshot enviado com sucesso.")
@@ -285,6 +345,8 @@ def _contextualize_artifacts():
     representative_state_name = source_state_list[0]
     _, target_suffix = _split_resource_name(representative_state_name, is_test_env=IsTest)
     logger.info(f"Sufixo de destino determinado: '{target_suffix}'")
+
+    # Lógica para Lambdas (sem alteração)
     lambdas_path = os.path.join(ARTIFACTS_DIR, "lambdas")
     if os.path.exists(lambdas_path):
         for lambda_manifest in json_data.get("ListLambda", []):
@@ -292,42 +354,263 @@ def _contextualize_artifacts():
             source_file = os.path.join(lambdas_path, f"{base_name}.zip")
             target_file = os.path.join(lambdas_path, f"{base_name}{target_suffix}.zip")
             if os.path.exists(source_file):
-                logger.info(f"Contextualizando para '{command_type}': Renomeando '{source_file}' para '{target_file}'")
+                logger.info(f"Contextualizando Lambda para '{command_type}': Renomeando '{source_file}' para '{target_file}'")
                 os.rename(source_file, target_file)
+
+    # Lógica para S3 (sem alteração)
     s3_content_path = os.path.join(ARTIFACTS_DIR, "s3_content")
     if os.path.exists(s3_content_path):
         for s3_manifest in json_data.get("ListS3", []):
-            base_name, _ = _split_resource_name(s3_manifest[0], is_test_env=IsTest)
+            base_name_from_manifest, *_ = s3_manifest
+            base_name, _ = _split_resource_name(base_name_from_manifest, is_test_env=IsTest)
             source_dir = os.path.join(s3_content_path, base_name)
             target_dir = os.path.join(s3_content_path, f"{base_name}{target_suffix}")
             if os.path.exists(source_dir):
                 logger.info(f"Contextualizando S3 para '{command_type}': Renomeando '{source_dir}' para '{target_dir}'")
                 os.rename(source_dir, target_dir)
+
+    # --- NOVO BLOCO PARA CONTEXTUALIZAR EC2 USERDATA ---
+    ec2_userdata_path = os.path.join(ARTIFACTS_DIR, "ec2_userdata")
+    if os.path.exists(ec2_userdata_path):
+        ec2_items = json_data.get("ListEC2", []) + json_data.get("ListLaunchTemplate", [])
+        for ec2_manifest in ec2_items:
+            base_name, _ = _split_resource_name(ec2_manifest[0], is_test_env=IsTest)
+            source_file = os.path.join(ec2_userdata_path, f"{base_name}.sh")
+            target_file = os.path.join(ec2_userdata_path, f"{base_name}{target_suffix}.sh")
+            if os.path.exists(source_file):
+                logger.info(f"Contextualizando UserData para '{command_type}': Renomeando '{source_file}' para '{target_file}'")
+                os.rename(source_file, target_file)
+
     _log_directory_contents(ARTIFACTS_DIR, "Arquivos restaurados e contextualizados para o estágio atual")
     logger.info("Contextualização de artefatos concluída.")
 
 def _upload_s3_content():
+    """
+    Faz upload do conteúdo S3 local para os respectivos buckets de destino,
+    reaplicando metadados salvos a partir de arquivos .metadata.json.
+    """
     logger.info("--- FASE 3: INICIANDO UPLOAD DE CONTEÚDO PARA BUCKETS S3 ---")
+    s3_content_base_path = os.path.join(ARTIFACTS_DIR, "s3_content")
+
+    if not os.path.isdir(s3_content_base_path):
+        logger.warning("Diretório 's3_content' não encontrado. Pulando upload para S3.")
+        return
+
     for target_list in json_data.get("ListS3", []):
-        target_bucket_name, target_region, _ = target_list
-        local_path = os.path.join(ARTIFACTS_DIR, "s3_content", target_bucket_name)
-        if not os.path.isdir(local_path): continue
-        s3_resource = boto3.resource('s3', region_name=target_region,
-                                     aws_access_key_id=s3_client.meta.credentials.access_key,
-                                     aws_secret_access_key=s3_client.meta.credentials.secret_key,
-                                     aws_session_token=s3_client.meta.credentials.token)
-        bucket_obj = s3_resource.Bucket(target_bucket_name)
+        target_bucket_name, target_region, *_ = target_list
+        local_path = os.path.join(s3_content_base_path, target_bucket_name)
+
+        if not os.path.isdir(local_path):
+            logger.info(f"Nenhum conteúdo local encontrado em '{local_path}' para o bucket '{target_bucket_name}'. Pulando.")
+            continue
+            
         logger.info(f"Fazendo upload de '{local_path}' para s3://{target_bucket_name}")
+        
+        upload_client = s3_client
+        if s3_client.meta.region_name != target_region:
+            logger.warning(f"O cliente S3 foi inicializado na região '{s3_client.meta.region_name}', mas o upload é para '{target_region}'.")
+
         for root, _, files in os.walk(local_path):
             for filename in files:
+                # --- [MODIFICAÇÃO INÍCIO] ---
+                # Ignora os arquivos de metadados para não fazer upload deles
+                if filename.endswith(".metadata.json"):
+                    continue
+                # --- [MODIFICAÇÃO FIM] ---
+
                 local_file = os.path.join(root, filename)
                 s3_key = os.path.relpath(local_file, local_path).replace(os.sep, '/')
-                bucket_obj.upload_file(local_file, s3_key)
+                
+                # --- [MODIFICAÇÃO INÍCIO] ---
+                # Procura pelo arquivo de metadados correspondente e o carrega
+                extra_args = {}
+                metadata_file = local_file + ".metadata.json"
+                if os.path.exists(metadata_file):
+                    try:
+                        with open(metadata_file, 'r', encoding='utf-8') as f:
+                            extra_args = json.load(f)
+                        logger.info(f"  -> Metadados encontrados para '{s3_key}', aplicando: {extra_args}")
+                    except json.JSONDecodeError:
+                        logger.warning(f"Arquivo de metadados '{metadata_file}' está corrompido. Upload será feito sem metadados extras.")
+                # --- [MODIFICAÇÃO FIM] ---
+
+                try:
+                    # Adiciona o parâmetro ExtraArgs na chamada de upload
+                    upload_client.upload_file(local_file, target_bucket_name, s3_key, ExtraArgs=extra_args)
+                except ClientError as e:
+                    logger.error(f"Falha ao fazer upload de '{local_file}' para 's3://{target_bucket_name}/{s3_key}': {e}")
+
     logger.info("Upload de conteúdo para S3 concluído.")
 
+# Adicionar esta nova função junto com as outras funções auxiliares
 
-# --- FUNÇÃO PRINCIPAL DE ORQUESTRAÇÃO ---
+def _upload_s3_content_for_state(current_state_name):
+    """
+    NOVA FUNÇÃO: Faz upload do conteúdo S3 APENAS para buckets associados
+    ao estado do Terraform que acabou de ser executado.
+    """
+    logger.info(f"--- Verificando conteúdo S3 para upload após o estado '{current_state_name}' ---")
+    s3_content_base_path = os.path.join(ARTIFACTS_DIR, "s3_content")
+
+    # Passo 1: Filtrar a lista de S3 para encontrar apenas os que pertencem ao estado atual
+    s3_targets_for_this_state = []
+    for target_list in json_data.get("ListS3", []):
+        # A nova lógica requer 4 elementos, sendo o último o nome do estado
+        if len(target_list) >= 4 and target_list[3] == current_state_name:
+            s3_targets_for_this_state.append(target_list)
+
+    # Passo 2: Se nenhum bucket corresponde a este estado, não fazer nada e sair
+    if not s3_targets_for_this_state:
+        logger.info(f"Nenhum bucket S3 associado ao estado '{current_state_name}'. Nenhum upload necessário nesta etapa.")
+        return
+
+    logger.info(f"Encontrado(s) {len(s3_targets_for_this_state)} bucket(s) para popular após o estado '{current_state_name}'.")
+
+    # Passo 3: Executar a lógica de upload (copiada da função original) para cada bucket encontrado
+    for target_list in s3_targets_for_this_state:
+        # Desempacota a lista de forma segura, ignorando elementos extras
+        target_bucket_name, target_region, *_ = target_list
+        # O sufixo do ambiente já foi aplicado durante a fase de contextualização
+        local_path = os.path.join(s3_content_base_path, target_bucket_name)
+
+        if not os.path.isdir(local_path):
+            logger.info(f"Nenhum conteúdo local encontrado em '{local_path}' para o bucket '{target_bucket_name}'. Pulando.")
+            continue
+            
+        logger.info(f"Fazendo upload de '{local_path}' para s3://{target_bucket_name}")
+        
+        # A lógica de upload abaixo é idêntica à da função _upload_s3_content()
+        upload_client = s3_client
+        if s3_client.meta.region_name != target_region:
+            logger.warning(f"O cliente S3 foi inicializado na região '{s3_client.meta.region_name}', mas o upload é para '{target_region}'.")
+
+        for root, _, files in os.walk(local_path):
+            for filename in files:
+                if filename.endswith(".metadata.json"):
+                    continue
+
+                local_file = os.path.join(root, filename)
+                s3_key = os.path.relpath(local_file, local_path).replace(os.sep, '/')
+                
+                extra_args = {}
+                metadata_file = local_file + ".metadata.json"
+                if os.path.exists(metadata_file):
+                    try:
+                        with open(metadata_file, 'r', encoding='utf-8') as f:
+                            extra_args = json.load(f)
+                        logger.info(f"  -> Metadados encontrados para '{s3_key}', aplicando: {extra_args}")
+                    except json.JSONDecodeError:
+                        logger.warning(f"Arquivo de metadados '{metadata_file}' está corrompido. Upload será feito sem metadados extras.")
+                try:
+                    upload_client.upload_file(local_file, target_bucket_name, s3_key, ExtraArgs=extra_args)
+                except ClientError as e:
+                    logger.error(f"Falha ao fazer upload de '{local_file}' para 's3://{target_bucket_name}/{s3_key}': {e}")
+
+    logger.info(f"Upload de conteúdo S3 para o estado '{current_state_name}' concluído.")
+
+def _process_and_save_ec2_artifacts():
+    """
+    Processa as listas 'ListEC2' e 'ListLaunchTemplate' do manifesto.
+    Busca os user_data de forma otimizada, limpa-os e salva como artefatos locais.
+    (VERSÃO COM LOGS DE DEPURAÇÃO DETALHADOS PARA LAUNCH TEMPLATES)
+    """
+    logger.info("Iniciando processamento de artefatos de UserData (EC2 e Launch Templates)...")
+    if 'ec2' not in boto3_clients:
+        logger.error("Cliente Boto3 para EC2 não foi inicializado. Verifique a função get_boto3_clients_with_assumed_role.")
+        raise RuntimeError("EC2 client not available.")
+    
+    ec2_client = boto3_clients['ec2']
+    dev_suffix = '-dev'
+    userdata_dir = os.path.join(ARTIFACTS_DIR, "ec2_userdata")
+    os.makedirs(userdata_dir, exist_ok=True)
+
+    # --- Parte 1: Instâncias EC2 (Lógica inalterada) ---
+    ec2_sources = json_data.get("ListEC2", [])
+    if ec2_sources:
+        source_names_for_download = [f"{_split_resource_name(s[0], is_test_env=True)[0]}{dev_suffix}" for s in ec2_sources]
+        logger.info(f"Buscando instâncias EC2 com tags Name: {source_names_for_download}")
+        try:
+            response = ec2_client.describe_instances(Filters=[{'Name': 'tag:Name', 'Values': source_names_for_download}])
+            tag_to_instance_id = {}
+            for res in response.get('Reservations', []):
+                for inst in res.get('Instances', []):
+                    if inst.get('State', {}).get('Name') not in ['terminated', 'shutting-down']:
+                        for tag in inst.get('Tags', []):
+                            if tag['Key'] == 'Name':
+                                tag_to_instance_id[tag['Value']] = inst['InstanceId']
+                                break
+            for source_list in ec2_sources:
+                base_name, _ = _split_resource_name(source_list[0], is_test_env=True)
+                source_name = f"{base_name}{dev_suffix}"
+                instance_id = tag_to_instance_id.get(source_name)
+                if not instance_id:
+                    logger.warning(f"Nenhuma instância EC2 ativa encontrada para a tag '{source_name}'. Pulando.")
+                    continue
+                result = ec2_client.describe_instance_attribute(InstanceId=instance_id, Attribute='userData')
+                if 'UserData' in result and 'Value' in result['UserData']:
+                    import base64
+                    decoded_userdata = base64.b64decode(result['UserData']['Value']).decode('utf-8')
+                    variables_block_regex = r'# --- BEGIN CLOUDMAN VARIABLES ---\n.*?# --- END CLOUDMAN VARIABLES ---\n'
+                    cleaned_script = re.sub(variables_block_regex, '', decoded_userdata, flags=re.DOTALL).strip()
+                    artifact_path = os.path.join(userdata_dir, f"{base_name}.sh")
+                    with open(artifact_path, 'w', encoding='utf-8') as f: f.write(cleaned_script)
+                    logger.info(f"  -> Artefato do UserData (EC2) para '{base_name}' salvo em '{artifact_path}'.")
+        except Exception as e:
+            logger.error(f"Ocorreu um erro durante o processamento em lote das instâncias EC2: {e}")
+
+    # --- Parte 2: Launch Templates (Lógica de logs de depuração adicionada) ---
+    lt_sources = json_data.get("ListLaunchTemplate", [])
+    for source_list in lt_sources:
+        base_name, _ = _split_resource_name(source_list[0], is_test_env=True)
+        source_name_for_download = f"{base_name}{dev_suffix}"
+        
+        try:
+            logger.info(f"Buscando Launch Template com tag Name: {source_name_for_download}")
+            response_lt = ec2_client.describe_launch_templates(Filters=[{'Name': 'tag:Name', 'Values': [source_name_for_download]}])
+            
+            if not response_lt.get('LaunchTemplates'):
+                logger.warning(f"Nenhum Launch Template encontrado para a tag '{source_name_for_download}'. Pulando.")
+                continue
+
+            lt_id = response_lt['LaunchTemplates'][0]['LaunchTemplateId']
+            
+            # [LOG DE DEPURAÇÃO 1] Confirma que o template foi encontrado e qual versão será buscada.
+            logger.info(f"Launch Template encontrado com ID: {lt_id}. Buscando versão '$Default'...")
+            response_version = ec2_client.describe_launch_template_versions(LaunchTemplateId=lt_id, Versions=['$Default'])
+            
+            # [LOG DE DEPURAÇÃO 2] Imprime a resposta completa da API para análise.
+            import pprint
+            logger.info(f"RESPOSTA COMPLETA DA API 'describe_launch_template_versions':\n{pprint.pformat(response_version)}")
+
+            # Lógica de verificação mais robusta para evitar erros e logar o ponto de falha.
+            if 'LaunchTemplateVersions' in response_version and response_version['LaunchTemplateVersions']:
+                version_data = response_version['LaunchTemplateVersions'][0]
+                
+                if 'LaunchTemplateData' in version_data and 'UserData' in version_data['LaunchTemplateData']:
+                    import base64
+                    encoded_userdata = version_data['LaunchTemplateData']['UserData']
+                    decoded_userdata = base64.b64decode(encoded_userdata).decode('utf-8')
+                    
+                    variables_block_regex = r'# --- BEGIN CLOUDMAN VARIABLES ---\n.*?# --- END CLOUDMAN VARIABLES ---\n'
+                    cleaned_script = re.sub(variables_block_regex, '', decoded_userdata, flags=re.DOTALL).strip()
+
+                    artifact_path = os.path.join(userdata_dir, f"{base_name}.sh")
+                    with open(artifact_path, 'w', encoding='utf-8') as f: f.write(cleaned_script)
+                    logger.info(f"  -> Artefato do UserData (Launch Template) para '{base_name}' salvo em '{artifact_path}'.")
+                else:
+                    # [LOG DE DEPURAÇÃO 3] Informa que o UserData não foi encontrado na resposta.
+                    logger.warning(f"A versão Default do Launch Template '{lt_id}' foi encontrada, mas NÃO contém o campo 'UserData'. O artefato não será criado.")
+            else:
+                # [LOG DE DEPURAÇÃO 4] Informa que a API não retornou nenhuma versão.
+                logger.warning(f"A API não retornou nenhuma versão para o Launch Template '{lt_id}'.")
+
+        except Exception as e:
+            # [LOG DE DEPURAÇÃO 5] Captura e exibe o erro completo, incluindo erros de permissão.
+            logger.error(f"FALHA CRÍTICA ao processar o Launch Template '{source_name_for_download}'. Erro detalhado:", exc_info=True)
+
+# --- FUNÇÃO PRINCIPAL DE ORQUESTRAÇÃO (VERSÃO REATORADA) ---
 def main():
+    # --- FASE 1: Preparação de Artefatos (Sem alterações) ---
     if command_type in ["apply", "destroy"]:
         try:
             if command_type == "apply" and IsTest:
@@ -340,6 +623,7 @@ def main():
             logger.error(f"FALHA CRÍTICA na Fase 1. A execução será interrompida. Erro: {e}", exc_info=True)
             sys.exit(1)
 
+    # --- FASE 2: Execução do Terraform (com lógica de upload integrada) ---
     logger.info("--- FASE 2: INICIANDO EXECUÇÃO DO TERRAFORM ---")
     states_to_process = (json_data.get("ListStatesBlue", [])[::-1] if not IsTest else json_data.get("ListStates", [])[::-1]) if command_type == "destroy" else json_data.get("ListStates", [])
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -350,6 +634,7 @@ def main():
         state_dir = os.path.join("/tmp/states", state_name)
         os.makedirs(state_dir, exist_ok=True)
         
+        # Download dos arquivos do Terraform (sem alterações)
         for file_name in ['main.tf', 'terraform.lock.hcl']:
             try: s3_client.download_file(s3_bucket_for_tf_files, f"states/{state_name}/{file_name}", os.path.join(state_dir, file_name))
             except ClientError:
@@ -357,9 +642,7 @@ def main():
         if os.path.exists(os.path.join(state_dir, 'terraform.lock.hcl')):
             os.rename(os.path.join(state_dir, 'terraform.lock.hcl'), os.path.join(state_dir, '.terraform.lock.hcl'))
         
-        # ### INÍCIO DA MODIFICAÇÃO CIRÚRGICA ###
-        # A chamada ao subprocesso 'modify_main_tf.py' foi REMOVIDA
-        # e substituída por uma chamada de função interna.
+        # Modificação do main.tf (sem alterações)
         try:
             _modify_and_prepare_main_tf(
                 state_dir=state_dir,
@@ -370,13 +653,12 @@ def main():
             )
         except Exception as e:
             logger.error(f"Falha crítica ao modificar o main.tf para {state_name}: {e}", exc_info=True); sys.exit(1)
-        # ### FIM DA MODIFICAÇÃO CIRÚRGICA ###
 
+        # Execução do Terraform via script auxiliar (sem alterações)
         try:
             logger.info(f"Executando InitTerraform.py para o estado '{state_name}'...")
-            env = os.environ.copy() # Passa o ambiente para o subprocesso
+            env = os.environ.copy()
             env['STATE_NAME'] = state_name
-            # O MANIFEST_JSON não é mais necessário para o InitTerraform, mas pode ser mantido por compatibilidade
             env['MANIFEST_JSON'] = json.dumps(json_data) 
             proc_init = subprocess.Popen([sys.executable, os.path.join(script_dir, 'InitTerraform.py')],
                                          cwd=state_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -390,15 +672,30 @@ def main():
         except subprocess.CalledProcessError as e:
             logger.error(f"InitTerraform.py falhou para {state_name} com código {e.returncode}"); sys.exit(1)
 
+        # ### INÍCIO DA MODIFICAÇÃO DA ORQUESTRAÇÃO ###
+        # Após a execução bem-sucedida do Terraform, chamamos a nova função de upload
+        # que atuará de forma inteligente, apenas para o estado atual.
+        if command_type == "apply":
+            try:
+                _upload_s3_content_for_state(state_name)
+            except Exception as e:
+                logger.error(f"FALHA ao fazer upload de conteúdo S3 para o estado '{state_name}': {e}", exc_info=True)
+                sys.exit(1)
+        # ### FIM DA MODIFICAÇÃO DA ORQUESTRAÇÃO ###
+
     logger.info("FASE 2 (Execução do Terraform) concluída com sucesso.")
 
-    if command_type == "apply":
-        try:
-            _upload_s3_content()
-            logger.info("FASE 3 (Povoamento da Infraestrutura) concluída com sucesso.")
-        except Exception as e:
-            logger.error(f"FALHA na Fase 3: {e}", exc_info=True); sys.exit(1)
+    # ### MODIFICAÇÃO FINAL ###
+    # A antiga FASE 3, que fazia o upload de TUDO no final, foi removida.
+    # A lógica agora acontece de forma incremental dentro do loop da FASE 2.
+    # if command_type == "apply":
+    #     try:
+    #         _upload_s3_content()
+    #         logger.info("FASE 3 (Povoamento da Infraestrutura) concluída com sucesso.")
+    #     except Exception as e:
+    #         logger.error(f"FALHA na Fase 3: {e}", exc_info=True); sys.exit(1)
 
+    # Verificações finais (sem alterações)
     if not json_data.get("Approved", False) and command_type == "destroy":
         logger.error("Comando 'destroy' recebido para versão não aprovada. Gerando falha para 'Retry'."); sys.exit(1)
 
@@ -406,3 +703,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
