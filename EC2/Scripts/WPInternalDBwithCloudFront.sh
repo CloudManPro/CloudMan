@@ -7,9 +7,10 @@ set -e -o pipefail
 LOG_FILE="/var/log/wordpress-install-final-definitive.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
 
-echo "--- Início do script de configuração DEFINITIVO v10 (com fix de usuário PHP-FPM) ---"
+echo "--- Início do script de configuração DEFINITIVO v11 (com otimização de memória PHP) ---"
 
 # --- 0. CRIAÇÃO DE SWAP ---
+# [ ... seção inalterada ... ]
 echo "Criando arquivo de SWAP de 1GB para estabilidade..."
 fallocate -l 1G /swapfile
 chmod 600 /swapfile
@@ -18,6 +19,7 @@ swapon /swapfile
 echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
 
 # --- 1. Atualização do Sistema e Instalação de Pacotes ---
+# [ ... seção inalterada ... ]
 echo "Atualizando pacotes do sistema..."
 yum update -y
 echo "Instalando Nginx, MariaDB, PHP-FPM e utilitários..."
@@ -37,12 +39,14 @@ innodb_flush_log_at_trx_commit = 2
 innodb_flush_method = O_DIRECT
 EOF
 
-# --- 3. (NOVO) Alinhamento de Usuário Nginx e PHP-FPM ---
+# --- 3. Alinhamento de Usuário Nginx e PHP-FPM ---
+# [ ... seção inalterada ... ]
 echo "Alinhando usuário do PHP-FPM com o usuário do Nginx..."
 sed -i 's/user = apache/user = nginx/g' /etc/php-fpm.d/www.conf
 sed -i 's/group = apache/group = nginx/g' /etc/php-fpm.d/www.conf
 
 # --- 4. Gerenciamento de Serviços ---
+# [ ... seção inalterada ... ]
 echo "Iniciando e habilitando os serviços..."
 systemctl start nginx; systemctl enable nginx
 systemctl start php-fpm; systemctl enable php-fpm
@@ -69,8 +73,8 @@ tar -xzf latest.tar.gz
 mv wordpress/* .
 rm -rf wordpress latest.tar.gz
 
-# --- 7. Configuração do wp-config.php ---
-# [ ... seção inalterada ... ]
+# --- 7. Configuração do wp-config.php (COM OTIMIZAÇÃO DE MEMÓRIA) ---
+echo "Criando e configurando o arquivo wp-config.php..."
 cp wp-config-sample.php wp-config.php
 sed -i "s/database_name_here/${DB_NAME}/g" wp-config.php
 sed -i "s/username_here/${DB_USER}/g" wp-config.php
@@ -78,15 +82,23 @@ sed -i "s#password_here#${DB_PASSWORD}#g" wp-config.php
 SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 STRING='put your unique phrase here'
 printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
+
+echo "Adicionando configurações avançadas no wp-config.php..."
 PHP_CONFIG_INSERT="\\
+// Proxy Reverso (CloudFront)\\
 if (isset(\\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO']) && \\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https') {\\\$_SERVER['HTTPS'] = 'on'; }\\
 define('WP_HOME', 'https://cfwp.cloudman.pro');\\
 define('WP_SITEURL', 'https://cfwp.cloudman.pro');\\
 define('FS_METHOD', 'direct');\\
+\\
+// *** NOVO: Otimização de Limite de Memória do PHP para WordPress *** \\
+define('WP_MEMORY_LIMIT', '256M');\\
+define('WP_MAX_MEMORY_LIMIT', '512M');\\
 "
 sed -i "/<?php/a ${PHP_CONFIG_INSERT}" wp-config.php
 
 # --- 8. AJUSTE DE PERMISSÕES PROATIVO E SEGURO ---
+# [ ... seção inalterada ... ]
 echo "Ajustando permissões..."
 sed -i 's/^open_basedir =/;\0/' /etc/php.ini
 mkdir -p /var/www/html/wp-content/uploads /var/www/html/wp-content/languages
@@ -97,6 +109,7 @@ find /var/www/html/wp-content -type d -exec chmod g+w {} \;
 chcon -t httpd_sys_rw_content_t -R /var/www/html/wp-content
 
 # --- 9. Instalação do WP-CLI ---
+# [ ... seção inalterada ... ]
 echo "Instalando WP-CLI..."
 wget https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
 chmod +x wp-cli.phar
@@ -125,6 +138,7 @@ server {
 EOF
 
 # --- 11. Finalização ---
+# [ ... seção inalterada ... ]
 echo "Reiniciando Nginx e PHP-FPM para aplicar todas as configurações..."
 systemctl restart nginx
 systemctl restart php-fpm
