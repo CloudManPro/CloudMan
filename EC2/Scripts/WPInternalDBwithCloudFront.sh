@@ -7,7 +7,7 @@ set -e -o pipefail
 LOG_FILE="/var/log/wordpress-install-final-definitive.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
 
-echo "--- Início do script de configuração DEFINITIVO v4 (com o fix para Mixed Content) ---"
+echo "--- Início do script de configuração DEFINITIVO v5 (com fix para Permissões) ---"
 
 # --- 0. CRIAÇÃO DE SWAP (ESSENCIAL PARA INSTÂNCIAS PEQUENAS) ---
 echo "Criando arquivo de SWAP de 1GB para estabilidade..."
@@ -15,7 +15,6 @@ fallocate -l 1G /swapfile
 chmod 600 /swapfile
 mkswap /swapfile
 swapon /swapfile
-# Tornar o SWAP permanente
 echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
 echo "SWAP ativado com sucesso."
 
@@ -24,7 +23,7 @@ echo "Atualizando pacotes do sistema..."
 yum update -y
 
 echo "Instalando Nginx, MariaDB, PHP-FPM e utilitários..."
-yum install -y nginx mariadb105-server php-fpm php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json openssl wget --allowerasing
+yum install -y nginx mariadb105-server php-fpm php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json openssl wget policycoreutils-python-utils --allowerasing
 
 # --- 2. Tunning do MariaDB para Baixo Consumo de RAM ---
 echo "Configurando MariaDB para usar menos memória..."
@@ -74,10 +73,7 @@ tar -xzf latest.tar.gz
 mv wordpress/* .
 rm -rf wordpress latest.tar.gz
 
-echo "Ajustando permissões dos arquivos do WordPress para o usuário do Nginx..."
-chown -R nginx:nginx /var/www/html
-
-# --- 6. Configuração do WordPress (wp-config.php) com o FIX FINAL para HTTPS ---
+# --- 6. Configuração do WordPress (wp-config.php) ---
 echo "Criando e configurando o arquivo wp-config.php..."
 cp wp-config-sample.php wp-config.php
 sed -i "s/database_name_here/${DB_NAME}/g" wp-config.php
@@ -88,10 +84,7 @@ SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 STRING='put your unique phrase here'
 printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
 
-echo "Adicionando configurações de proxy reverso/CloudFront no início do wp-config.php..."
-# ***** CORREÇÃO DEFINITIVA PARA O PROBLEMA DE CONTEÚDO MISTO (MIXED CONTENT) *****
-# O código abaixo é inserido logo após '<?php' para garantir que o WordPress
-# identifique a conexão como HTTPS antes de qualquer outra operação.
+echo "Adicionando configurações de proxy reverso e método de escrita no wp-config.php..."
 PHP_CONFIG_INSERT="\\
 // Força HTTPS e define o URL do site para ambientes com Proxy Reverso (CloudFront)\\
 if (isset(\\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO']) && \\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https') {\\
@@ -99,11 +92,29 @@ if (isset(\\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO']) && \\\$_SERVER['HTTP_C
 }\\
 define('WP_HOME', 'https://cfwp.cloudman.pro');\\
 define('WP_SITEURL', 'https://cfwp.cloudman.pro');\\
+\\
+// *** NOVO: Força o WordPress a usar o método de escrita direta no sistema de arquivos ***\\
+define('FS_METHOD', 'direct');\\
 "
 sed -i "/<?php/a ${PHP_CONFIG_INSERT}" wp-config.php
 
 
-# --- 7. Configuração do Nginx para o WordPress ---
+# --- 7. Ajuste Final de Permissões (CORRIGE O PROBLEMA DE FTP) ---
+echo "Ajustando permissões de arquivos e contextos SELinux para o WordPress..."
+# Define o dono dos arquivos para o usuário do Nginx
+chown -R nginx:nginx /var/www/html
+
+# NOVO: Define as permissões corretas para diretórios (755) e arquivos (644)
+find /var/www/html/ -type d -exec chmod 755 {} \;
+find /var/www/html/ -type f -exec chmod 644 {} \;
+
+# NOVO: Ajusta o contexto SELinux para permitir que o servidor web escreva nas pastas necessárias
+chcon -t httpd_sys_rw_content_t -R /var/www/html/wp-content
+chcon -t httpd_sys_rw_content_t -R /var/www/html/wp-admin
+chcon -t httpd_sys_rw_content_t -R /var/www/html/wp-includes
+
+
+# --- 8. Configuração do Nginx para o WordPress ---
 echo "Configurando o Nginx para servir o site WordPress..."
 cat > /etc/nginx/conf.d/wordpress.conf <<'EOF'
 server {
@@ -128,7 +139,7 @@ server {
 }
 EOF
 
-# --- 8. Finalização ---
+# --- 9. Finalização ---
 echo "Reiniciando o Nginx e PHP-FPM para aplicar todas as configurações..."
 systemctl restart nginx
 systemctl restart php-fpm
