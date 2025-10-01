@@ -7,7 +7,7 @@ set -e -o pipefail
 LOG_FILE="/var/log/wordpress-install-final-definitive.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
 
-echo "--- Início do script de configuração DEFINITIVO v7 (Proativo e Granular) ---"
+echo "--- Início do script de configuração DEFINITIVO v8 (com fix para WP-CLI) ---"
 
 # --- 0. CRIAÇÃO DE SWAP ---
 echo "Criando arquivo de SWAP de 1GB para estabilidade..."
@@ -21,7 +21,8 @@ echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
 echo "Atualizando pacotes do sistema..."
 yum update -y
 echo "Instalando Nginx, MariaDB, PHP-FPM e utilitários..."
-yum install -y nginx mariadb105-server php-fpm php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json openssl wget policycoreutils-python-utils --allowerasing
+# ADICIONADO: php-cli é essencial para o WP-CLI funcionar na linha de comando
+yum install -y nginx mariadb105-server php-fpm php-cli php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json openssl wget policycoreutils-python-utils --allowerasing
 
 # --- 2. Tunning do MariaDB ---
 echo "Configurando MariaDB para usar menos memória..."
@@ -85,17 +86,12 @@ sed -i "/<?php/a ${PHP_CONFIG_INSERT}" wp-config.php
 
 # --- 7. AJUSTE DE PERMISSÕES PROATIVO E SEGURO ---
 echo "Ajustando permissões de forma granular e segura para o futuro..."
-# Cria diretórios essenciais que podem não existir ainda
 mkdir -p /var/www/html/wp-content/uploads
 mkdir -p /var/www/html/wp-content/languages
-# Define o dono de todos os arquivos para o usuário do Nginx
 chown -R nginx:nginx /var/www/html
-# Define permissões base seguras: 755 para diretórios, 644 para arquivos
 find /var/www/html/ -type d -exec chmod 755 {} \;
 find /var/www/html/ -type f -exec chmod 644 {} \;
-# Permite que o GRUPO (nginx) escreva APENAS nos DIRETÓRIOS de wp-content, protegendo os arquivos .php
 find /var/www/html/wp-content -type d -exec chmod g+w {} \;
-# Ajusta o contexto SELinux para permitir que o servidor web escreva
 chcon -t httpd_sys_rw_content_t -R /var/www/html/wp-content
 
 # --- 8. (PROATIVO) Instalação do WP-CLI para Gerenciamento Avançado ---
@@ -103,7 +99,7 @@ echo "Instalando WP-CLI..."
 wget https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
 chmod +x wp-cli.phar
 mv wp-cli.phar /usr/local/bin/wp
-# Verifica a instalação (opcional)
+echo "Verificando a instalação do WP-CLI..."
 /usr/local/bin/wp --info
 
 # --- 9. Configuração do Nginx ---
