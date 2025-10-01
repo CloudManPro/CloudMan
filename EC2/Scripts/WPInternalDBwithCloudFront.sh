@@ -84,14 +84,26 @@ define('FS_METHOD', 'direct'); // Força método de escrita direta\\
 "
 sed -i "/<?php/a ${PHP_CONFIG_INSERT}" wp-config.php
 
-# --- 7. AJUSTE DE PERMISSÕES PROATIVO E SEGURO ---
-echo "Ajustando permissões de forma granular e segura para o futuro..."
+# --- 7. AJUSTE DE PERMISSÕES E CONFIGURAÇÃO PHP ---
+echo "Ajustando permissões e configurando PHP..."
+# (PROATIVO) Desativa a restrição open_basedir no PHP que pode impedir a escrita
+sed -i 's/^open_basedir =/;\0/' /etc/php.ini
+
+# Cria diretórios essenciais
 mkdir -p /var/www/html/wp-content/uploads
 mkdir -p /var/www/html/wp-content/languages
+
+# Define o dono dos arquivos
 chown -R nginx:nginx /var/www/html
+
+# Define permissões base seguras
 find /var/www/html/ -type d -exec chmod 755 {} \;
 find /var/www/html/ -type f -exec chmod 644 {} \;
+
+# Permite escrita para o grupo APENAS nos diretórios de wp-content
 find /var/www/html/wp-content -type d -exec chmod g+w {} \;
+
+# Ajusta o contexto SELinux
 chcon -t httpd_sys_rw_content_t -R /var/www/html/wp-content
 
 # --- 8. (PROATIVO) Instalação do WP-CLI para Gerenciamento Avançado ---
