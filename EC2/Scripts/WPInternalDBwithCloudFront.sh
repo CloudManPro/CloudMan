@@ -4,10 +4,10 @@
 set -e -o pipefail
 
 # --- Logging ---
-LOG_FILE="/var/log/wordpress-install-final-v3.log"
+LOG_FILE="/var/log/wordpress-install-final-definitive.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
 
-echo "--- Início do script de configuração FINAL v3 (Nginx + SWAP + CloudFront Fix) ---"
+echo "--- Início do script de configuração DEFINITIVO v4 (com o fix para Mixed Content) ---"
 
 # --- 0. CRIAÇÃO DE SWAP (ESSENCIAL PARA INSTÂNCIAS PEQUENAS) ---
 echo "Criando arquivo de SWAP de 1GB para estabilidade..."
@@ -77,14 +77,13 @@ rm -rf wordpress latest.tar.gz
 echo "Ajustando permissões dos arquivos do WordPress para o usuário do Nginx..."
 chown -R nginx:nginx /var/www/html
 
-# --- 6. Configuração do WordPress (wp-config.php) com Fix para CloudFront ---
+# --- 6. Configuração do WordPress (wp-config.php) com o FIX FINAL para HTTPS ---
 echo "Criando e configurando o arquivo wp-config.php..."
 cp wp-config-sample.php wp-config.php
 sed -i "s/database_name_here/${DB_NAME}/g" wp-config.php
 sed -i "s/username_here/${DB_USER}/g" wp-config.php
 sed -i "s#password_here#${DB_PASSWORD}#g" wp-config.php
 
-# ***** LINHA CORRIGIDA AQUI *****
 SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 STRING='put your unique phrase here'
 printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
@@ -92,11 +91,14 @@ printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
 echo "Adicionando configurações de proxy reverso/CloudFront no wp-config.php..."
 echo "define('WP_HOME', 'https://cfwp.cloudman.pro');" >> wp-config.php
 echo "define('WP_SITEURL', 'https://cfwp.cloudman.pro');" >> wp-config.php
-echo "if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {" >> wp-config.php
+
+# ***** CORREÇÃO DEFINITIVA PARA O PROBLEMA DE CONTEÚDO MISTO (MIXED CONTENT) *****
+# Procura pelo cabeçalho correto enviado pelo CloudFront para detectar HTTPS.
+echo "if (isset(\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO']) && \$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https') {" >> wp-config.php
 echo "    \$_SERVER['HTTPS'] = 'on';" >> wp-config.php
 echo "}" >> wp-config.php
 
-# --- 7. Configuração do Nginx para o WordPress (Sem modificações arriscadas) ---
+# --- 7. Configuração do Nginx para o WordPress ---
 echo "Configurando o Nginx para servir o site WordPress..."
 cat > /etc/nginx/conf.d/wordpress.conf <<'EOF'
 server {
