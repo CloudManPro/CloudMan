@@ -7,7 +7,7 @@ set -e -o pipefail
 LOG_FILE="/var/log/wordpress-install-final-definitive.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
 
-echo "--- Início do script de configuração DEFINITIVO v11 (com otimização de memória PHP) ---"
+echo "--- Início do script de configuração DEFINITIVO v12 (fix de memory_limit no php.ini) ---"
 
 # --- 0. CRIAÇÃO DE SWAP ---
 # [ ... seção inalterada ... ]
@@ -39,13 +39,19 @@ innodb_flush_log_at_trx_commit = 2
 innodb_flush_method = O_DIRECT
 EOF
 
-# --- 3. Alinhamento de Usuário Nginx e PHP-FPM ---
-# [ ... seção inalterada ... ]
+# --- 3. (NOVO) Otimização Centralizada do PHP ---
+echo "Configurando limites do PHP no php.ini..."
+# Aumenta o limite de memória para operações pesadas como importação de templates
+sed -i 's/memory_limit = .*/memory_limit = 512M/' /etc/php.ini
+# Desativa a restrição open_basedir que pode impedir a escrita de arquivos
+sed -i 's/^open_basedir =/;\0/' /etc/php.ini
+
+# --- 4. Alinhamento de Usuário Nginx e PHP-FPM ---
 echo "Alinhando usuário do PHP-FPM com o usuário do Nginx..."
 sed -i 's/user = apache/user = nginx/g' /etc/php-fpm.d/www.conf
 sed -i 's/group = apache/group = nginx/g' /etc/php-fpm.d/www.conf
 
-# --- 4. Gerenciamento de Serviços ---
+# --- 5. Gerenciamento de Serviços ---
 # [ ... seção inalterada ... ]
 echo "Iniciando e habilitando os serviços..."
 systemctl start nginx; systemctl enable nginx
@@ -54,7 +60,7 @@ systemctl start mariadb; systemctl enable mariadb
 echo "Aguardando 10 segundos para o MariaDB iniciar completamente..."
 sleep 10
 
-# --- 5. Configuração do Banco de Dados ---
+# --- 6. Configuração do Banco de Dados ---
 # [ ... seção inalterada ... ]
 DB_NAME="wordpress_db"; DB_USER="wordpress_user"; DB_PASSWORD=$(openssl rand -base64 12) 
 echo "Criando o banco de dados e o usuário para o WordPress..."
@@ -65,7 +71,7 @@ GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
 EOF
 
-# --- 6. Instalação do WordPress ---
+# --- 7. Instalação do WordPress ---
 # [ ... seção inalterada ... ]
 cd /var/www/html
 wget https://wordpress.org/latest.tar.gz
@@ -73,7 +79,7 @@ tar -xzf latest.tar.gz
 mv wordpress/* .
 rm -rf wordpress latest.tar.gz
 
-# --- 7. Configuração do wp-config.php (COM OTIMIZAÇÃO DE MEMÓRIA) ---
+# --- 8. Configuração do wp-config.php (Simplificada) ---
 echo "Criando e configurando o arquivo wp-config.php..."
 cp wp-config-sample.php wp-config.php
 sed -i "s/database_name_here/${DB_NAME}/g" wp-config.php
@@ -83,32 +89,28 @@ SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 STRING='put your unique phrase here'
 printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
 
-echo "Adicionando configurações avançadas no wp-config.php..."
+# As configurações de memória foram movidas para o php.ini
+echo "Adicionando configurações essenciais no wp-config.php..."
 PHP_CONFIG_INSERT="\\
 // Proxy Reverso (CloudFront)\\
 if (isset(\\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO']) && \\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https') {\\\$_SERVER['HTTPS'] = 'on'; }\\
 define('WP_HOME', 'https://cfwp.cloudman.pro');\\
 define('WP_SITEURL', 'https://cfwp.cloudman.pro');\\
 define('FS_METHOD', 'direct');\\
-\\
-// *** NOVO: Otimização de Limite de Memória do PHP para WordPress *** \\
-define('WP_MEMORY_LIMIT', '256M');\\
-define('WP_MAX_MEMORY_LIMIT', '512M');\\
 "
 sed -i "/<?php/a ${PHP_CONFIG_INSERT}" wp-config.php
 
-# --- 8. AJUSTE DE PERMISSÕES PROATIVO E SEGURO ---
+# --- 9. AJUSTE DE PERMISSÕES PROATIVO E SEGURO ---
 # [ ... seção inalterada ... ]
 echo "Ajustando permissões..."
-sed -i 's/^open_basedir =/;\0/' /etc/php.ini
 mkdir -p /var/www/html/wp-content/uploads /var/www/html/wp-content/languages
 chown -R nginx:nginx /var/www/html
 find /var/www/html/ -type d -exec chmod 755 {} \;
 find /var/www/html/ -type f -exec chmod 644 {} \;
 find /var/www/html/wp-content -type d -exec chmod g+w {} \;
-chcon -t httpd_sys_rw_content_t -R /var/www/html/wp-content
+chcon -t http_sys_rw_content_t -R /var/www/html/wp-content
 
-# --- 9. Instalação do WP-CLI ---
+# --- 10. Instalação do WP-CLI ---
 # [ ... seção inalterada ... ]
 echo "Instalando WP-CLI..."
 wget https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
@@ -116,7 +118,7 @@ chmod +x wp-cli.phar
 mv wp-cli.phar /usr/local/bin/wp
 /usr/local/bin/wp --info
 
-# --- 10. Configuração do Nginx ---
+# --- 11. Configuração do Nginx ---
 # [ ... seção inalterada ... ]
 cat > /etc/nginx/conf.d/wordpress.conf <<'EOF'
 server {
@@ -137,7 +139,7 @@ server {
 }
 EOF
 
-# --- 11. Finalização ---
+# --- 12. Finalização ---
 # [ ... seção inalterada ... ]
 echo "Reiniciando Nginx e PHP-FPM para aplicar todas as configurações..."
 systemctl restart nginx
