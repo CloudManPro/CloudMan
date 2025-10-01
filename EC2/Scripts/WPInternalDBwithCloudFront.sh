@@ -4,10 +4,10 @@
 set -e -o pipefail
 
 # --- Logging ---
-LOG_FILE="/var/log/wordpress-install-final.log"
+LOG_FILE="/var/log/wordpress-install-debug.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
 
-echo "--- Início do script de configuração FINAL e OTIMIZADO (Nginx + SWAP + CloudFront Fix) ---"
+echo "--- Início do script de configuração com DEBUG DE LOG (Nginx + SWAP + CloudFront Fix) ---"
 
 # --- 0. CRIAÇÃO DE SWAP (ESSENCIAL PARA INSTÂNCIAS PEQUENAS) ---
 echo "Criando arquivo de SWAP de 1GB para estabilidade..."
@@ -88,41 +88,44 @@ SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 STRING='put your unique phrase here'
 printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
 
-# --- INÍCIO DA CORREÇÃO ESSENCIAL PARA CLOUDFRONT ---
 echo "Adicionando configurações de proxy reverso/CloudFront no wp-config.php..."
-# Define o nome de domínio correto para evitar redirecionamentos indesejados
 echo "define('WP_HOME', 'https://cfwp.cloudman.pro');" >> wp-config.php
 echo "define('WP_SITEURL', 'https://cfwp.cloudman.pro');" >> wp-config.php
-
-# Confia no cabeçalho X-Forwarded-Proto do CloudFront para detectar HTTPS
 echo "if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {" >> wp-config.php
 echo "    \$_SERVER['HTTPS'] = 'on';" >> wp-config.php
 echo "}" >> wp-config.php
-# --- FIM DA CORREÇÃO ESSENCIAL PARA CLOUDFRONT ---
 
-# --- 7. Configuração do Nginx para o WordPress ---
+# --- 7. DEBUG: Modificar Formato de Log do Nginx ---
+echo "Adicionando formato de log de depuração ao Nginx..."
+# Adiciona o novo formato de log chamado 'debug'
+sed -i "/log_format  main/a \
+    log_format debug '\$remote_addr - \$remote_user [\$time_local] \"\$request\" ' \
+                      '\\\$status \\\$body_bytes_sent \"\\\$http_referer\" ' \
+                      '\"\\\$http_user_agent\" \"\\\$http_x_forwarded_for\" ' \
+                      'host=\"\\\$host\" fwd_proto=\"\\\$http_x_forwarded_proto\"';" /etc/nginx/nginx.conf
+
+# Altera o log de acesso padrão para usar o novo formato 'debug'
+sed -i 's|access_log  /var/log/nginx/access.log  main;|access_log  /var/log/nginx/access.log  debug;|' /etc/nginx/nginx.conf
+echo "Formato de log do Nginx alterado para 'debug'."
+
+# --- 8. Configuração do Nginx para o WordPress ---
 echo "Configurando o Nginx para servir o site WordPress..."
 cat > /etc/nginx/conf.d/wordpress.conf <<'EOF'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
-
     root /var/www/html;
     index index.php index.html index.htm;
-
     server_name _;
-
     location / {
         try_files $uri $uri/ /index.php?$args;
     }
-
     location ~ \.php$ {
         include fastcgi_params;
         fastcgi_pass unix:/run/php-fpm/www.sock;
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
     }
-
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
         expires max;
         log_not_found off;
@@ -130,7 +133,7 @@ server {
 }
 EOF
 
-# --- 8. Finalização ---
+# --- 9. Finalização ---
 echo "Reiniciando o Nginx e PHP-FPM para aplicar todas as configurações..."
 systemctl restart nginx
 systemctl restart php-fpm
