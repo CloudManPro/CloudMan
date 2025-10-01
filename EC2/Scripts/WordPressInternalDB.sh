@@ -4,33 +4,56 @@
 set -e -o pipefail
 
 # --- Logging ---
-LOG_FILE="/var/log/wordpress-install-universal.log"
+LOG_FILE="/var/log/wordpress-install-optimized.log"
 exec > >(tee -a ${LOG_FILE}) 2>&1
 
-echo "--- Início do script de configuração do WordPress com MariaDB (Versão Universal para AL2023) ---"
+echo "--- Início do script de configuração OTIMIZADO (Nginx + SWAP) ---"
 
-# --- 1. Atualização do Sistema e Instalação de Pacotes ---
+# --- 0. CRIAÇÃO DE SWAP (ESSENCIAL PARA 1GB RAM) ---
+echo "Criando arquivo de SWAP de 1GB para estabilidade..."
+fallocate -l 1G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+# Tornar o SWAP permanente
+echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+echo "SWAP ativado com sucesso."
+
+# --- 1. Atualização do Sistema e Instalação de Pacotes Otimizados ---
 echo "Atualizando pacotes do sistema..."
 yum update -y
 
-echo "Instalando Apache, MariaDB, PHP e utilitários..."
-yum install -y httpd mariadb105-server php php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json openssl wget --allowerasing
+echo "Instalando Nginx, MariaDB, PHP-FPM e utilitários..."
+yum install -y nginx mariadb105-server php-fpm php-mysqlnd php-gd php-curl php-mbstring php-xml php-zip php-json openssl wget --allowerasing
 
-# --- 2. Configuração de Segurança (SELinux) ---
-echo "Configurando a política do SELinux para o banco de dados..."
-setsebool -P httpd_can_network_connect_db 1
+# --- 2. Tunning do MariaDB para Baixo Consumo de RAM ---
+echo "Configurando MariaDB para usar menos memória..."
+cat << EOF > /etc/my.cnf.d/low-memory-tune.cnf
+[mysqld]
+innodb_buffer_pool_size = 128M
+key_buffer_size = 8M
+query_cache_size = 0
+query_cache_type = 0
+max_connections = 20
+performance_schema = OFF
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method = O_DIRECT
+EOF
+echo "Configuração de memória do MariaDB aplicada."
 
 # --- 3. Gerenciamento de Serviços ---
-echo "Iniciando e habilitando os serviços httpd e mariadb..."
-systemctl start httpd
-systemctl enable httpd
+echo "Iniciando e habilitando os serviços nginx, php-fpm e mariadb..."
+systemctl start nginx
+systemctl enable nginx
+systemctl start php-fpm
+systemctl enable php-fpm
 systemctl start mariadb
 systemctl enable mariadb
 
 echo "Aguardando 10 segundos para o MariaDB iniciar completamente..."
 sleep 10
 
-# --- 4. Configuração do Banco de Dados ---
+# --- 4. Configuração do Banco de Dados (sem alterações) ---
 DB_NAME="wordpress_db"
 DB_USER="wordpress_user"
 DB_PASSWORD=$(openssl rand -base64 12) 
@@ -51,8 +74,8 @@ tar -xzf latest.tar.gz
 mv wordpress/* .
 rm -rf wordpress latest.tar.gz
 
-echo "Ajustando permissões dos arquivos do WordPress..."
-chown -R apache:apache /var/www/html
+echo "Ajustando permissões dos arquivos do WordPress para o usuário do Nginx..."
+chown -R nginx:nginx /var/www/html
 
 # --- 6. Configuração do WordPress (wp-config.php) ---
 echo "Criando e configurando o arquivo wp-config.php..."
@@ -65,29 +88,52 @@ SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 STRING='put your unique phrase here'
 printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
 
-# --- 7. Finalização ---
-echo "Reiniciando o Apache para aplicar todas as configurações..."
-systemctl restart httpd
+# --- 7. Configuração do Nginx para o WordPress ---
+echo "Configurando o Nginx para servir o site WordPress..."
+cat > /etc/nginx/conf.d/wordpress.conf <<'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    root /var/www/html;
+    index index.php index.html index.htm;
+
+    server_name _;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php-fpm/www.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }
+
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+        expires max;
+        log_not_found off;
+    }
+}
+EOF
+
+# --- 8. Finalização ---
+echo "Reiniciando o Nginx e PHP-FPM para aplicar todas as configurações..."
+systemctl restart nginx
+systemctl restart php-fpm
 
 # --- LÓGICA UNIVERSAL DE DETECÇÃO DE ENDEREÇO ---
 echo "--- Script de configuração do WordPress concluído com sucesso! ---"
-echo ""
-
-# Tenta obter o endereço IPv4 público. O comando curl falhará silenciosamente se não houver um.
-# O || true garante que o script não pare aqui caso o comando falhe (por causa do set -e).
+# (A lógica de detecção de IP/DNS permanece a mesma)
 PUBLIC_IPV4=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || true)
-
-# Se um endereço IPv4 foi encontrado, mostre-o. Este é o cenário standalone.
 if [ -n "$PUBLIC_IPV4" ]; then
     echo "Cenário STANDALONE detectado (com IP público IPv4)."
     echo "Acesse o seu site em: http://${PUBLIC_IPV4}"
-    echo "Para usar HTTPS, configure um domínio e um certificado SSL."
 else
-    # Se não houver IPv4, obtenha o DNS público (que resolverá para IPv6). Este é o cenário CloudFront.
     PUBLIC_DNS=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || true)
     echo "Cenário CLOUDFRONT / IPv6-only detectado."
-    echo "O acesso a esta instância deve ser feito através da sua distribuição CloudFront."
-    echo "DNS da Instância (para referência na configuração da origem do CloudFront): ${PUBLIC_DNS}"
+    echo "Acesso via CloudFront. DNS da Instância: ${PUBLIC_DNS}"
 fi
 
 echo ""
