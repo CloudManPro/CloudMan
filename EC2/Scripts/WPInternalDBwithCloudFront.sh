@@ -88,15 +88,20 @@ SALT=$(curl -sL https://api.wordpress.org/secret-key/1.1/salt/)
 STRING='put your unique phrase here'
 printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s wp-config.php
 
-echo "Adicionando configurações de proxy reverso/CloudFront no wp-config.php..."
-echo "define('WP_HOME', 'https://cfwp.cloudman.pro');" >> wp-config.php
-echo "define('WP_SITEURL', 'https://cfwp.cloudman.pro');" >> wp-config.php
-
+echo "Adicionando configurações de proxy reverso/CloudFront no início do wp-config.php..."
 # ***** CORREÇÃO DEFINITIVA PARA O PROBLEMA DE CONTEÚDO MISTO (MIXED CONTENT) *****
-# Procura pelo cabeçalho correto enviado pelo CloudFront para detectar HTTPS.
-echo "if (isset(\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO']) && \$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https') {" >> wp-config.php
-echo "    \$_SERVER['HTTPS'] = 'on';" >> wp-config.php
-echo "}" >> wp-config.php
+# O código abaixo é inserido logo após '<?php' para garantir que o WordPress
+# identifique a conexão como HTTPS antes de qualquer outra operação.
+PHP_CONFIG_INSERT="\\
+// Força HTTPS e define o URL do site para ambientes com Proxy Reverso (CloudFront)\\
+if (isset(\\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO']) && \\\$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https') {\\
+    \\\$_SERVER['HTTPS'] = 'on';\\
+}\\
+define('WP_HOME', 'https://cfwp.cloudman.pro');\\
+define('WP_SITEURL', 'https://cfwp.cloudman.pro');\\
+"
+sed -i "/<?php/a ${PHP_CONFIG_INSERT}" wp-config.php
+
 
 # --- 7. Configuração do Nginx para o WordPress ---
 echo "Configurando o Nginx para servir o site WordPress..."
