@@ -15,6 +15,7 @@ import shutil
 import requests
 import re
 from botocore.exceptions import ClientError
+import hcl2
 
 # --- CONFIGURAÇÃO INICIAL E CONSTANTES ---
 ARTIFACTS_DIR = '/tmp/artifacts'
@@ -25,6 +26,7 @@ logger = logging.getLogger()
 
 
 # --- FUNÇÕES AUXILIARES (INCLUINDO AS MOVIDAS DO MODIFY_MAIN_TF.PY) ---
+
 
 def get_boto3_clients_with_assumed_role(role_arn, session_name="TerraBatchSession"):
     """Assume uma IAM Role e retorna um dicionário de clientes Boto3 com credenciais temporárias."""
@@ -64,7 +66,6 @@ def _split_resource_name(full_name, is_test_env):
 def inject_assume_role(code, role_arn):
     """
     TAREFA 1: Injeta o bloco 'assume_role' no provedor 'aws'.
-    (Função movida do antigo modify_main_tf.py)
     """
     if not role_arn:
         logger.info("Nenhuma DYNAMIC_ASSUMABLE_ROLE_ARN encontrada. Pulando injeção de role.")
@@ -92,55 +93,112 @@ def inject_assume_role(code, role_arn):
 
     return re.sub(provider_regex, add_assume_role, code, flags=re.MULTILINE)
 
-def _modify_and_prepare_main_tf(state_dir, state_name, manifest_data, role_arn_to_assume, is_test_env):
+
+
+import os
+import re
+import logging
+
+# Presume-se que as seguintes variáveis e o logger já existem no escopo do seu script:
+# logger = logging.getLogger()
+# ARTIFACTS_DIR = '/tmp/artifacts'
+# def inject_assume_role(content, role_arn): ...
+# def _split_resource_name(full_name, is_test_env): ...
+
+def _modify_and_prepare_main_tf(state_dir, state_name, manifest_data, role_arn_to_assume, is_test_env, command_type):
     """
-    Modifica o arquivo main.tf em memória antes da execução do Terraform.
-    Esta função absorve e corrige a lógica do antigo script modify_main_tf.py.
+    VERSÃO FINAL E ROBUSTA: Processa o main.tf dinamicamente, usando substituição de
+    placeholders complexos. Esta versão foi corrigida para usar o nome completo do
+    recurso do manifesto na construção dos placeholders, garantindo que a busca
+    funcione corretamente em todos os ambientes (test, prod, etc.).
     """
     main_tf_path = os.path.join(state_dir, 'main.tf')
-    logger.info(f"Processando arquivo de configuração: {main_tf_path}")
+    logger.info(f"Processando '{main_tf_path}' para o comando '{command_type}'.")
 
-    with open(main_tf_path, 'r', encoding='utf-8') as f:
-        content = f.read()
+    try:
+        with open(main_tf_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        logger.error(f"FALHA CRÍTICA ao ler o arquivo HCL '{main_tf_path}'. Erro: {e}", exc_info=True)
+        raise
 
-    # ETAPA 1: Injetar a role (sem alteração)
+    # Injeção de role (sem alterações)
     content = inject_assume_role(content, role_arn_to_assume)
 
-    # ETAPA 2: Substituir os placeholders
-    logger.info(f"[{state_name}/modify] Iniciando substituição de placeholders para o estado '{state_name}'...")
-    _, target_suffix = _split_resource_name(state_name, is_test_env=is_test_env)
+    try:
+        if command_type == 'destroy':
+            logger.info(f"[{state_name}/destroy-optimize] Otimizando HCL para destruição...")
+            dummy_zip_path = "/tmp/dummy_artifact.zip"
+            os.makedirs('/tmp', exist_ok=True)
+            with open(dummy_zip_path, 'w') as f: f.write('dummy')
+            
+            # Substitui todos os filenames de artefatos por um dummy
+            content = re.sub(r'filename\s*=\s*"Change_CloudMan_%\&*_File_Name_.*"',
+                             f'filename = "{dummy_zip_path}"',
+                             content, flags=re.MULTILINE)
+            logger.info("  -> [destroy] Filenames de Lambdas/UserData alterados para dummy.")
+            
+            # Remove completamente todas as linhas de source_code_hash
+            content = re.sub(r'^\s*source_code_hash\s*=\s*"Change_CloudMan_%\&*_Hash_.*"\n?',
+                             '',
+                             content, flags=re.MULTILINE)
+            logger.info("  -> [destroy] Linhas de source_code_hash removidas.")
+            
+        else: # Lógica para 'apply'
+            logger.info(f"[{state_name}/apply] Modificando HCL para aplicação...")
+            _, target_suffix = _split_resource_name(state_name, is_test_env=is_test_env)
 
-    # --- Lógica de substituição para Lambdas (sem alteração) ---
-    for lambda_info in manifest_data.get("ListLambda", []):
-        base_name, _ = _split_resource_name(lambda_info[0], is_test_env=is_test_env)
-        target_full_name = f"{base_name}{target_suffix}"
-        placeholder_to_find = f"Change_File_Name_{target_full_name}"
-        new_artifact_path = os.path.join(ARTIFACTS_DIR, "lambdas", f"{target_full_name}.zip").replace("\\", "/")
-        content = content.replace(f'"{placeholder_to_find}"', f'"{new_artifact_path}"')
-        content = content.replace(f'filebase64sha256("{placeholder_to_find}")', f'filebase64sha256("{new_artifact_path}")')
+            # 1. Garante 'force_destroy: true' para buckets S3
+            content = re.sub(r'(\bforce_destroy\s*=\s*)false',
+                             r'\1true',
+                             content)
+            logger.info("  -> [apply] Garantido 'force_destroy: true' para buckets S3 marcados.")
 
-    # --- NOVO: Lógica de substituição para EC2 e Launch Templates ---
-    ec2_items = manifest_data.get("ListEC2", []) + manifest_data.get("ListLaunchTemplate", [])
-    for ec2_info in ec2_items:
-        base_name, _ = _split_resource_name(ec2_info[0], is_test_env=is_test_env)
-        target_full_name = f"{base_name}{target_suffix}"
-        placeholder_to_find = f"Change_File_Name_{target_full_name}"
-        new_artifact_path = os.path.join(ARTIFACTS_DIR, "ec2_userdata", f"{target_full_name}.sh").replace("\\", "/")
+            # 2. Processar Lambdas
+            for lambda_manifest in manifest_data.get("ListLambda", []):
+                # --- [ CORREÇÃO CIRÚRGICA ] ---
+                # Usa o nome COMPLETO do manifesto (ex: "Function-test") para construir o placeholder.
+                resource_name_from_manifest = lambda_manifest[0]
+                
+                # A função split ainda é usada para construir o nome do ARQUIVO de destino.
+                base_name_for_path, _ = _split_resource_name(resource_name_from_manifest, is_test_env)
+                
+                placeholder_filename = f'"Change_CloudMan_%&*_File_Name_{resource_name_from_manifest}"'
+                placeholder_hash = f'"Change_CloudMan_%&*_Hash_{resource_name_from_manifest}"'
+                # --- [ FIM DA CORREÇÃO ] ---
+
+                # O resto da lógica agora funciona, pois os placeholders correspondem ao HCL.
+                new_path = os.path.join(ARTIFACTS_DIR, "lambdas", f"{base_name_for_path}{target_suffix}.zip").replace("\\", "/")
+                new_hash_expression = f'filebase64sha256("{new_path}")'
+                
+                content = content.replace(placeholder_filename, f'"{new_path}"')
+                content = content.replace(placeholder_hash, new_hash_expression)
+                
+                logger.info(f"  -> [apply] Artefato da Lambda '{resource_name_from_manifest}' atualizado para '{new_path}'.")
+
+            # 3. Processar UserData de EC2 e Launch Templates
+            ec2_items = manifest_data.get("ListEC2", []) + manifest_data.get("ListLaunchTemplate", [])
+            for ec2_manifest in ec2_items:
+                # Aplicando a mesma lógica de correção aqui
+                resource_name_from_manifest = ec2_manifest[0]
+                base_name_for_path, _ = _split_resource_name(resource_name_from_manifest, is_test_env)
+
+                new_path = os.path.join(ARTIFACTS_DIR, "ec2_userdata", f"{base_name_for_path}{target_suffix}.sh").replace("\\", "/")
+                new_file_expr = f'${{file("{new_path}")}}'
+                
+                placeholder_userdata = f'"Change_CloudMan_%&*_File_Name_{resource_name_from_manifest}"'
+                content = content.replace(placeholder_userdata, f'"{new_file_expr}"')
+                logger.info(f"  -> [apply] UserData de '{resource_name_from_manifest}' atualizado para '{new_path}'.")
+
+        # Sobrescreve o arquivo main.tf com o conteúdo final modificado
+        with open(main_tf_path, 'w', encoding='utf-8') as f:
+            f.write(content)
         
-        # Substitui tanto a referência direta ao arquivo quanto a função file() do Terraform
-        content = content.replace(f'"{placeholder_to_find}"', f'"{new_artifact_path}"')
-        content = content.replace(f'file("{placeholder_to_find}")', f'file("{new_artifact_path}")')
+        logger.info(f"[{state_name}/modify] Arquivo '{main_tf_path}' modificado com sucesso.")
 
-    # ... (Restante da função para logar e salvar o arquivo, sem alterações) ...
-    logger.info(f"--- CONTEÚDO FINAL DO main.tf PARA O ESTADO {state_name} ---")
-    for i, line in enumerate(content.splitlines()):
-        if i < 25: logger.info(line)
-        elif i == 25: logger.info("..."); break
-    logger.info("------------------------------------------------------")
-
-    with open(main_tf_path, 'w', encoding='utf-8') as f: f.write(content)
-    logger.info(f"[{state_name}/modify] Arquivo '{main_tf_path}' processado e salvo com sucesso.")
-
+    except Exception as e:
+        logger.error(f"FALHA CRÍTICA ao processar o HCL para o estado '{state_name}'. Erro: {e}", exc_info=True)
+        raise
 
 # --- LEITURA DE VARIÁVEIS DE AMBIENTE E MANIFESTO ---
 command_array = (os.getenv('Command') or '').split(',')
@@ -649,7 +707,8 @@ def main():
                 state_name=state_name,
                 manifest_data=json_data,
                 role_arn_to_assume=DYNAMIC_ASSUMABLE_ROLE_ARN,
-                is_test_env=IsTest
+                is_test_env=IsTest,
+                command_type=command_type
             )
         except Exception as e:
             logger.error(f"Falha crítica ao modificar o main.tf para {state_name}: {e}", exc_info=True); sys.exit(1)
