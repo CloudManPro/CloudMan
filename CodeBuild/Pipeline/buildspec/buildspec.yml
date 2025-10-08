@@ -22,12 +22,10 @@ phases:
       - echo "export PATH_VAR=${path}" >> exported_env_vars.sh
       - cat exported_env_vars.sh
       - echo "Installing Python dependencies..."
-      - pip install boto3
+      - pip3 install boto3 python-hcl2
       - echo "Downloading TerraBatch.py, InitTerraform.py, and modify_main_tf.py from S3..."
       - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/TerraBatch.py ./TerraBatch.py
       - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/InitTerraform.py ./InitTerraform.py
-      - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/modify_main_tf.py ./modify_main_tf.py
-      - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/Copy.py ./Copy.py
       - echo "Downloading List.txt file from S3..."
       - aws s3 cp s3://${AWS_S3_BUCKET_TARGET_NAME_0}/${path}/List.txt ./List.txt
       - echo "Content of the List.txt file:"
@@ -62,11 +60,7 @@ phases:
       - echo "Preparing build..."
       - echo "Loading exported environment variables..."
       - source exported_env_vars.sh
-      - echo "Cleaning existing Terraform plugin cache to avoid conflicts..."
-      - rm -rf ${TF_PLUGIN_CACHE_DIR}/registry.terraform.io/
-      - echo "Syncing Terraform plugins from S3 to avoid re-downloading during init..."
-      - aws s3 sync s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform.d/plugin-cache/ ${TF_PLUGIN_CACHE_DIR}/ --quiet
-      - echo "Terraform plugin cache synced from S3."
+      # O sync do cache do S3 foi removido daqui. O Terraform irá baixar os providers da internet.
 
   build:
     commands:
@@ -75,12 +69,4 @@ phases:
         source exported_env_vars.sh
         python TerraBatch.py
 
-  post_build:
-    commands:
-      - echo "Syncing updated Terraform plugin cache back to S3..."
-      - aws s3 sync ${TF_PLUGIN_CACHE_DIR}/ s3://${AWS_S3_BUCKET_TARGET_NAME_0}/terraform-plugin-dir/.terraform.d/plugin-cache/ --quiet
-      - echo "Terraform plugin cache synced back to S3."
-
-cache:
-  paths:
-    - '/tmp/.terraform.d/plugin-cache/**'
+# A fase 'post_build' e a diretiva 'cache' foram completamente removidas.
