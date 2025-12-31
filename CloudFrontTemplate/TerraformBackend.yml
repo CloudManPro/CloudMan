@@ -1,12 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Template para criar Backend do Terraform (S3 + DynamoDB) e Integração OIDC com GitHub Actions.
+Description: Template para Backend do Terraform (S3 + DynamoDB) com OIDC GitHub Actions e Tags de Rastreabilidade.
 
 Parameters:
-  CreateOIDCProvider:
-    Description: "Cria o provedor OIDC se ele ainda não existir na conta (true/false)."
+  UserName:
+    Description: "Usuário que disparou a criação (visto na Tag User)."
     Type: String
-    Default: "true"
-    AllowedValues: ["true", "false"]
+    Default: "usuario-cloudman"
+
+  S3BucketName:
+    Description: "Nome globalmente único para o bucket S3 do Terraform State."
+    Type: String
 
   CreateDynamoDBTable:
     Description: "Deseja criar a tabela DynamoDB para State Locking? (true/false)."
@@ -14,12 +17,8 @@ Parameters:
     Default: "true"
     AllowedValues: ["true", "false"]
 
-  S3BucketName:
-    Description: "Nome globalmente único para o bucket S3 do Terraform State."
-    Type: String
-
   DynamoDBTableName:
-    Description: "Nome da tabela DynamoDB para locking (Opcional se CreateDynamoDBTable for false)."
+    Description: "Nome da tabela DynamoDB para locking."
     Type: String
     Default: "terraform-state-lock"
 
@@ -36,12 +35,18 @@ Parameters:
     Description: "Nome do Repositório que terá permissão."
     Type: String
 
+  CreateOIDCProvider:
+    Description: "Cria o provedor OIDC se ele ainda não existir na conta (true/false)."
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
 Conditions:
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
   ShouldCreateDynamoDB: !Equals [ !Ref CreateDynamoDBTable, "true" ]
 
 Resources:
-  # Provedor OIDC (Só cria se o parâmetro for "true")
+  # 1. Provedor OIDC (Nota: OIDC Provider não suporta Tags via CloudFormation em algumas regiões/versões)
   GithubOidc:
     Type: AWS::IAM::OIDCProvider
     Condition: ShouldCreateOIDC
@@ -52,7 +57,7 @@ Resources:
       ThumbprintList:
         - 6938fd4d98bab03faadb97b34396831e3780aea1
 
-  # Bucket S3 para o Terraform State
+  # 2. Bucket S3 para o Terraform State
   TerraformStateBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -68,8 +73,15 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Ref S3BucketName
+        - Key: User
+          Value: !Ref UserName
+        - Key: Stack
+          Value: !Ref "AWS::StackName"
 
-  # Tabela DynamoDB para State Locking (Opcional)
+  # 3. Tabela DynamoDB para State Locking
   TerraformStateLockTable:
     Type: AWS::DynamoDB::Table
     Condition: ShouldCreateDynamoDB
@@ -82,8 +94,15 @@ Resources:
         - AttributeName: LockID
           KeyType: HASH
       BillingMode: PAY_PER_REQUEST
+      Tags:
+        - Key: Name
+          Value: !Ref DynamoDBTableName
+        - Key: User
+          Value: !Ref UserName
+        - Key: Stack
+          Value: !Ref "AWS::StackName"
 
-  # IAM Role para o GitHub Actions
+  # 4. IAM Role para o GitHub Actions
   GitHubActionsRole:
     Type: AWS::IAM::Role
     Properties:
@@ -102,13 +121,22 @@ Resources:
                 token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:*"
               StringEquals:
                 token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
+      Tags:
+        - Key: Name
+          Value: !Ref IAMRoleName
+        - Key: User
+          Value: !Ref UserName
+        - Key: Stack
+          Value: !Ref "AWS::StackName"
 
 Outputs:
   RoleArn:
     Description: "ARN da Role para usar no GitHub Actions"
     Value: !GetAtt GitHubActionsRole.Arn
   BucketName:
+    Description: "Nome do Bucket S3 criado"
     Value: !Ref TerraformStateBucket
   DynamoDBTable:
     Condition: ShouldCreateDynamoDB
+    Description: "Nome da tabela DynamoDB criada"
     Value: !Ref TerraformStateLockTable
