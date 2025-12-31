@@ -78,7 +78,7 @@ Resources:
           Value: !Ref S3BucketName
         - Key: User
           Value: !Ref UserName
-        - Key: Stack
+        - Key: State
           Value: !Ref "AWS::StackName"
 
   # 3. Tabela DynamoDB para State Locking
@@ -99,7 +99,7 @@ Resources:
           Value: !Ref DynamoDBTableName
         - Key: User
           Value: !Ref UserName
-        - Key: Stack
+        - Key: State
           Value: !Ref "AWS::StackName"
 
   # 4. IAM Role para o GitHub Actions
@@ -126,7 +126,7 @@ Resources:
           Value: !Ref IAMRoleName
         - Key: User
           Value: !Ref UserName
-        - Key: Stack
+        - Key: State
           Value: !Ref "AWS::StackName"
 
 Outputs:
