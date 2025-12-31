@@ -76,7 +76,7 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref S3BucketName
-        - Key: User
+        - Key: CloudmanUser
           Value: !Ref UserName
         - Key: State
           Value: !Ref "AWS::StackName"
@@ -97,7 +97,7 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref DynamoDBTableName
-        - Key: User
+        - Key: CloudmanUser
           Value: !Ref UserName
         - Key: State
           Value: !Ref "AWS::StackName"
@@ -124,7 +124,7 @@ Resources:
       Tags:
         - Key: Name
           Value: !Ref IAMRoleName
-        - Key: User
+        - Key: CloudmanUser
           Value: !Ref UserName
         - Key: State
           Value: !Ref "AWS::StackName"
