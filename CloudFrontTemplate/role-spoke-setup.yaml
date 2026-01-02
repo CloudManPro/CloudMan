@@ -1,0 +1,43 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudMan Spoke Setup: Creates the Cross-Account IAM Role required for the Main Account (Hub) to provision resources in this account.'
+
+Parameters:
+  MainAccountId:
+    Type: String
+    Description: "The AWS Account ID of the CloudMan Main Platform (Hub) where the backend resides."
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: "Must be a valid 12-digit AWS Account ID."
+
+  MainAccountRoleName:
+    Type: String
+    Description: "The specific IAM Role name in the Main Account that executes the Terraform pipeline."
+    Default: "github-actions-terraform-role"
+
+  TargetRoleName:
+    Type: String
+    Description: "The name of the IAM Role to be created in this account (used by the Terraform provider)."
+    Default: "CrossAccountPermitsMain"
+
+Resources:
+  # This is the Role that Terraform (running in the Main Account) will assume
+  TerraformExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref TargetRoleName
+      # AdministratorAccess is required as the user defines dynamic resources
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              # SECURITY ENFORCEMENT: Trust only the specific GitHub Actions Role in the Main Account.
+              # This prevents other admins in the Main Account from accessing this Spoke Account.
+              AWS: !Sub "arn:aws:iam::${MainAccountId}:role/${MainAccountRoleName}"
+            Action: "sts:AssumeRole"
+
+Outputs:
+  TargetRoleArn:
+    Description: "The ARN of the newly created Execution Role. Use this value in your CloudMan manifest or Terraform configuration."
+    Value: !GetAtt TerraformExecutionRole.Arn
