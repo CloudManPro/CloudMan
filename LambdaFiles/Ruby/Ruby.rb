@@ -1,5 +1,5 @@
 require 'json'
 
 def lambda_handler(event:, context:)
-    { statusCode: 200, body: JSON.generate('Hello from CloudMan (Ruby)!') }
+    { statusCode: 200, body: JSON.generate('Hello from CloudMan (Ruby EFGH)!') }
 end
