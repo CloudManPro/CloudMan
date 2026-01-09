@@ -1,4 +1,4 @@
-exports.handler = async (event) => {
+Hexports.handler = async (event) => {
     // TODO: Implement your logic here abcd
     const response = {
         statusCode: 200,
