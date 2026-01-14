@@ -36,8 +36,9 @@ dynamodb = boto3.resource('dynamodb', region_name=Region)
 lambda_client = boto3.client('lambda', region_name=Region)
 sns = boto3.client('sns', region_name=Region)
 s3 = boto3.client('s3')
-LambdaName = os.getenv("LAMBDA_NAME")
-
+LambdaName = os.getenv("LAMBDA_NAME",'')
+if not LambdaName:
+    LambdaName = os.getenv("NAME", '')
 
 # Assuming that xray_enabled is a previously defined boolean variable
 # and that you have already configured X-Ray (for example, with xray_recorder.configure(...))
