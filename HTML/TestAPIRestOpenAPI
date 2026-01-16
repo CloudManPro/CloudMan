@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>CloudMan API Tester</title>
+		<style>
+			:root {
+				--bg-color: #1e1e1e;
+				--card-bg: #252526;
+				--text-color: #d4d4d4;
+				--accent-color: #007acc;
+				--success-color: #4ec9b0;
+				--error-color: #f48771;
+				--border-color: #3e3e42;
+			}
+
+			body {
+				font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+				background-color: var(--bg-color);
+				color: var(--text-color);
+				margin: 0;
+				padding: 20px;
+				display: flex;
+				flex-direction: column;
+				height: 100vh;
+				box-sizing: border-box;
+			}
+
+			h1,
+			h2,
+			h3 {
+				color: #fff;
+				margin-top: 0;
+			}
+
+			/* Layout */
+			.container {
+				display: flex;
+				gap: 20px;
+				flex: 1;
+				overflow: hidden; /* Prevents body scroll */
+				min-height: 0; /* Critical for nested flex scrolling */
+			}
+
+			.controls {
+				flex: 1;
+				display: flex;
+				flex-direction: column;
+				gap: 15px;
+				overflow-y: auto;
+				min-width: 300px; /* Ensures controls don't disappear */
+			}
+
+			.logs-panel {
+				flex: 1;
+				background-color: #000;
+				border: 1px solid var(--border-color);
+				border-radius: 5px;
+				display: flex;
+				flex-direction: column;
+				min-width: 0; /* FIX: Prevents flex child from overflowing container */
+			}
+
+			/* Cards */
+			.card {
+				background-color: var(--card-bg);
+				border: 1px solid var(--border-color);
+				border-radius: 8px;
+				padding: 15px;
+				box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+			}
+
+			/* Inputs */
+			label {
+				display: block;
+				margin-bottom: 5px;
+				font-weight: bold;
+				font-size: 0.9em;
+			}
+			input[type='text'],
+			textarea,
+			select {
+				width: 100%;
+				padding: 8px;
+				background-color: #3c3c3c;
+				border: 1px solid var(--border-color);
+				color: white;
+				border-radius: 4px;
+				box-sizing: border-box;
+				margin-bottom: 10px;
+			}
+			input:focus,
+			textarea:focus {
+				outline: 1px solid var(--accent-color);
+			}
+
+			/* Tabs */
+			.tabs {
+				display: flex;
+				gap: 5px;
+				margin-bottom: 10px;
+			}
+			.tab-btn {
+				background-color: var(--card-bg);
+				border: 1px solid var(--border-color);
+				color: var(--text-color);
+				padding: 10px 20px;
+				cursor: pointer;
+				border-radius: 5px 5px 0 0;
+				flex: 1;
+			}
+			.tab-btn.active {
+				background-color: var(--accent-color);
+				color: white;
+				border-bottom: none;
+				font-weight: bold;
+			}
+
+			/* Modules */
+			.module {
+				display: none;
+			}
+			.module.active {
+				display: block;
+			}
+
+			/* Action Buttons */
+			.actions-grid {
+				display: grid;
+				grid-template-columns: repeat(2, 1fr);
+				gap: 10px;
+			}
+			button.action-btn {
+				padding: 10px;
+				border: none;
+				border-radius: 4px;
+				cursor: pointer;
+				font-weight: bold;
+				transition: background 0.2s;
+				color: #fff;
+			}
+			.btn-get {
+				background-color: #0e639c;
+			} /* Blue */
+			.btn-post {
+				background-color: #2da042;
+			} /* Green */
+			.btn-put {
+				background-color: #d29922;
+			} /* Orange */
+			.btn-delete {
+				background-color: #f85149;
+			} /* Red */
+			.btn-head {
+				background-color: #8b949e;
+			} /* Gray */
+
+			button:hover {
+				filter: brightness(1.1);
+			}
+			button:active {
+				transform: translateY(1px);
+			}
+
+			/* Logs */
+			.logs-header {
+				padding: 10px;
+				background-color: #333;
+				border-bottom: 1px solid var(--border-color);
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+			}
+			#console-output {
+				flex: 1;
+				padding: 10px;
+				overflow-y: auto;
+				font-family: 'Consolas', 'Courier New', monospace;
+				font-size: 0.9em;
+				white-space: pre-wrap; /* Keeps formatting */
+				word-break: break-all; /* FIX: Prevents long strings from breaking layout */
+			}
+			.log-entry {
+				margin-bottom: 10px;
+				border-bottom: 1px dashed #333;
+				padding-bottom: 5px;
+			}
+			.log-time {
+				color: #888;
+				font-size: 0.8em;
+			}
+			.log-method {
+				font-weight: bold;
+				color: var(--accent-color);
+			}
+			.log-status {
+				font-weight: bold;
+			}
+			.status-200 {
+				color: var(--success-color);
+			}
+			.status-error {
+				color: var(--error-color);
+			}
+			.log-body {
+				color: #ce9178;
+				margin-top: 5px;
+			}
+			.log-info {
+				color: #9cdcfe;
+			}
+
+			.hidden {
+				display: none;
+			}
+		</style>
+	</head>
+	<body>
+		<header>
+			<h1>CloudMan API Tester</h1>
+		</header>
+
+		<div class="container">
+			<!-- Left Side: Controls -->
+			<div class="controls">
+				<!-- Global Config -->
+				<div class="card">
+					<h3>1. Global Configuration</h3>
+					<label for="baseUrl">Base URL (API Gateway Stage URL)</label>
+					<input
+						type="text"
+						id="baseUrl"
+						placeholder="https://xyz.execute-api.us-east-1.amazonaws.com/prod"
+						value=""
+					/>
+					<small style="color: #888">Ex: https://ID.execute-api.REGION.amazonaws.com/STAGE</small>
+				</div>
+
+				<!-- Module Selection -->
+				<div class="tabs">
+					<button class="tab-btn active" onclick="switchTab('sqs')">SQS (Queue)</button>
+					<button class="tab-btn" onclick="switchTab('s3')">S3 (Buckets)</button>
+				</div>
+
+				<!-- SQS MODULE -->
+				<div id="module-sqs" class="module card active">
+					<h3>2. SQS Controls</h3>
+					<label for="sqs-path">Resource Path (Queue Name in URL)</label>
+					<input type="text" id="sqs-path" value="/queue" placeholder="/queue" />
+
+					<label for="sqs-message">Message Body (For Sending)</label>
+					<textarea id="sqs-message" rows="3" placeholder="Type your message here...">
+CloudMan Test</textarea
+					>
+
+					<div class="actions-grid">
+						<button class="action-btn btn-post" onclick="execSQS('POST')">SEND (POST)</button>
+						<button class="action-btn btn-put" onclick="execSQS('PUT')">SEND (PUT)</button>
+						<button class="action-btn btn-get" onclick="execSQS('GET')">READ (GET)</button>
+						<button class="action-btn btn-head" onclick="execSQS('HEAD')">STATUS (HEAD)</button>
+						<button class="action-btn btn-delete" onclick="execSQS('DELETE')">
+							DELETE (DELETE)
+						</button>
+					</div>
+					<p style="font-size: 0.8em; color: #888; margin-top: 10px">
+						* To DELETE, perform a GET first. The system captures the 'receiptHandle' automatically.
+					</p>
+					<div
+						id="sqs-handle-display"
+						style="font-size: 0.8em; color: var(--success-color); display: none"
+					>
+						ReceiptHandle Captured! Ready to delete.
+					</div>
+				</div>
+
+				<!-- S3 MODULE -->
+				<div id="module-s3" class="module card">
+					<h3>2. S3 Controls</h3>
+					<label for="s3-path">Resource Path (Bucket + Filename)</label>
+					<div style="display: flex; gap: 5px">
+						<input
+							type="text"
+							id="s3-bucket"
+							value="/resource1"
+							placeholder="/mybucket"
+							style="flex: 1"
+						/>
+						<input
+							type="text"
+							id="s3-filename"
+							value="/test.txt"
+							placeholder="/file.txt"
+							style="flex: 1"
+						/>
+					</div>
+
+					<label for="s3-content">File Content</label>
+					<textarea
+						id="s3-content"
+						rows="4"
+						placeholder="Leave empty to generate random text..."
+					></textarea>
+
+					<div class="actions-grid">
+						<button class="action-btn btn-put" onclick="execS3('PUT')">UPLOAD (PUT)</button>
+						<button class="action-btn btn-post" onclick="execS3('POST')">UPLOAD (POST)</button>
+						<button class="action-btn btn-get" onclick="execS3('GET')">DOWNLOAD (GET)</button>
+						<button class="action-btn btn-head" onclick="execS3('HEAD')">METADATA (HEAD)</button>
+						<button class="action-btn btn-delete" onclick="execS3('DELETE')">
+							DELETE (DELETE)
+						</button>
+					</div>
+				</div>
+			</div>
+
+			<!-- Right Side: Logs -->
+			<div class="logs-panel">
+				<div class="logs-header">
+					<span>Response Console</span>
+					<button
+						onclick="clearLog()"
+						style="background: transparent; border: 1px solid #555; color: #fff; cursor: pointer"
+					>
+						Clear
+					</button>
+				</div>
+				<div id="console-output">
+					<div class="log-entry">
+						<span class="log-info">Ready. Enter Base URL and select a module.</span>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<script>
+			// --- GLOBAL STATE ---
+			let lastReceiptHandle = null;
+
+			// --- UI FUNCTIONS ---
+			function switchTab(tabId) {
+				// Tabs
+				document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+				event.target.classList.add('active');
+
+				// Content
+				document.querySelectorAll('.module').forEach((m) => m.classList.remove('active'));
+				document.getElementById('module-' + tabId).classList.add('active');
+
+				log(`Switched module to: ${tabId.toUpperCase()}`, 'info');
+			}
+
+			function clearLog() {
+				document.getElementById('console-output').innerHTML = '';
+			}
+
+			function log(msg, type = 'normal', details = null) {
+				const consoleDiv = document.getElementById('console-output');
+				const time = new Date().toLocaleTimeString();
+
+				let html = `<div class="log-entry">`;
+				html += `<span class="log-time">[${time}]</span> `;
+
+				if (type === 'error') html += `<span style="color:var(--error-color)">${msg}</span>`;
+				else if (type === 'success')
+					html += `<span style="color:var(--success-color)">${msg}</span>`;
+				else if (type === 'info') html += `<span class="log-info">${msg}</span>`;
+				else html += `<span>${msg}</span>`;
+
+				if (details) {
+					// Use innerText logic for details to prevent HTML injection issues
+					// But we want to allow formatting, so we do rudimentary escaping
+					const safeDetails = details
+						.replace(/&/g, '&amp;')
+						.replace(/</g, '&lt;')
+						.replace(/>/g, '&gt;');
+					html += `<div class="log-body">${safeDetails}</div>`;
+				}
+				html += `</div>`;
+
+				consoleDiv.innerHTML += html;
+				consoleDiv.scrollTop = consoleDiv.scrollHeight;
+			}
+
+			// --- PERSISTENCE LOGIC (FIX: Auto-save/load) ---
+			function initPersistence() {
+				const fields = [
+					'baseUrl',
+					'sqs-path',
+					'sqs-message',
+					's3-bucket',
+					's3-filename',
+					's3-content'
+				];
+
+				fields.forEach((id) => {
+					const el = document.getElementById(id);
+					if (el) {
+						// 1. Load from storage
+						const saved = localStorage.getItem('cloudman_' + id);
+						if (saved !== null) {
+							el.value = saved;
+						}
+
+						// 2. Save on input
+						el.addEventListener('input', (e) => {
+							localStorage.setItem('cloudman_' + id, e.target.value);
+						});
+					}
+				});
+				log('Local storage data loaded.', 'info');
+			}
+
+			// --- CORE REQUEST FUNCTION ---
+			async function makeRequest(method, url, body = null, headers = {}) {
+				log(`Sending ${method} to: ${url}`, 'info');
+
+				const options = {
+					method: method,
+					headers: headers
+				};
+
+				if (body && method !== 'GET' && method !== 'HEAD') {
+					options.body = body;
+				}
+
+				try {
+					const response = await fetch(url, options);
+
+					// Read Headers
+					let headersLog = 'Response Headers:\n';
+					response.headers.forEach((val, key) => (headersLog += `  ${key}: ${val}\n`));
+
+					// Read Body
+					let textData = await response.text();
+					let displayData = textData;
+
+					const statusClass = response.status >= 200 && response.status < 300 ? 'success' : 'error';
+
+					log(
+						`${method} Complete - Status: ${response.status} ${response.statusText}`,
+						statusClass,
+						`${headersLog}\nBody:\n${displayData.substring(0, 2000)}${displayData.length > 2000 ? '...' : ''}`
+					);
+
+					return {
+						ok: response.ok,
+						status: response.status,
+						text: textData,
+						headers: response.headers
+					};
+				} catch (error) {
+					log(`Network/CORS Error: ${error.message}`, 'error');
+					return null;
+				}
+			}
+
+			// --- SQS LOGIC ---
+			async function execSQS(method) {
+				const baseUrl = document.getElementById('baseUrl').value.replace(/\/$/, '');
+				const path = document.getElementById('sqs-path').value;
+
+				if (!baseUrl) {
+					alert('Please configure Base URL first!');
+					return;
+				}
+
+				let url = baseUrl + path;
+				let body = null;
+				let headers = {};
+
+				// Method Prep
+				if (method === 'POST' || method === 'PUT') {
+					body = document.getElementById('sqs-message').value;
+					if (!body) body = 'Auto Test ' + Date.now();
+					headers['Content-Type'] = 'text/plain';
+				}
+
+				if (method === 'DELETE') {
+					if (!lastReceiptHandle) {
+						log(
+							"ERROR: No 'ReceiptHandle' captured. Perform a GET first to pull a message.",
+							'error'
+						);
+						return;
+					}
+					// Add to Query String for AWS Proxy integration usually
+					const encodedHandle = encodeURIComponent(lastReceiptHandle);
+					url += `?receiptHandle=${encodedHandle}`;
+				}
+
+				// Execute
+				const result = await makeRequest(method, url, body, headers);
+
+				// Post-Processing (Capture Handle on GET)
+				if (result && method === 'GET' && result.ok) {
+					// FIX: Handle JSON response seen in screenshot, fallback to XML
+					let receiptHandle = null;
+					let msgBody = '';
+
+					// Try JSON First (as seen in screenshot)
+					try {
+						const json = JSON.parse(result.text);
+						// Structure based on screenshot:
+						// {"ReceiveMessageResponse": {"ReceiveMessageResult": {"messages": [...]}}}
+						const messages = json?.ReceiveMessageResponse?.ReceiveMessageResult?.messages;
+						if (Array.isArray(messages) && messages.length > 0) {
+							receiptHandle = messages[0].ReceiptHandle;
+							msgBody = messages[0].Body;
+						}
+					} catch (e) {
+						// Not JSON, try XML
+						try {
+							const parser = new DOMParser();
+							const xmlDoc = parser.parseFromString(result.text, 'text/xml');
+							const handleNode = xmlDoc.getElementsByTagName('ReceiptHandle')[0];
+							const bodyNode = xmlDoc.getElementsByTagName('Body')[0];
+							if (handleNode) {
+								receiptHandle = handleNode.textContent;
+								msgBody = bodyNode ? bodyNode.textContent : '(no body)';
+							}
+						} catch (e2) {
+							console.error('Parsing error', e2);
+						}
+					}
+
+					if (receiptHandle) {
+						lastReceiptHandle = receiptHandle;
+						document.getElementById('sqs-handle-display').style.display = 'block';
+						document.getElementById('sqs-handle-display').innerText =
+							`Captured Message: "${msgBody}". Handle saved for DELETE.`;
+						log('ReceiptHandle captured successfully.', 'success');
+					} else {
+						document.getElementById('sqs-handle-display').style.display = 'none';
+						log('No message returned (Empty Queue or Timeout).', 'info');
+						lastReceiptHandle = null;
+					}
+				}
+			}
+
+			// --- S3 LOGIC ---
+			async function execS3(method) {
+				const baseUrl = document.getElementById('baseUrl').value.replace(/\/$/, '');
+				const bucketPart = document.getElementById('s3-bucket').value.replace(/\/$/, '');
+				const filePart = document.getElementById('s3-filename').value;
+
+				if (!baseUrl) {
+					alert('Please configure Base URL first!');
+					return;
+				}
+
+				let url = baseUrl + bucketPart + filePart;
+				let body = null;
+				let headers = {};
+
+				if (method === 'PUT' || method === 'POST') {
+					let content = document.getElementById('s3-content').value;
+					if (!content) {
+						content = `File Generated Automatically at ${new Date().toISOString()}\n`;
+						content += `Random ID: ${Math.random().toString(36).substring(7)}`;
+						document.getElementById('s3-content').value = content;
+						log('Content generated automatically.', 'info');
+					}
+					body = content;
+					headers['Content-Type'] = 'text/plain';
+				}
+
+				await makeRequest(method, url, body, headers);
+			}
+
+			// Initialize
+			window.onload = initPersistence;
+		</script>
+	</body>
+</html>
