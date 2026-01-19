@@ -105,7 +105,7 @@ fi
 DISK_DEVICES=$(lsblk -o NAME,SIZE,TYPE,MOUNTPOINT | awk '{if(NR>1)print}')
 
 # Create the HTML page with instance information, private IP address, and IPv6 address
-echo "<!DOCTYPE html>" >/var/www/html/index.html
+echo "<!DOCTYPE html>" >>/var/www/html/index.html
 echo "<html>" >>/var/www/html/index.html
 echo "<head>" >>/var/www/html/index.html
 echo "  <title>EC2 Instance Information</title>" >>/var/www/html/index.html
