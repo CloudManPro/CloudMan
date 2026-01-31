@@ -18,8 +18,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # ESTE PASSO NOVO CONVERTE O NOME PARA MINÚSCULO
+      - name: Lowercase repo name
+        run: |
+          echo "IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/ec2hub" | tr '[:upper:]' '[:lower:]' >> $GITHUB_ENV
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -31,9 +33,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./Docker/TaskHub/ # Pasta onde está o Dockerfile e o EC2Hub.py
+          context: ./Docker/TaskHub/
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/ec2hub:latest
-            ghcr.io/${{ github.repository_owner }}/ec2hub:${{ github.sha }}
-          # O context garante que o Docker encontre o requirements.txt e o EC2Hub.py
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
