@@ -19,6 +19,7 @@ import time # Importar time para a lógica de espera
 
 # (O restante das importações e configurações iniciais permanecem as mesmas)
 # ...
+#v4 2
 try:
     import watchtower
 except ImportError:
