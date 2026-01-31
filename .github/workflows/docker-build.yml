@@ -1,11 +1,11 @@
-name: Build and Push Docker Image to GHCR
+name: Build and Push Docker Image
 
 on:
   push:
     branches:
-      - main  # Ou a sua branch principal
+      - main
     paths:
-      - 'Docker/TaskHub/**' # Dispara apenas se houver mudanças nesta pasta
+      - 'Docker/TaskHub/**'
 
 jobs:
   build-and-push:
@@ -18,10 +18,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ESTE PASSO NOVO CONVERTE O NOME PARA MINÚSCULO
-      - name: Lowercase repo name
-        run: |
-          echo "IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/ec2hub" | tr '[:upper:]' '[:lower:]' >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -34,7 +32,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: ./Docker/TaskHub/
+          file: ./Docker/TaskHub/Dockerfile
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ghcr.io/cloudmanpro/ec2hub:latest
+            ghcr.io/cloudmanpro/ec2hub:${{ github.sha }}
