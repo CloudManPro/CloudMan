@@ -3,7 +3,7 @@ import datetime
 import sys
 
 print("--- Iniciando o Container de Teste de Logs ---")
-# O flush garante que o log apareça no CloudWatch sem atrasos
+# O flush garante que o log apareça no CloudWatch sem atrasos  v
 sys.stdout.flush()
 
 while True:
