@@ -1,0 +1,13 @@
+# Imagem super leve (cerca de 40MB a 50MB)
+FROM python:3.9-slim
+
+# Evita que o Python armazene logs em buffer (essencial para Docker/ECS)
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Copia apenas o script de teste
+COPY test_logs.py .
+
+# Comando para rodar o script
+CMD ["python", "test_logs.py"]
