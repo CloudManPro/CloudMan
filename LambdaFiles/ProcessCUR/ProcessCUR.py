@@ -17,6 +17,17 @@ USAGE_TYPE_COLUMN = 'lineItem/UsageType'
 USAGE_START_DATE_COLUMN = 'lineItem/UsageStartDate'
 USAGE_ACCOUNT_COLUMN = 'lineItem/UsageAccountId'
 
+# BUG CORRIGIDO (custo de IPv4 público perdido em "Untagged"): a AWS cobra
+# endereços IPv4 públicos sob o produto "AmazonVPC", ligado ao ENI/EIP que
+# efetivamente carrega o IP -- não ao recurso que "usa" esse IP (ex. um ALB).
+# Essa linha de custo quase nunca vem com a cost-allocation tag do recurso
+# dono, então sempre caía em "Untagged" e se perdia. O CUR já é gerado com
+# `additional_schema_elements = ["RESOURCES"]` (ver Terraform), então a
+# coluna abaixo já existe no CSV -- só não estava sendo lida.
+RESOURCE_ID_COLUMN = 'lineItem/ResourceId'
+UNTAGGABLE_PRODUCT_CODE = 'AmazonVPC'
+UNTAGGABLE_USAGE_TYPE_PATTERN = 'PublicIPv4'
+
 CUR_BUCKET_NAME_FALLBACK = os.environ.get('AWS_S3_BUCKET_NAME_0') or os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0')
 CONSOLIDATED_BUCKET_NAME = os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0') or CUR_BUCKET_NAME_FALLBACK
 CONSOLIDATED_KEY = os.getenv("CONSOLIDATED_KEY", "consolidated-costs/daily_costs_by_tag.json")
@@ -40,6 +51,10 @@ except ValueError:
     MONTHS_TO_RETAIN = 24
 
 s3_client = boto3.client('s3')
+# Novos clientes -- só leitura (Describe*), usados exclusivamente pra
+# resolver o dono real de um ENI/EIP não tagueado (ver resolve_untagged_resource_name).
+ec2_client = boto3.client('ec2')
+elbv2_client = boto3.client('elbv2')
 
 def decimal_default(obj):
     if isinstance(obj, Decimal): return str(obj)
@@ -51,33 +66,41 @@ def load_consolidated_data(bucket, key):
         content = response['Body'].read().decode('utf-8')
         print(f"Successfully loaded existing consolidated file from s3://{bucket}/{key}")
         data = json.loads(content)
-        
+
         # --- Compatibilidade e Migração Retroativa ---
         if "costs_by_tag_and_date" in data:
             print("Migrating deprecated 'costs_by_tag_and_date' structure to split layout.")
             data["daily_costs"] = data.pop("costs_by_tag_and_date")
-            
+
         if "daily_costs" not in data:
             data["daily_costs"] = {}
         if "monthly_costs" not in data:
             data["monthly_costs"] = {}
-            
+        # NOVO: índice secundário por resourceId (ARN/ENI/EIP), só populado
+        # pra linhas SEM tag de custo -- ver process_single_csv_file. Permite
+        # o frontend achar custo real de recursos importados que nunca
+        # ganharam a cost-allocation tag na AWS, casando pelo ARN salvo no
+        # próprio nó em vez da tag.
+        if "resources_by_id" not in data:
+            data["resources_by_id"] = {}
+
         return data
     except s3_client.exceptions.NoSuchKey:
         print(f"Consolidated file not found at s3://{bucket}/{key}. Initializing new structure.")
         return {
             "metadata": {
                 "description": f"Daily costs (last {DAYS_TO_RETAIN} days) and monthly costs (last {MONTHS_TO_RETAIN} months) aggregated by tag '{RESOURCE_TAG_KEY}'.",
-                "tag_key_used": RESOURCE_TAG_KEY, 
+                "tag_key_used": RESOURCE_TAG_KEY,
                 "days_retained": DAYS_TO_RETAIN,
                 "months_retained": MONTHS_TO_RETAIN,
-                "last_processed_cur_date": None, 
+                "last_processed_cur_date": None,
                 "last_processed_assembly_id": None,
-                "last_updated_timestamp_utc": None, 
-                "currency_code": None 
+                "last_updated_timestamp_utc": None,
+                "currency_code": None
             },
             "daily_costs": {},
-            "monthly_costs": {}
+            "monthly_costs": {},
+            "resources_by_id": {}
         }
     except Exception as e:
         print(f"ERROR: Failed to load consolidated data from s3://{bucket}/{key}. Error: {e}")
@@ -102,14 +125,154 @@ def read_manifest_file(bucket, key):
         print(f"ERROR: Failed to read manifest file: {e}")
         raise
 
-def process_single_csv_file(bucket_name, object_key, fallback_date):
+
+def _get_name_tag(tags):
+    """Extrai a tag 'Name' de uma lista de tags no formato [{'Key':..,'Value':..}, ...]
+    (formato comum a EC2/ELBv2/NAT Gateway). Retorna None se não achar."""
+    for t in (tags or []):
+        if t.get('Key') == 'Name':
+            return t.get('Value')
+    return None
+
+
+def _resolve_via_eni(eni_id):
+    """Resolve a tag 'Name' do recurso DONO de um ENI (eni-...) sem tag
+    própria no CUR -- caso típico de IP público de EC2 ou de um Load
+    Balancer (o ALB/NLB não expõe um ENI "seu" diretamente pro usuário,
+    mas a AWS gerencia ENIs internos com uma Description identificável)."""
+    resp = ec2_client.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
+    interfaces = resp.get('NetworkInterfaces', [])
+    if not interfaces:
+        return None
+    eni = interfaces[0]
+
+    # Caso 1: ENI pertence diretamente a uma instância EC2 (IP público
+    # atribuído à própria instância) -- pega a tag Name da instância.
+    instance_id = eni.get('Attachment', {}).get('InstanceId')
+    if instance_id:
+        tags_resp = ec2_client.describe_tags(
+            Filters=[
+                {'Name': 'resource-id', 'Values': [instance_id]},
+                {'Name': 'key', 'Values': ['Name']}
+            ]
+        )
+        for t in tags_resp.get('Tags', []):
+            if t.get('Key') == 'Name':
+                return t.get('Value')
+        return None
+
+    # Caso 2: ENI gerenciado por um Load Balancer -- a Description vem no
+    # formato "ELB app/<lb-name>/<id>" (ALB) ou "ELB net/<lb-name>/<id>" (NLB).
+    # NOTA: <lb-name> aqui é o nome "cru" do recurso na AWS, que pode não
+    # bater com a tag lógica ("Name") usada no resto do app -- por isso
+    # resolvemos o ARN e buscamos a tag Name de verdade, em vez de usar o
+    # nome cru direto.
+    description = eni.get('Description', '')
+    match = re.search(r'ELB (?:app|net)/([^/]+)/', description)
+    if match:
+        lb_name = match.group(1)
+        try:
+            lb_resp = elbv2_client.describe_load_balancers(Names=[lb_name])
+            lbs = lb_resp.get('LoadBalancers', [])
+            if lbs:
+                lb_arn = lbs[0]['LoadBalancerArn']
+                tags_resp = elbv2_client.describe_tags(ResourceArns=[lb_arn])
+                for td in tags_resp.get('TagDescriptions', []):
+                    name = _get_name_tag(td.get('Tags'))
+                    if name:
+                        return name
+        except Exception as e:
+            print(f"WARN: Falha ao resolver Load Balancer '{lb_name}' a partir do ENI '{eni_id}': {e}")
+
+    return None
+
+
+def _resolve_via_eip(allocation_id):
+    """Resolve a tag 'Name' do recurso DONO de um Elastic IP (eipalloc-...)
+    sem tag própria -- caso típico do IP público de um NAT Gateway."""
+    resp = ec2_client.describe_addresses(AllocationIds=[allocation_id])
+    addresses = resp.get('Addresses', [])
+    if not addresses:
+        return None
+    address = addresses[0]
+
+    # Caso mais comum: EIP associado a um NAT Gateway.
+    network_interface_id = address.get('NetworkInterfaceId')
+    if network_interface_id:
+        nat_resp = ec2_client.describe_nat_gateways(
+            Filter=[{'Name': 'network-interface-id', 'Values': [network_interface_id]}]
+        )
+        for nat in nat_resp.get('NatGateways', []):
+            name = _get_name_tag(nat.get('Tags'))
+            if name:
+                return name
+
+    # Fallback: a própria EIP pode estar tagueada diretamente.
+    return _get_name_tag(address.get('Tags'))
+
+
+def resolve_untagged_resource_name(resource_id, cache):
+    """Tenta descobrir a tag 'Name' do recurso DONO de um resourceId de rede
+    (ENI ou EIP) que não veio com tag própria no CUR -- caso típico do IPv4
+    público, cobrado sob AmazonVPC mas usado por outro recurso (ALB, NAT
+    Gateway, EC2). Retorna None se não conseguir resolver -- nesse caso a
+    linha cai em "Untagged", exatamente o comportamento de antes desta
+    correção (nunca quebra o processamento por causa disso).
+
+    `cache` é um dict compartilhado entre TODOS os arquivos CSV de um mesmo
+    manifesto -- o mesmo ENI/EIP costuma se repetir em várias linhas/dias,
+    evita bater na API da AWS de novo pro mesmo resourceId."""
+    if resource_id in cache:
+        return cache[resource_id]
+
+    resolved_name = None
+    try:
+        if resource_id.startswith('eni-'):
+            resolved_name = _resolve_via_eni(resource_id)
+        elif resource_id.startswith('eipalloc-'):
+            resolved_name = _resolve_via_eip(resource_id)
+    except Exception as e:
+        print(f"WARN: Falha ao resolver resourceId '{resource_id}': {e}")
+
+    cache[resource_id] = resolved_name
+    return resolved_name
+
+
+def _accumulate_cost_entry(target_dict, key_value, usage_date, product_code, usage_key, cost):
+    """Soma `cost` na estrutura padrão `{key_value: {date: {TotalUnblendedCost,
+    CostsByProduct}}}`, criando os níveis que faltarem. Compartilhado entre o
+    índice por TAG e o índice novo por resourceId -- mesmo formato, evita
+    duplicar a lógica de acumulação duas vezes."""
+    if key_value not in target_dict:
+        target_dict[key_value] = {}
+    if usage_date not in target_dict[key_value]:
+        target_dict[key_value][usage_date] = {
+            "TotalUnblendedCost": Decimal('0.0'),
+            "CostsByProduct": {}
+        }
+
+    target_dict[key_value][usage_date]['TotalUnblendedCost'] += cost
+
+    costs_by_product = target_dict[key_value][usage_date]['CostsByProduct']
+    if product_code not in costs_by_product:
+        costs_by_product[product_code] = {}
+    costs_by_usage = costs_by_product[product_code]
+    if usage_key not in costs_by_usage:
+        costs_by_usage[usage_key] = Decimal('0.0')
+    costs_by_usage[usage_key] += cost
+
+
+def process_single_csv_file(bucket_name, object_key, fallback_date, resource_name_cache):
     daily_costs_by_tag = {}
+    # NOVO: índice secundário por resourceId, só preenchido pra linhas que
+    # ficam SEM tag (ver loop abaixo) -- ver comentário em load_consolidated_data.
+    daily_costs_by_resource_id = {}
     currency_code = None
     body = None
     text_stream = None
-    
+
     print(f"Processing data part: s3://{bucket_name}/{object_key}")
-    
+
     try:
         s3_object = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         body = s3_object['Body']
@@ -140,54 +303,62 @@ def process_single_csv_file(bucket_name, object_key, fallback_date):
             else:
                 usage_date = fallback_date or "UnknownDate"
 
+            product_code = row.get(PRODUCT_COLUMN) or 'UnknownProduct'
+            usage_type = row.get(USAGE_TYPE_COLUMN) or 'UnknownUsageType'
+            # Lido incondicionalmente (não só no caso do IPv4) -- precisa
+            # estar disponível pro índice novo por resourceId logo abaixo,
+            # pra QUALQUER linha que acabe sem tag, não só a de IPv4.
+            resource_id = row.get(RESOURCE_ID_COLUMN)
+
             tag_value = row.get(RESOURCE_TAG_KEY)
-            if not tag_value: 
-                tag_value = "Untagged"
+            if not tag_value:
+                # BUG CORRIGIDO: custo de IPv4 público (cobrado sob AmazonVPC,
+                # ligado ao ENI/EIP, não ao recurso que o usa) sempre caía
+                # aqui em "Untagged" -- perdido pra sempre, mesmo sendo custo
+                # real do ALB/NAT/EC2 dono do IP. Resolve o dono via API da
+                # AWS, processado perto do dia real (preserva o histórico com
+                # muito mais precisão do que reconstruir depois a partir da
+                # config atual do recurso).
+                if (
+                    resource_id
+                    and product_code == UNTAGGABLE_PRODUCT_CODE
+                    and UNTAGGABLE_USAGE_TYPE_PATTERN in usage_type
+                ):
+                    resolved_name = resolve_untagged_resource_name(resource_id, resource_name_cache)
+                    tag_value = resolved_name or "Untagged"
+                else:
+                    tag_value = "Untagged"
 
             cost_str = row.get(COST_COLUMN)
             try:
                 cost = Decimal(cost_str) if cost_str else Decimal('0.0')
-            except (InvalidOperation, TypeError): 
+            except (InvalidOperation, TypeError):
                 cost = Decimal('0.0')
-            
-            if cost == Decimal('0.0'): 
+
+            if cost == Decimal('0.0'):
                 continue
-            
-            product_code = row.get(PRODUCT_COLUMN) or 'UnknownProduct'
-            usage_type = row.get(USAGE_TYPE_COLUMN) or 'UnknownUsageType'
-            
+
             # Captura a conta ativa correspondente ao uso
             active_account = row.get(USAGE_ACCOUNT_COLUMN) or 'UnknownAccount'
-            
-            if tag_value not in daily_costs_by_tag:
-                daily_costs_by_tag[tag_value] = {}
-            
-            if usage_date not in daily_costs_by_tag[tag_value]:
-                daily_costs_by_tag[tag_value][usage_date] = {
-                    "TotalUnblendedCost": Decimal('0.0'),
-                    "CostsByProduct": {}
-                }
-            
-            daily_costs_by_tag[tag_value][usage_date]['TotalUnblendedCost'] += cost
-            
-            if product_code not in daily_costs_by_tag[tag_value][usage_date]['CostsByProduct']:
-                daily_costs_by_tag[tag_value][usage_date]['CostsByProduct'][product_code] = {}
-            
-            costs_by_usage = daily_costs_by_tag[tag_value][usage_date]['CostsByProduct'][product_code]
-            
-            # Combina o tipo de uso com a respectiva conta de consumo ativa
             usage_key = f"{usage_type}@{active_account}"
-            
-            if usage_key not in costs_by_usage: 
-                costs_by_usage[usage_key] = Decimal('0.0')
-            costs_by_usage[usage_key] += cost
+
+            _accumulate_cost_entry(daily_costs_by_tag, tag_value, usage_date, product_code, usage_key, cost)
+
+            # NOVO: linha ainda SEM tag (recurso importado sem cost-allocation
+            # tag na AWS, ou resolução de IPv4 acima não achou dono) mas COM
+            # resourceId -- indexa também por resourceId, pro frontend poder
+            # casar pelo ARN salvo no nó quando a busca por tag falhar.
+            if tag_value == "Untagged" and resource_id:
+                _accumulate_cost_entry(
+                    daily_costs_by_resource_id, resource_id, usage_date, product_code, usage_key, cost
+                )
 
         print(f"Finished parsing part. Total rows scanned: {processed_rows}.")
-        return daily_costs_by_tag, currency_code
+        return daily_costs_by_tag, daily_costs_by_resource_id, currency_code
 
     except Exception as e:
         print(f"Error parsing file part {object_key}: {e}")
-        return {}, None
+        return {}, {}, None
     finally:
         if text_stream and not text_stream.closed:
             try: text_stream.close()
@@ -196,6 +367,67 @@ def process_single_csv_file(bucket_name, object_key, fallback_date):
              try: body.close()
              except Exception: pass
 
+def merge_batch_into_temp(temp_dict, csv_costs, touched_months):
+    """Mescla o lote de UM arquivo CSV (`csv_costs`, no formato
+    `{key: {date: {...}}}`) no acumulador temporário do manifesto inteiro.
+    Compartilhada entre o índice por TAG e o índice novo por resourceId --
+    mesma lógica de mesclagem, só o dicionário-alvo muda."""
+    for key_value, dates_dict in csv_costs.items():
+        if key_value not in temp_dict:
+            temp_dict[key_value] = {}
+        for d_str, day_data in dates_dict.items():
+            touched_months.add(d_str[:7])  # Captura formato YYYY-MM
+            if d_str not in temp_dict[key_value]:
+                temp_dict[key_value][d_str] = day_data
+            else:
+                existing_total = temp_dict[key_value][d_str]["TotalUnblendedCost"]
+                new_total = day_data["TotalUnblendedCost"]
+                temp_dict[key_value][d_str]["TotalUnblendedCost"] = existing_total + new_total
+
+                for prod_code, prod_data in day_data["CostsByProduct"].items():
+                    if prod_code not in temp_dict[key_value][d_str]["CostsByProduct"]:
+                        temp_dict[key_value][d_str]["CostsByProduct"][prod_code] = prod_data
+                    else:
+                        for usage_type, cost_val in prod_data.items():
+                            existing_val = temp_dict[key_value][d_str]["CostsByProduct"][prod_code].get(usage_type, Decimal('0.0'))
+                            temp_dict[key_value][d_str]["CostsByProduct"][prod_code][usage_type] = existing_val + cost_val
+
+
+def prune_daily_structure(consolidated_data, structure_key, cutoff_date):
+    """Remove datas mais velhas que `cutoff_date` de
+    `consolidated_data[structure_key]` (formato `{key: {date: {...}}}`),
+    removendo também chaves que ficarem vazias. Compartilhada entre
+    `daily_costs` (por tag) e `resources_by_id` (novo, por resourceId) --
+    mesma janela de retenção de 60 dias pros dois. Retorna quantas datas
+    foram removidas."""
+    removed_count = 0
+    empty_keys = []
+
+    for key_value in list(consolidated_data[structure_key].keys()):
+        dates_to_delete = []
+        date_data = consolidated_data[structure_key][key_value]
+
+        for date_str in date_data.keys():
+            try:
+                data_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                if data_date < cutoff_date:
+                    dates_to_delete.append(date_str)
+            except ValueError:
+                continue
+
+        for date_to_delete in dates_to_delete:
+            del consolidated_data[structure_key][key_value][date_to_delete]
+            removed_count += 1
+
+        if not consolidated_data[structure_key][key_value]:
+            empty_keys.append(key_value)
+
+    for key_to_delete in empty_keys:
+        del consolidated_data[structure_key][key_to_delete]
+
+    return removed_count
+
+
 def rebuild_monthly_costs(consolidated_data, touched_months):
     """
     Sincroniza os custos mensais agregados com base nos dados diários.
@@ -203,7 +435,7 @@ def rebuild_monthly_costs(consolidated_data, touched_months):
     """
     daily = consolidated_data.get("daily_costs", {})
     monthly = consolidated_data.setdefault("monthly_costs", {})
-    
+
     for tag_value, dates_dict in daily.items():
         tag_monthly = monthly.setdefault(tag_value, {})
         for month_str in touched_months:
@@ -213,19 +445,19 @@ def rebuild_monthly_costs(consolidated_data, touched_months):
                 # Se não existem mais dados diários na janela de retenção de 60 dias,
                 # não sobrescrevemos o histórico do mês consolidado do passado
                 continue
-                
+
             total_unblended = Decimal('0.0')
             products = {}
-            
+
             for d_str, day_data in month_dates.items():
                 cost_val = day_data.get("TotalUnblendedCost", "0.0")
                 total_unblended += Decimal(str(cost_val))
-                
+
                 for prod_code, prod_data in day_data.get("CostsByProduct", {}).items():
                     prod_entry = products.setdefault(prod_code, {})
                     for usage_type, cost_str in prod_data.items():
                         prod_entry[usage_type] = prod_entry.get(usage_type, Decimal('0.0')) + Decimal(str(cost_str))
-            
+
             # Atualiza/Insere o mês consolidado com valores normalizados em string
             tag_monthly[month_str] = {
                 "TotalUnblendedCost": str(total_unblended),
@@ -269,7 +501,7 @@ def lambda_handler(event, context):
 
     assembly_id = manifest.get("assemblyId", "UnknownAssembly")
     report_keys = manifest.get("reportKeys", [])
-    
+
     # Captura o ID da conta pagadora do manifesto
     payer_account_id = manifest.get("payerAccountId", "UnknownAccount")
 
@@ -288,37 +520,30 @@ def lambda_handler(event, context):
 
     # 2. Processar e agrupar novos dados diários em lote
     temp_aggregated_costs = {}
+    # NOVO: acumulador temporário do índice por resourceId (só linhas sem tag).
+    temp_aggregated_resource_costs = {}
     final_currency_code = None
     touched_months = set()
+    # Compartilhado entre TODOS os arquivos CSV deste manifesto -- ver
+    # resolve_untagged_resource_name.
+    resource_name_cache = {}
 
     for csv_key in report_keys:
-        csv_costs, csv_currency = process_single_csv_file(cur_bucket_name, csv_key, processing_date_str)
+        csv_costs, csv_resource_costs, csv_currency = process_single_csv_file(
+            cur_bucket_name, csv_key, processing_date_str, resource_name_cache
+        )
         if csv_currency:
             final_currency_code = csv_currency
 
-        # Mesclar no lote temporário
-        for tag, dates_dict in csv_costs.items():
-            if tag not in temp_aggregated_costs:
-                temp_aggregated_costs[tag] = {}
-            for d_str, day_data in dates_dict.items():
-                touched_months.add(d_str[:7]) # Captura formato YYYY-MM
-                if d_str not in temp_aggregated_costs[tag]:
-                    temp_aggregated_costs[tag][d_str] = day_data
-                else:
-                    existing_total = temp_aggregated_costs[tag][d_str]["TotalUnblendedCost"]
-                    new_total = day_data["TotalUnblendedCost"]
-                    temp_aggregated_costs[tag][d_str]["TotalUnblendedCost"] = existing_total + new_total
-                    
-                    for prod_code, prod_data in day_data["CostsByProduct"].items():
-                        if prod_code not in temp_aggregated_costs[tag][d_str]["CostsByProduct"]:
-                            temp_aggregated_costs[tag][d_str]["CostsByProduct"][prod_code] = prod_data
-                        else:
-                            for usage_type, cost_val in prod_data.items():
-                                existing_val = temp_aggregated_costs[tag][d_str]["CostsByProduct"][prod_code].get(usage_type, Decimal('0.0'))
-                                temp_aggregated_costs[tag][d_str]["CostsByProduct"][prod_code][usage_type] = existing_val + cost_val
+        merge_batch_into_temp(temp_aggregated_costs, csv_costs, touched_months)
+        # NOVO: mesmo tratamento pro índice por resourceId -- usa um `set()`
+        # descartável pra `touched_months` porque essa estrutura não tem
+        # agregação mensal própria (só o índice por tag tem).
+        merge_batch_into_temp(temp_aggregated_resource_costs, csv_resource_costs, set())
 
     # Serializar decimais temporários para float/string
     daily_costs_data = json.loads(json.dumps(temp_aggregated_costs, default=decimal_default))
+    resource_costs_data = json.loads(json.dumps(temp_aggregated_resource_costs, default=decimal_default))
 
     # 3. Carregar dados consolidados existentes do S3
     try:
@@ -335,6 +560,14 @@ def lambda_handler(event, context):
         for date_str, day_data in dates_dict.items():
             consolidated_data[daily_key][tag_value][date_str] = day_data
         updated_tags_count += 1
+
+    # NOVO: mesma mesclagem pro índice novo "resources_by_id".
+    resources_key = 'resources_by_id'
+    for resource_id_value, dates_dict in resource_costs_data.items():
+        if resource_id_value not in consolidated_data[resources_key]:
+            consolidated_data[resources_key][resource_id_value] = {}
+        for date_str, day_data in dates_dict.items():
+            consolidated_data[resources_key][resource_id_value][date_str] = day_data
 
     # 5. Sincronizar custos agregados mensais dos meses afetados
     rebuild_monthly_costs(consolidated_data, touched_months)
@@ -356,38 +589,18 @@ def lambda_handler(event, context):
         reference_date = datetime.now(timezone.utc).date()
         print(f"Reference date falling back to current date: {reference_date}")
 
-    # 7. Podar dados diários antigos (Mais velhos que 60 dias)
+    # 7. Podar dados diários antigos (Mais velhos que 60 dias) -- mesma janela
+    # aplicada aos dois índices (por tag e, agora, por resourceId).
     print(f"Starting pruning of daily data older than {DAYS_TO_RETAIN} days...")
     cutoff_date = reference_date - timedelta(days=DAYS_TO_RETAIN)
-    dates_removed_count = 0
-    empty_daily_tags = []
-
-    for tag_value in list(consolidated_data[daily_key].keys()):
-        dates_to_delete = []
-        tag_date_data = consolidated_data[daily_key][tag_value]
-        
-        for date_str in tag_date_data.keys():
-            try:
-                data_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                if data_date < cutoff_date:
-                    dates_to_delete.append(date_str)
-            except ValueError:
-                continue
-                
-        for date_to_delete in dates_to_delete:
-            del consolidated_data[daily_key][tag_value][date_to_delete]
-            dates_removed_count += 1
-                
-        if not consolidated_data[daily_key][tag_value]:
-            empty_daily_tags.append(tag_value)
-
-    for tag_to_delete in empty_daily_tags:
-        del consolidated_data[daily_key][tag_to_delete]
+    dates_removed_count = prune_daily_structure(consolidated_data, daily_key, cutoff_date)
+    resource_dates_removed_count = prune_daily_structure(consolidated_data, resources_key, cutoff_date)
+    print(f"Pruned {dates_removed_count} daily_costs entries and {resource_dates_removed_count} resources_by_id entries.")
 
     # 8. Podar dados mensais consolidados antigos (Mais velhos que 24 meses)
     monthly_key = 'monthly_costs'
     months_removed_count = 0
-    
+
     # Calcular limite de corte de 24 meses atrás baseado na referência
     ref_year = reference_date.year
     ref_month = reference_date.month
@@ -406,11 +619,11 @@ def lambda_handler(event, context):
             for m_str in consolidated_data[monthly_key][tag_value].keys():
                 if m_str < cutoff_month_str:
                     months_to_delete.append(m_str)
-            
+
             for m_to_delete in months_to_delete:
                 del consolidated_data[monthly_key][tag_value][m_to_delete]
                 months_removed_count += 1
-                
+
             if not consolidated_data[monthly_key][tag_value]:
                 del consolidated_data[monthly_key][tag_value]
 
@@ -434,7 +647,9 @@ def lambda_handler(event, context):
         'body': json.dumps({
             'message': 'Consolidated cost data updated successfully.',
             'tags_updated': updated_tags_count,
+            'resource_ids_updated': len(resource_costs_data),
             'daily_dates_removed': dates_removed_count,
+            'resource_dates_removed': resource_dates_removed_count,
             'monthly_records_removed': months_removed_count
         })
     }
