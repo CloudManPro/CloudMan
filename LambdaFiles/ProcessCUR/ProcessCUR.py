@@ -15,6 +15,7 @@ COST_COLUMN = 'lineItem/UnblendedCost'
 PRODUCT_COLUMN = 'lineItem/ProductCode'
 USAGE_TYPE_COLUMN = 'lineItem/UsageType'
 USAGE_START_DATE_COLUMN = 'lineItem/UsageStartDate'
+USAGE_ACCOUNT_COLUMN = 'lineItem/UsageAccountId'
 
 CUR_BUCKET_NAME_FALLBACK = os.environ.get('AWS_S3_BUCKET_NAME_0') or os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0')
 CONSOLIDATED_BUCKET_NAME = os.environ.get('AWS_S3_BUCKET_TARGET_NAME_0') or CUR_BUCKET_NAME_FALLBACK
@@ -155,6 +156,9 @@ def process_single_csv_file(bucket_name, object_key, fallback_date):
             product_code = row.get(PRODUCT_COLUMN) or 'UnknownProduct'
             usage_type = row.get(USAGE_TYPE_COLUMN) or 'UnknownUsageType'
             
+            # Captura a conta ativa correspondente ao uso
+            active_account = row.get(USAGE_ACCOUNT_COLUMN) or 'UnknownAccount'
+            
             if tag_value not in daily_costs_by_tag:
                 daily_costs_by_tag[tag_value] = {}
             
@@ -170,9 +174,13 @@ def process_single_csv_file(bucket_name, object_key, fallback_date):
                 daily_costs_by_tag[tag_value][usage_date]['CostsByProduct'][product_code] = {}
             
             costs_by_usage = daily_costs_by_tag[tag_value][usage_date]['CostsByProduct'][product_code]
-            if usage_type not in costs_by_usage: 
-                costs_by_usage[usage_type] = Decimal('0.0')
-            costs_by_usage[usage_type] += cost
+            
+            # Combina o tipo de uso com a respectiva conta de consumo ativa
+            usage_key = f"{usage_type}@{active_account}"
+            
+            if usage_key not in costs_by_usage: 
+                costs_by_usage[usage_key] = Decimal('0.0')
+            costs_by_usage[usage_key] += cost
 
         print(f"Finished parsing part. Total rows scanned: {processed_rows}.")
         return daily_costs_by_tag, currency_code
@@ -261,6 +269,10 @@ def lambda_handler(event, context):
 
     assembly_id = manifest.get("assemblyId", "UnknownAssembly")
     report_keys = manifest.get("reportKeys", [])
+    
+    # Captura o ID da conta pagadora do manifesto
+    payer_account_id = manifest.get("payerAccountId", "UnknownAccount")
+
 
     if not report_keys:
         print("WARNING: No report keys to process inside the manifest.")
