@@ -1,5 +1,14 @@
+# Onboarding stack the customer opens from the GitOps Workspace deep link
+# (AgentV2.GenerateConnectionLinkTerraformBackend).
+#
+# PUBLISHED AT:
+#   s3://struct8-public-cloudformation-templates/TerraformBackend.yml
+# Editing this file changes nothing until that object is replaced.
+#
+# Blast radius of a change here: new stacks only. An account onboarded earlier keeps
+# the role it already has until someone updates its stack.
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Template for Terraform Backend with OIDC GitHub Actions. Creates S3 and DynamoDB only if requested.
+Description: Terraform backend with GitHub Actions OIDC. Creates S3 and DynamoDB only if requested.
 
 Parameters:
   UserName:
@@ -49,6 +58,18 @@ Parameters:
   GitHubRepo:
     Description: "Authorized GitHub repository."
     Type: String
+
+  GitHubSubject:
+    Description: >-
+      Which GitHub Actions workflow run may use this role. Struct8 deploys from the
+      main branch, which is the default. Accepted forms: ref:refs/heads/<branch>,
+      ref:refs/tags/<tag>, environment:<name>. Wildcards are rejected: a value such
+      as * would let a workflow run from any branch of the repository use this role.
+    Type: String
+    Default: "ref:refs/heads/main"
+    AllowedPattern: '^(ref:refs/(heads|tags)/[A-Za-z0-9._\-\/]+|environment:[A-Za-z0-9 ._\-]+)$'
+    ConstraintDescription: >-
+      Must be ref:refs/heads/<branch>, ref:refs/tags/<tag> or environment:<name>.
 
 Conditions:
   ShouldCreateS3: !Equals [ !Ref CreateS3Bucket, "true" ]
@@ -127,16 +148,61 @@ Resources:
           - Effect: Allow
             Principal:
               # Fixes Race Condition: Creates implicit dependency only if OIDC is created in the Stack
-              Federated: !If 
+              Federated: !If
                 - ShouldCreateOIDC
                 - !Ref GithubOidc
                 - !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
             Action: "sts:AssumeRoleWithWebIdentity"
+            # Both claims are matched exactly. `sub` was `repo:<org>/<repo>:*` until
+            # 2026-08-05, which accepted a run from ANY ref of the repository -- with
+            # AdministratorAccess attached, a pushed branch was enough to reach the
+            # whole account. Struct8 only ever deploys from main (both push paths
+            # hardcode it), so exact matching removes reach without removing use.
             Condition:
-              StringLike:
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:*"
               StringEquals:
                 token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
+      Policies:
+        # Explicit Deny beats the Allow in AdministratorAccess. Scoped to the two
+        # objects that ARE this role's own trust, plus audit tampering -- everything
+        # else stays open, because Terraform legitimately manages IAM users, EKS OIDC
+        # providers and the rest of the account.
+        - PolicyName: Struct8ProtectOwnTrust
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Without this, a deploy could rewrite the trust policy above and grant
+              # itself the very reach the condition denies.
+              - Effect: Deny
+                Action:
+                  - "iam:UpdateAssumeRolePolicy"
+                  - "iam:UpdateRole"
+                  - "iam:DeleteRole"
+                  - "iam:PutRolePolicy"
+                  - "iam:DeleteRolePolicy"
+                  - "iam:AttachRolePolicy"
+                  - "iam:DetachRolePolicy"
+                  - "iam:PutRolePermissionsBoundary"
+                  - "iam:DeleteRolePermissionsBoundary"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${IAMRoleName}"
+              # The GitHub provider only. EKS clusters create their own OIDC providers
+              # for IRSA and must stay manageable, so this is not a blanket deny.
+              - Effect: Deny
+                Action:
+                  - "iam:DeleteOpenIDConnectProvider"
+                  - "iam:UpdateOpenIDConnectProviderThumbprint"
+                  - "iam:AddClientIDToOpenIDConnectProvider"
+                  - "iam:RemoveClientIDFromOpenIDConnectProvider"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+              # Struct8 has no CloudTrail resource in its catalog, so denying this
+              # cannot block a deploy -- it only stops a deploy from erasing its trail.
+              - Effect: Deny
+                Action:
+                  - "cloudtrail:StopLogging"
+                  - "cloudtrail:DeleteTrail"
+                  - "cloudtrail:UpdateTrail"
+                  - "cloudtrail:PutEventSelectors"
+                Resource: "*"
       Tags:
         - Key: Name
           Value: !Ref IAMRoleName
@@ -149,7 +215,11 @@ Outputs:
   RoleArn:
     Description: "ARN of the Role to use in GitHub Actions"
     Value: !GetAtt GitHubActionsRole.Arn
-  
+
+  AllowedSubject:
+    Description: "The only GitHub Actions subject that can use this role"
+    Value: !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
+
   BucketName:
     Condition: ShouldCreateS3
     Description: "Name of the created S3 Bucket"
