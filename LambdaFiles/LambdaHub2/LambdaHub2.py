@@ -60,8 +60,19 @@ except Exception:
 
 
 REGIAO = os.getenv("REGION") or os.getenv("AWS_REGION")
+# ACCOUNT so e emitido pelo Struct8 quando o recurso esta em OUTRA conta, e a AWS
+# nao publica o id da conta em variavel de ambiente nenhuma. No caso comum -- fila
+# na mesma conta -- esta variavel fica vazia, a URL sai
+# `https://sqs.{regiao}.amazonaws.com/None/{fila}` e todo send_message falha; o ARN
+# do topico SNS quebra igual. Quem carrega o id e o ARN da propria invocacao, entao
+# _registrar_conta o extrai de la na primeira chamada do handler.
 CONTA = os.getenv("ACCOUNT")
-NOME_DA_LAMBDA = os.getenv("LAMBDA_NAME") or os.getenv("NAME") or ""
+# AWS_LAMBDA_FUNCTION_NAME e posto pela propria AWS. Sem ele o nome fica vazio e a
+# guarda de laco (`NOME_DA_LAMBDA in mensagem`) para de valer -- e este hub tambem
+# manda para Lambdas, entao uma cadeia que volta nele mesmo se realimentaria sem fim.
+NOME_DA_LAMBDA = (
+    os.getenv("LAMBDA_NAME") or os.getenv("NAME") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or ""
+)
 
 # PROXY: o API Gateway entrega o envelope HTTP inteiro e espera o envelope de
 # volta. AWS: a integracao ja entrega o JSON limpo e espera so o dado.
@@ -169,6 +180,17 @@ def _regiao_de(vizinho):
 
 def _conta_de(vizinho):
     return vizinho.get("ACCOUNT") or CONTA
+
+
+def _registrar_conta(contexto):
+    """Preenche CONTA pelo ARN da invocacao quando a variavel nao veio."""
+    global CONTA
+    if CONTA:
+        return
+    arn = getattr(contexto, "invoked_function_arn", "") or ""
+    partes = arn.split(":")
+    if len(partes) > 4 and partes[4]:
+        CONTA = partes[4]
 
 
 def _url_da_fila(vizinho):
@@ -662,6 +684,8 @@ ORIGENS_EM_LOTE = ("aws:sqs", "aws:kinesis", "aws:dynamodb")
 
 def lambda_handler(evento, contexto):
     print("Evento recebido:", json.dumps(evento)[:4000])
+
+    _registrar_conta(contexto)
 
     est = estado()
     if est["falhas"]:
