@@ -1,625 +1,772 @@
-import traceback
-import boto3
-import os
-import json
+"""
+LambdaHub2 -- Lambda universal de teste do Struct8.
+
+Recebe evento de qualquer origem suportada e reenvia a mensagem para TODOS os
+recursos ligados a ela no diagrama. Quem configura o hub é o fio: o gerador
+injeta uma variavel de ambiente por conexao, e o hub descobre os vizinhos lendo
+o proprio ambiente. Nao existe lista de destinos no codigo.
+
+FORMATO DA VARIAVEL (unico suportado):
+
+    <TIPO_DO_ALVO>_<CHAVE>_<LABEL>        ex.: AWS_S3_BUCKET_NAME_0
+
+- TIPO: o type do no alvo em maiuscula (aws_s3_bucket -> AWS_S3_BUCKET).
+- CHAVE: vem do exportEnvVar da definition do alvo; quem nao declara cai no
+  fallback NAME, cujo valor e o logicalName do no.
+- LABEL: o texto do fio no diagrama, sanitizado. Fio sem texto vira "0".
+
+O formato antigo, com o segmento TARGET_ no meio
+(AWS_S3_BUCKET_TARGET_NAME_0), NAO e mais lido. Ele saiu do gerador e as
+Lambdas que ainda o usam sao anteriores a essa mudanca.
+
+O parse NAO e por regex: em AWS_LAMBDA_FUNCTION_URL_NAME_0 as particoes
+AWS_LAMBDA_FUNCTION + URL_NAME e AWS_LAMBDA_FUNCTION_URL + NAME sao as duas
+sintaticamente validas, e so a segunda esta certa. Por isso o casamento e por
+vocabulario conhecido, do mais longo para o mais curto.
+"""
+
+import base64
 import datetime
 import http.client
+import json
+import os
+import traceback
 from urllib.parse import unquote
 
-# Configuração do X-Ray
+import boto3
+
+# ----------------------------------------------------------------------------
+# Dependencias opcionais
+# ----------------------------------------------------------------------------
+
 try:
-    from aws_xray_sdk.core import xray_recorder
-    from aws_xray_sdk.core import patch_all
+    from aws_xray_sdk.core import patch_all, xray_recorder
+
     patch_all()
-    xray_enabled = True
-except:
-    xray_enabled = False
-    print("XRay SDK not found!")
+    XRAY_DISPONIVEL = True
+except Exception:
+    XRAY_DISPONIVEL = False
+    print("XRay SDK nao encontrado.")
 
-XRay = os.getenv('XRAY_ENABLED', "False")
-if XRay == "False":
-    xray_enabled = False
+XRAY_LIGADO = XRAY_DISPONIVEL and os.getenv("XRAY_ENABLED", "False") != "False"
 
-# Configuração do PyMySQL
 try:
     import pymysql
-    from pymysql import MySQLError
-    MySQLEnabled = True
-except:
-    MySQLEnabled = False
-    print("Pymysql not found!")
 
-# *************************** Inicialização de Clientes AWS ***********************
-Region = os.getenv("REGION")
-AccountID = os.getenv("ACCOUNT")
-sqs = boto3.client('sqs', region_name=Region)
-dynamodb = boto3.resource('dynamodb', region_name=Region)
-lambda_client = boto3.client('lambda', region_name=Region)
-sns = boto3.client('sns', region_name=Region)
-s3 = boto3.client('s3')
-LambdaName = os.getenv("LAMBDA_NAME", '')
-if not LambdaName:
-    LambdaName = os.getenv("NAME", '')
+    MYSQL_DISPONIVEL = True
+except Exception:
+    MYSQL_DISPONIVEL = False
+    print("pymysql nao encontrado -- destinos RDS serao ignorados.")
 
-# Variável de Ambiente para definir o tipo de integração da API
-# Valores possíveis: "PROXY" ou "AWS" (Padrão: AWS/Service Integration)
-API_INTEGRATION_TYPE = os.getenv("API_INTEGRATION_TYPE", "PROXY").upper()
 
-def execute_with_xray(segment_name, function, *args, **kwargs):
+REGIAO = os.getenv("REGION") or os.getenv("AWS_REGION")
+CONTA = os.getenv("ACCOUNT")
+NOME_DA_LAMBDA = os.getenv("LAMBDA_NAME") or os.getenv("NAME") or ""
+
+# PROXY: o API Gateway entrega o envelope HTTP inteiro e espera o envelope de
+# volta. AWS: a integracao ja entrega o JSON limpo e espera so o dado.
+MODO_API = os.getenv("API_INTEGRATION_TYPE", "PROXY").upper()
+
+LIMITE_DA_MENSAGEM = 900
+
+
+def com_xray(nome, funcao, *args, **kwargs):
+    """Executa dentro de um subsegmento, quando o X-Ray esta ligado."""
+    if not XRAY_LIGADO:
+        return funcao(*args, **kwargs)
+    with xray_recorder.in_subsegment(nome) as subsegmento:
+        try:
+            return funcao(*args, **kwargs)
+        except Exception as erro:
+            subsegmento.add_exception(erro, traceback.format_exc())
+            raise
+
+
+# ----------------------------------------------------------------------------
+# Descoberta dos vizinhos pelo ambiente
+# ----------------------------------------------------------------------------
+
+# Tipos que este hub sabe acionar. Tipo novo aqui exige tambem um bloco de
+# envio la embaixo -- sem ele a variavel e reconhecida e nada acontece.
+TIPOS_CONHECIDOS = (
+    "AWS_S3_BUCKET",
+    "AWS_SQS_QUEUE",
+    "AWS_SNS_TOPIC",
+    "AWS_DYNAMODB_TABLE",
+    "AWS_LAMBDA_FUNCTION_URL",
+    "AWS_LAMBDA_FUNCTION",
+    "AWS_KINESIS_STREAM",
+    "AWS_KINESIS_FIREHOSE_DELIVERY_STREAM",
+    "AWS_SSM_PARAMETER",
+    "AWS_SECRETSMANAGER_SECRET",
+    "AWS_DB_INSTANCE",
+    "AWS_EFS_FILE_SYSTEM",
+    "AWS_EFS_ACCESS_POINT",
+    "AWS_INSTANCE",
+    "AWS_CODEBUILD_PROJECT",
+    "AWS_ELASTICACHE_REPLICATION_GROUP",
+)
+
+# Chaves que o gerador emite (exportEnvVar das definitions, mais o fallback
+# NAME e os REGION/ACCOUNT de alvo em regiao ou conta diferente).
+CHAVES_CONHECIDAS = (
+    "SECRET_ARN",
+    "QUEUE_URL",
+    "USER_NAME",
+    "DB_NAME",
+    "ENDPOINT",
+    "ACCOUNT",
+    "REGION",
+    "BUCKET",
+    "PATH",
+    "NAME",
+    "ARN",
+    "URL",
+    "ID",
+)
+
+_TIPOS_ORDENADOS = tuple(sorted(TIPOS_CONHECIDOS, key=len, reverse=True))
+_CHAVES_ORDENADAS = tuple(sorted(CHAVES_CONHECIDAS, key=len, reverse=True))
+
+
+def descobrir_vizinhos(ambiente):
     """
-    Wrapper para execução com X-Ray
+    Varre o ambiente e agrupa as variaveis em vizinhos.
+
+    Devolve {TIPO: [ {label, NAME, ARN, ...}, ... ]}, com a lista ordenada pelo
+    label para o resultado nao depender da ordem do dicionario do ambiente.
     """
-    if function.__name__ == 'send_message':
-        if xray_enabled:
-            with xray_recorder.in_subsegment(segment_name) as subsegment:
-                try:
-                    result = function(*args, **kwargs)
-                    if "QueueUrl" in kwargs:
-                        subsegment.put_annotation("QueueUrl", kwargs["QueueUrl"])
-                    return result
-                except Exception as e:
-                    subsegment.add_exception(e, traceback.format_exc())
-                    raise
-        else:
-            return function(*args, **kwargs)
-    else:
-        return function(*args, **kwargs)
+    agrupado = {}
+
+    for variavel, valor in ambiente.items():
+        tipo = next((t for t in _TIPOS_ORDENADOS if variavel.startswith(t + "_")), None)
+        if tipo is None:
+            continue
+
+        resto = variavel[len(tipo) + 1 :]
+        chave = next((c for c in _CHAVES_ORDENADAS if resto.startswith(c + "_")), None)
+        if chave is None:
+            continue
+
+        label = resto[len(chave) + 1 :]
+        if not label:
+            # Sem label a variavel esta malformada: o gerador escreve "0"
+            # quando o fio nao tem texto, nunca vazio.
+            continue
+
+        vizinho = agrupado.setdefault(tipo, {}).setdefault(label, {"label": label})
+        vizinho[chave] = valor
+
+    return {
+        tipo: [porlabel[k] for k in sorted(porlabel)]
+        for tipo, porlabel in agrupado.items()
+    }
 
 
-# *************************** Recursos de Destino (Targets) ***********************
+def _regiao_de(vizinho):
+    return vizinho.get("REGION") or REGIAO
 
-# --- SQS Targets ---
-SQSTargetMaxNumber = 0
-SQSTargetName = []
-QueueTargetUrl = []
-i = 0
-while True:
-    Name = os.getenv(f"AWS_SQS_QUEUE_TARGET_NAME_{str(i)}")
-    URL = os.getenv(f"AWS_SQS_QUEUE_TARGET_URL_{str(i)}")
-    if Name != None:
-        SQSTargetName.append(Name)
-        QueueTargetUrl.append(URL)
-    else:
-        SQSTargetMaxNumber = i
-        break
-    i += 1
-print(f"Total SQS Targets: {i} {SQSTargetName}")
 
-# --- SNS Targets ---
-SNSTargetMaxNumber = 0
-SNSTargetName = []
-TopicTargetARN = []
-i = 0
-while True:
-    Name = os.getenv(f"AWS_SNS_TOPIC_TARGET_NAME_{str(i)}")
-    ARN = os.getenv(f"AWS_SNS_TOPIC_TARGET_ARN_{str(i)}")
-    if Name != None:
-        SNSTargetName.append(Name)
-        TopicTargetARN.append(ARN)
-    else:
-        SNSTargetMaxNumber = i
-        break
-    i += 1
-print(f"Total SNS Targets: {i} {SNSTargetName}")
+def _conta_de(vizinho):
+    return vizinho.get("ACCOUNT") or CONTA
 
-# --- DynamoDB Targets ---
-DynamoDBTargetMaxNumber = 0
-TableNameTargetList = []
-ListDynamo = []
-i = 0
-while True:
-    TableName = os.getenv(f"AWS_DYNAMODB_TABLE_TARGET_NAME_{str(i)}")
-    if TableName != None:
-        TableNameTargetList.append([dynamodb.Table(TableName), TableName])
-        ListDynamo.append(TableName)
-        Table = TableNameTargetList[i][0]
-        # Inicialização simples da tabela (Upsert ID 1)
+
+def _url_da_fila(vizinho):
+    """
+    Monta a URL a partir do nome. A policy que o Struct8 gera para SQS concede
+    SendMessage/ReceiveMessage/DeleteMessage/GetQueueAttributes -- nao concede
+    GetQueueUrl, entao resolver o nome pela API falharia por permissao.
+    """
+    if vizinho.get("QUEUE_URL"):
+        return vizinho["QUEUE_URL"]
+    if vizinho.get("URL"):
+        return vizinho["URL"]
+    return f"https://sqs.{_regiao_de(vizinho)}.amazonaws.com/{_conta_de(vizinho)}/{vizinho['NAME']}"
+
+
+def _arn_do_topico(vizinho):
+    """Mesma razao da fila: a policy concede sns:Publish e mais nada."""
+    if vizinho.get("ARN"):
+        return vizinho["ARN"]
+    return f"arn:aws:sns:{_regiao_de(vizinho)}:{_conta_de(vizinho)}:{vizinho['NAME']}"
+
+
+# ----------------------------------------------------------------------------
+# Estado preguicoso
+# ----------------------------------------------------------------------------
+#
+# Tudo que fala com a nuvem fica aqui, e nada disso roda na importacao do
+# modulo. Erro em tempo de import derruba a invocacao inteira com
+# Runtime.ImportModuleError, antes do handler existir -- e num Event Source
+# Mapping isso e pior que um erro comum: o lote e reprocessado ate o registro
+# expirar, e com bisect_batch_on_function_error o lote ainda e partido ao meio
+# a cada tentativa. Aqui dentro, cada bloco falha sozinho e o erro vai para o
+# relatorio da resposta em vez de matar o resto.
+
+_ESTADO = None
+
+
+def estado():
+    global _ESTADO
+    if _ESTADO is None:
+        _ESTADO = _montar_estado()
+    return _ESTADO
+
+
+def _montar_estado():
+    vizinhos = descobrir_vizinhos(os.environ)
+    falhas = []
+
+    for tipo, lista in sorted(vizinhos.items()):
+        print(f"[descoberta] {tipo}: {[v.get('NAME', v['label']) for v in lista]}")
+    if not vizinhos:
+        print("[descoberta] nenhum vizinho no ambiente -- nenhum fio desenhado, ou o tipo do alvo nao tem typeEnvVar")
+
+    est = {
+        "vizinhos": vizinhos,
+        "falhas": falhas,
+        "tabelas": [],
+        "segredos": [],
+        "rds": [],
+        "ec2": [],
+    }
+
+    _preparar_dynamodb(est)
+    _preparar_segredos(est)
+    _preparar_rds(est)
+    _preparar_ec2(est)
+
+    return est
+
+
+def _preparar_dynamodb(est):
+    recurso = boto3.resource("dynamodb", region_name=REGIAO)
+    for vizinho in est["vizinhos"].get("AWS_DYNAMODB_TABLE", []):
+        nome = vizinho.get("NAME")
+        if not nome:
+            continue
+        tabela = recurso.Table(nome)
+        est["tabelas"].append((tabela, nome))
         try:
-            response = Table.get_item(Key={'ID': "1"})
-            if 'Item' not in response:
-                Table.put_item(Item={'ID': "1", "LambdaName": "Created by " + LambdaName, 'Cont': 0})
-        except Exception as e:
-            print(f"Error checking DynamoDB table {TableName}: {e}")
-    else:
-        DynamoDBTargetMaxNumber = i
-        break
-    i += 1
-print(f"Total DynamoDB Targets: {i} {ListDynamo}")
+            if "Item" not in tabela.get_item(Key={"ID": "1"}):
+                tabela.put_item(Item={"ID": "1", "LambdaName": f"Created by {NOME_DA_LAMBDA}", "Cont": 0})
+        except Exception as erro:
+            est["falhas"].append(f"DynamoDB {nome}: {erro}")
 
-# --- Lambda Targets ---
-LambdaMaxNumber = 0
-LambdaNameList = []
-i = 0
-while True:
-    Name = os.getenv(f"AWS_LAMBDA_FUNCTION_TARGET_NAME_{str(i)}")
-    if Name != None:
-        LambdaNameList.append(Name)
-        LambdaMaxNumber = i
-    else:
-        break
-    i += 1
-print(f"Total Lambda Targets: {i} {LambdaNameList}")
 
-# --- CodeBuild Targets ---
-CodeBuildMaxNumber = 0
-CodeBuildNameList = []
-i = 0
-while True:
-    Name = os.getenv(f"AWS_CODEBUILD_PROJECT_TARGET_NAME_{str(i)}")
-    if Name is not None:
-        CodeBuildNameList.append(Name)
-        CodeBuildMaxNumber = i
-    else:
-        break
-    i += 1
-print(f"Total CodeBuild Targets: {i} {CodeBuildNameList}")
-
-# --- S3 Targets ---
-S3TargetMaxNumber = 0
-S3BucketTarget = []
-i = 0
-while True:
-    Name = os.getenv(f"AWS_S3_BUCKET_TARGET_NAME_{str(i)}")
-    TargetRegion = os.getenv(f"AWS_S3_BUCKET_TARGET_REGION_{str(i)}")
-    if Name is not None:
-        S3BucketTarget.append([Name, TargetRegion])
-    else:
-        S3TargetMaxNumber = i
-        break
-    i += 1
-print(f"Total S3 Targets: {i}")
-
-# --- EC2 Targets ---
-def find_ec2_dns_by_tag(key, value, region):
-    ec2 = boto3.client('ec2', region_name=region)
-    response = ec2.describe_instances(Filters=[{'Name': f'tag:{key}', 'Values': [value]}])
-    for reservation in response['Reservations']:
-        for instance in reservation['Instances']:
-            return instance.get('PublicDnsName'), instance.get('PrivateDnsName')
-    return None, None
-
-EC2TargetDNS = []
-EC2TargetName = []
-i = 0
-while True:
-    Name = os.getenv(f"AWS_INSTANCE_TARGET_NAME_{str(i)}")
-    TargetRegion = os.getenv(f"AWS_INSTANCE_TARGET_REGION_{str(i)}")
-    if Name is not None:
-        public_dns, private_dns = find_ec2_dns_by_tag('Name', Name, TargetRegion)
-        EC2TargetName.append(Name)
-        if public_dns:
-            EC2TargetDNS.append(public_dns)
-            print(f"Found public DNS for {Name}")
-        else:
-            EC2TargetDNS.append(private_dns)
-            print(f"Found private DNS for {Name}")
-    else:
-        break
-    i += 1
-print(f"Total EC2 Targets: {i} {EC2TargetName}")
-
-# --- EFS Targets ---
-EFSList = []
-EFSNameList = []
-i = 0
-while True:
-    Name = os.getenv(f"AWS_EFS_FILE_SYSTEM_TARGET_NAME_{str(i)}")
-    if Name is not None:
-        Path = os.getenv(f"AWS_EFS_ACCESS_POINT_TARGET_PATH_{str(i)}")
-        EFSList.append(Path)
-        EFSNameList.append(Name)
-    else:
-        break
-    i += 1
-print(f"Total EFS Targets: {i} {EFSNameList}")
-
-# --- SSM Parameter Targets ---
-SSMParameterTargetName = []
-SSMParameterTargetRegion = []
-i = 0
-while True:
-    Name = os.getenv(f"AWS_SSM_PARAMETER_TARGET_NAME_{str(i)}")
-    TargetRegion = os.getenv(f"AWS_SSM_PARAMETER_TARGET_REGION_{str(i)}")
-    if Name is not None and TargetRegion is not None:
-        SSMParameterTargetName.append(Name)
-        SSMParameterTargetRegion.append(TargetRegion)
-    else:
-        break
-    i += 1
-print(f"Total SSM Parameters: {i} {SSMParameterTargetName}")
-
-# *************************** Recursos de Origem (Sources) ***********************
-# (Mantendo carregamento de Secrets para RDS)
-SecretsCredentials = []
-SecretNameList = []
-i = 0
-while True:
-    SecretName = os.getenv(f"AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_NAME_{i}")
-    SecretARN = os.getenv(f"AWS_SECRETSMANAGER_SECRET_VERSION_SOURCE_ARN_{i}")
-    if SecretName is not None:
-        client = boto3.client('secretsmanager', region_name=Region)
-        response = client.get_secret_value(SecretId=SecretARN)
-        secret = json.loads(response['SecretString'])
-        username = secret['username']
-        password = secret['password']
-        SecretsCredentials.append([SecretName, username, password])
-        SecretNameList.append(SecretName)
-    else:
-        break
-    i += 1
-print(f"Total Secret Sources: {i} {SecretNameList}")
-
-# --- RDS Connection Helpers ---
-def create_connection(host_name, user_name, user_password, db_name):
-    connection = None
-    try:
-        connection = pymysql.connect(
-            host=host_name, user=user_name, password=user_password,
-            database=db_name, charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor
-        )
-        print("Connection to MySQL DB successful")
-    except MySQLError as e:
-        print(f"The error '{e}' occurred")
-    return connection
-
-def execute_query(connection, query, values=None):
-    with connection.cursor() as cursor:
+def _preparar_segredos(est):
+    vizinhos = est["vizinhos"].get("AWS_SECRETSMANAGER_SECRET", [])
+    if not vizinhos:
+        return
+    cliente = boto3.client("secretsmanager", region_name=REGIAO)
+    for vizinho in vizinhos:
+        identificador = vizinho.get("ARN") or vizinho.get("SECRET_ARN") or vizinho.get("NAME")
         try:
-            if values:
-                cursor.execute(query, values)
-            else:
-                cursor.execute(query)
-            connection.commit()
-            print("Query executed successfully")
-        except MySQLError as e:
-            print(f"The error '{e}' occurred")
-
-RDSConnections = []
-i = 0
-if MySQLEnabled:
-    while True:
-        database = os.getenv(f"AWS_DB_INSTANCE_TARGET_NAME_{i}")
-        if database is not None:
-            EndPoint = os.getenv(f"AWS_DB_INSTANCE_TARGET_ENDPOINT_{i}")
-            Host = EndPoint.split(":")[0]
-            # Lógica de credenciais (mantida)
-            FoundSecret = False
-            username = "TypeNewUserName"
-            password = "TypeNewPassword"
-            if len(SecretsCredentials) > 0:
-                for j in range(len(SecretsCredentials)):
-                    if database in SecretsCredentials[j][0]:
-                        username = SecretsCredentials[j][1]
-                        password = SecretsCredentials[j][2]
-                        FoundSecret = True
-                        break
-                if not FoundSecret and len(SecretsCredentials) > 0:
-                     username = SecretsCredentials[0][1]
-                     password = SecretsCredentials[0][2]
-
-            print(f"Connecting to RDS {i}: {database}, {Host}")
-            connection = create_connection(Host, username, password, database)
-            if connection is not None:
-                RDSConnections.append([connection, database])
-                create_table_query = """
-                    CREATE TABLE IF NOT EXISTS exemplo (
-                        id INT AUTO_INCREMENT, texto VARCHAR(4000) NOT NULL, PRIMARY KEY (id)
-                    )
-                """
-                execute_query(connection, create_table_query)
-        else:
-            break
-        i += 1
-
-# ******************************************************************************
-# *                             LAMBDA HANDLER                                 *
-# ******************************************************************************
-
-def lambda_handler(event, context):
-    print("Event Received:", json.dumps(event))
-    
-    # 1. Identificar a Origem (EventSource)
-    EventSource = "API" # Padrão
-    
-    try:
-        if 'Records' in event and len(event['Records']) > 0:
-            record = event['Records'][0]
-            if 'Sns' in record:
-                EventSource = "aws:sns"
-            elif 'eventSource' in record and record['eventSource'] == "aws:sqs":
-                EventSource = "aws:sqs"
-            elif 's3' in record:
-                EventSource = "aws:s3"
-            elif 'kinesis' in record:
-                EventSource = "aws:kinesis"
-        elif 'CodePipeline.job' in event:
-            EventSource = "aws:codepipeline"
-        elif 'source' in event and event['source'] == "aws.events":
-            EventSource = "aws.events"
-        elif 'requestContext' in event:
-            if 'elb' in event['requestContext']:
-                EventSource = "aws:elb"
-            elif 'http' in event['requestContext'] or 'apiId' in event['requestContext']:
-                EventSource = "API" # Proxy (HTTP API or REST API)
-        elif 'AWS:EC2' in str(event): # Simplificação baseada no seu código original
-             EventSource = "AWS:EC2"
-    except Exception as e:
-        print(f"Error determining source: {e}")
-        EventSource = "API"
-
-    print(f"Determined Source: {EventSource}")
-
-    # 2. Extração da Mensagem
-    Subject = "None"
-    Message = ""
-    Information = ""
-
-    if EventSource == "aws:sns":
-        SNSName = event['Records'][0]['Sns']['TopicArn'].split(":")[-1]
-        EventSource += f":{SNSName}"
-        Subject = event['Records'][0]['Sns']['Subject']
-        Message = event['Records'][0]['Sns']['Message']
-        Information = f"Message from SNS {SNSName}"
-
-    elif EventSource == "aws:sqs":
-        SQSName = event['Records'][0]['eventSourceARN'].split(":")[-1]
-        Message = event['Records'][0]['body']
-        Information = f"Message from SQS {SQSName}"
-
-    elif EventSource == "aws.events":
-        EBName = event['resources'][0].split("/")[-1]
-        Message = f"Event from {EBName}"
-        Information = f"Message from EventBridge {EBName}"
-
-    elif EventSource == "aws:s3":
-        EventSource += event['Records'][0]['s3']["bucket"]['arn'].split(":")[-1]
-        FileSize = str(event['Records'][0]['s3']['object']["size"])
-        bucket_name = event['Records'][0]['s3']['bucket']["name"]
-        file_path_encoded = event['Records'][0]['s3']['object']["key"]
-        file_path = unquote(file_path_encoded).replace('+', ' ')
-        Ext = file_path.split(".")[-1]
-        
-        if Ext == "txt":
-            response = execute_with_xray(bucket_name, s3.get_object, Bucket=bucket_name, Key=file_path)
-            Message = response['Body'].read().decode('utf-8')
-        else:
-            Message = f"File {file_path} is not .txt"
-        Information = f"File {file_path} from S3 bucket {bucket_name}, size {FileSize}"
-
-    elif EventSource == "aws:elb":
-        ALBName = event['requestContext']['elb']['targetGroupArn'].split(":")[-1]
-        Message = "HTTP request from ALB"
-        Information = f"Request from ALB {ALBName}"
-
-    elif EventSource == "aws:codepipeline":
-        job_id = event['CodePipeline.job']['id']
-        Message = "Job ID: " + job_id
-        Information = "Event from CodePipeline"
-
-    elif EventSource == "AWS:EC2":
-        Information = "Event from EC2"
-        Message = event.get("message", "No message")
-
-    elif EventSource == "API":
-        # *** LÓGICA FLEXÍVEL PARA API ***
-        print(f"Processing API Event with mode: {API_INTEGRATION_TYPE}")
-        
-        if API_INTEGRATION_TYPE == "PROXY":
-            # Modo Proxy Integration (Lambda Proxy)
-            try:
-                body_raw = event.get('body', '{}')
-                if body_raw is None: body_raw = '{}'
-                
-                # Se o body vier como string (o padrão do Proxy), faz parse
-                if isinstance(body_raw, str):
-                    body_data = json.loads(body_raw)
-                else:
-                    body_data = body_raw
-                
-                # Tenta extrair 'message' ou usa o body inteiro
-                if isinstance(body_data, dict):
-                    Message = str(body_data.get('message', body_data))
-                    Source = body_data.get('source', 'API Proxy')
-                else:
-                    Message = str(body_data)
-                    Source = 'API Proxy'
-            except Exception as e:
-                Message = f"Error parsing Proxy Body: {str(e)}"
-                Source = "API Proxy Error"
-        else:
-            # Modo Service Integration (Non-Proxy / VTL)
-            # Assume que o API Gateway já entregou o JSON limpo
-            try:
-                Message = str(event.get("message", event))
-                Source = event.get("source", "API AWS Integration")
-            except:
-                Message = str(event)
-                Source = "API"
-        
-        Information = f"Event from API (Mode: {API_INTEGRATION_TYPE})"
+            bruto = cliente.get_secret_value(SecretId=identificador)["SecretString"]
+            segredo = json.loads(bruto)
+            est["segredos"].append((vizinho.get("NAME", ""), segredo.get("username"), segredo.get("password")))
+        except Exception as erro:
+            est["falhas"].append(f"Secrets {identificador}: {erro}")
 
 
-    # Verificação de Loop Infinito
-    if LambdaName in Message:
-        print("Loop Found! Stopping execution.")
-        return create_response(EventSource, "Loop prevented", 200)
+def _preparar_rds(est):
+    vizinhos = est["vizinhos"].get("AWS_DB_INSTANCE", [])
+    if not vizinhos:
+        return
+    if not MYSQL_DISPONIVEL:
+        est["falhas"].append("RDS: pymysql ausente (falta a layer)")
+        return
 
-    Agora = datetime.datetime.now()
-    NewMessage = f"Lambda: {LambdaName}. Source: {EventSource}. Date/Time: {str(Agora)}. <- {Message}"
-    print("Message to be sent: ", NewMessage)
+    for vizinho in vizinhos:
+        banco = vizinho.get("DB_NAME") or vizinho.get("NAME")
+        endereco = (vizinho.get("ENDPOINT") or "").split(":")[0]
+        if not endereco:
+            est["falhas"].append(f"RDS {banco}: sem ENDPOINT no ambiente")
+            continue
 
-    # ************************* SQS Block **************************************
-    for i in range(SQSTargetMaxNumber):
-        print(f"Sending to SQS: {SQSTargetName[i]}")
-        execute_with_xray(SQSTargetName[i], sqs.send_message, QueueUrl=QueueTargetUrl[i], MessageBody=NewMessage)
-
-    # ************************* DynamoDB Block **********************************
-    for i in range(DynamoDBTargetMaxNumber):
-        Table = TableNameTargetList[i][0]
-        TableName = TableNameTargetList[i][1]
+        usuario, senha = _credenciais_de(est, banco)
         try:
-            # Atomic counter update
-            execute_with_xray(TableName, Table.update_item, 
-                Key={'ID': "1"},
-                UpdateExpression='SET Cont = if_not_exists(Cont, :zero) + :val1',
-                ExpressionAttributeValues={':val1': 1, ':zero': 0}
+            conexao = pymysql.connect(
+                host=endereco,
+                user=usuario,
+                password=senha,
+                database=banco,
+                charset="utf8mb4",
+                cursorclass=pymysql.cursors.DictCursor,
+                connect_timeout=5,
             )
-            # Put log item
-            ttl_timestamp = int((datetime.datetime.now() + datetime.timedelta(days=1)).timestamp())
-            ID = f"{LambdaName}:{str(Agora)}"
-            execute_with_xray(TableName, Table.put_item, Item={'ID': ID, "Message": NewMessage, 'TTL': ttl_timestamp})
-        except Exception as e:
-            print(f"DynamoDB Error: {e}")
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    "CREATE TABLE IF NOT EXISTS exemplo ("
+                    "id INT AUTO_INCREMENT, texto VARCHAR(4000) NOT NULL, PRIMARY KEY (id))"
+                )
+            conexao.commit()
+            est["rds"].append((conexao, banco))
+        except Exception as erro:
+            est["falhas"].append(f"RDS {banco}: {erro}")
 
-    # ************************* SNS Block **********************************
-    for i in range(SNSTargetMaxNumber):
-        topic_arn = TopicTargetARN[i]
-        execute_with_xray(topic_arn, sns.publish, TopicArn=topic_arn,
-                          Message=json.dumps({'default': json.dumps(NewMessage)}), MessageStructure='json')
 
-    # ************************* Lambda Block ********************
-    lambda_cli = boto3.client('lambda')
-    for function_name in LambdaNameList:
-        payload = json.dumps({"message": NewMessage, "source": "aws:lambda"})
-        execute_with_xray(function_name, lambda_cli.invoke, FunctionName=function_name,
-                          InvocationType='Event', Payload=payload)
+def _credenciais_de(est, banco):
+    for nome, usuario, senha in est["segredos"]:
+        if banco and banco in nome:
+            return usuario, senha
+    if est["segredos"]:
+        return est["segredos"][0][1], est["segredos"][0][2]
+    return "TypeNewUserName", "TypeNewPassword"
 
-    # ************************* S3 Block **********************************
-    for i in range(S3TargetMaxNumber):
-        bucket_name = S3BucketTarget[i][0]
-        region_s3 = S3BucketTarget[i][1]
-        s3_cli = boto3.client('s3', region_name=region_s3)
-        file_path = f"{LambdaName}/{LambdaName}:{str(Agora)}.txt"
-        execute_with_xray(bucket_name, s3_cli.put_object, Bucket=bucket_name, Key=file_path, Body=NewMessage)
 
-    # ************************* EFS Block **********************************
-    for efs_mount_path in EFSList:
+def _preparar_ec2(est):
+    vizinhos = est["vizinhos"].get("AWS_INSTANCE", [])
+    if not vizinhos:
+        return
+    for vizinho in vizinhos:
+        nome = vizinho.get("NAME")
         try:
-            file_name = f"{LambdaName}:{str(Agora)}.txt"
-            test_file_path = os.path.join(efs_mount_path, file_name)
-            with open(test_file_path, "w") as file:
-                file.write(NewMessage)
-        except Exception as e:
-            print(f"EFS Error: {e}")
-
-    # ************************* RDS Block **********************************
-    for connection, db_name in RDSConnections:
-        try:
-            Data = json.dumps(NewMessage)
-            execute_query(connection, "INSERT INTO exemplo (texto) VALUES (%s)", (Data,))
-        except Exception as e:
-            print(f"RDS Error on {db_name}: {e}")
-
-    # ************************* SSM Parameter Block ************************
-    for Name, region in zip(SSMParameterTargetName, SSMParameterTargetRegion):
-        ssm_client = boto3.client('ssm', region_name=region)
-        try:
-            # Simples incremento de contador no Parameter Store
-            try:
-                resp = execute_with_xray(Name, ssm_client.get_parameter, Name=Name, WithDecryption=True)
-                val = int(resp['Parameter']['Value']) + 1
-            except:
-                val = 0
-            execute_with_xray(Name, ssm_client.put_parameter, Name=Name, Value=str(val), Type='String', Overwrite=True)
-        except Exception as e:
-            print(f"SSM Error: {e}")
-
-    # ************************* EC2 HTTP Block *****************************
-    MessageJSON = json.dumps(NewMessage).encode('utf-8')
-    for DNS, EC2Name in zip(EC2TargetDNS, EC2TargetName):
-        try:
-            Conn = http.client.HTTPConnection(DNS, timeout=2)
-            Headers = {'Content-type': 'application/json'}
-            execute_with_xray(EC2Name, Conn.request, "POST", f'/{EC2Name}', body=MessageJSON, headers=Headers)
-            Resp = Conn.getresponse()
-            Conn.close()
-            print(f"EC2 Response: {Resp.status}")
-        except Exception as e:
-            print(f"EC2 Connection Error: {e}")
-
-    # ************************* CodeBuild Block ****************************
-    codebuild = boto3.client('codebuild')
-    env_vars = [{'name': 'EVENT', 'value': NewMessage, 'type': 'PLAINTEXT'}]
-    for CodeBuildName in CodeBuildNameList:
-        execute_with_xray(CodeBuildName, codebuild.start_build, projectName=CodeBuildName, environmentVariablesOverride=env_vars)
-
-    # ************************* PROCESSAMENTO CODEPIPELINE *****************
-    if EventSource == "aws:codepipeline":
-        return process_codepipeline(event, job_id)
-
-    # ************************* RESPOSTA FINAL (RESPONSE) ******************
-    return create_response(EventSource, NewMessage)
+            cliente = boto3.client("ec2", region_name=_regiao_de(vizinho))
+            resposta = cliente.describe_instances(Filters=[{"Name": "tag:Name", "Values": [nome]}])
+            for reserva in resposta["Reservations"]:
+                for instancia in reserva["Instances"]:
+                    dns = instancia.get("PublicDnsName") or instancia.get("PrivateDnsName")
+                    if dns:
+                        est["ec2"].append((dns, nome))
+                        break
+        except Exception as erro:
+            # ec2:DescribeInstances nao esta nas policies que o Struct8 gera por
+            # conexao: sem uma policy escrita a mao, este bloco falha sempre.
+            est["falhas"].append(f"EC2 {nome}: {erro}")
 
 
-def process_codepipeline(event, job_id):
-    """Função auxiliar para CodePipeline para manter o handler limpo"""
+# ----------------------------------------------------------------------------
+# Entrada: identificar a origem e extrair os itens
+# ----------------------------------------------------------------------------
+
+
+def identificar_origem(evento):
+    registros = evento.get("Records") if isinstance(evento, dict) else None
+    if registros:
+        primeiro = registros[0]
+        if "Sns" in primeiro:
+            return "aws:sns"
+        if primeiro.get("eventSource") == "aws:sqs":
+            return "aws:sqs"
+        if "s3" in primeiro:
+            return "aws:s3"
+        if "kinesis" in primeiro:
+            return "aws:kinesis"
+        if "dynamodb" in primeiro:
+            return "aws:dynamodb"
+
+    if not isinstance(evento, dict):
+        return "API"
+    if "CodePipeline.job" in evento:
+        return "aws:codepipeline"
+    if evento.get("source") == "aws.events":
+        return "aws.events"
+
+    contexto = evento.get("requestContext")
+    if isinstance(contexto, dict) and "elb" in contexto:
+        return "aws:elb"
+    return "API"
+
+
+def _truncar(texto):
+    texto = str(texto)
+    return texto if len(texto) <= LIMITE_DA_MENSAGEM else texto[:LIMITE_DA_MENSAGEM] + "...[truncado]"
+
+
+def _resumir_payload(texto):
+    """
+    Dado de stream costuma ser JSON. O caso do CDC do DynamoDB ganha resumo
+    proprio porque o envelope cru e ilegivel num log de teste -- o que interessa
+    ali e a operacao e a chave, nao a imagem inteira do item.
+    """
     try:
-        credentials = event['CodePipeline.job']['data']['artifactCredentials']
-        s3_pipe = boto3.client('s3',
-            aws_access_key_id=credentials['accessKeyId'],
-            aws_secret_access_key=credentials['secretAccessKey'],
-            aws_session_token=credentials['sessionToken']
-        )
-        input_artifacts = event['CodePipeline.job']['data']['inputArtifacts']
-        output_artifacts = event['CodePipeline.job']['data']['outputArtifacts']
-        
-        if input_artifacts:
-            artifact = input_artifacts[0]
-            loc = artifact['location']['s3Location']
-            if loc['objectKey'].endswith(".txt"):
-                obj = s3_pipe.get_object(Bucket=loc['bucketName'], Key=loc['objectKey'])
-                content = obj['Body'].read().decode('utf-8').upper()
-                
-                if output_artifacts:
-                    out = output_artifacts[0]
-                    out_loc = out['location']['s3Location']
-                    s3_pipe.put_object(Bucket=out_loc['bucketName'], Key=out_loc['objectKey'], Body=content.encode('utf-8'))
-        
-        codepipeline = boto3.client('codepipeline')
-        codepipeline.put_job_success_result(jobId=job_id)
-        return {'statusCode': 200, 'body': json.dumps({'status': 'SUCCESS'})}
-    except Exception as e:
-        codepipeline = boto3.client('codepipeline')
-        codepipeline.put_job_failure_result(jobId=job_id, failureDetails={'type': 'JobFailed', 'message': str(e)})
-        return {'statusCode': 500, 'body': json.dumps({'status': 'FAILED'})}
+        dado = json.loads(texto)
+    except (ValueError, TypeError):
+        return _truncar(texto)
+
+    if isinstance(dado, dict) and "dynamodb" in dado:
+        tabela = dado.get("tableName", "?")
+        operacao = dado.get("eventName", "?")
+        chave = json.dumps(dado.get("dynamodb", {}).get("Keys", {}), ensure_ascii=False)
+        return f"CDC {operacao} na tabela {tabela}, chave {chave}"
+
+    return _truncar(json.dumps(dado, ensure_ascii=False))
 
 
-def create_response(event_source, message, status_code=200):
+def extrair_itens(evento, origem):
     """
-    Fábrica de Respostas: Decide o formato do retorno baseando-se na origem
-    e na variável de ambiente.
+    Devolve (itens, descricao). Cada item e (identificador, mensagem).
+
+    O identificador so existe onde a origem entrega LOTE e aceita relatorio
+    parcial de falha (fila e stream); nas demais e None. Origem de lote e
+    percorrida inteira: ler so Records[0] descartaria ate 99 registros de um
+    batch_size 100.
     """
-    
-    # Se for ALB, o formato é fixo (Proxy)
-    if event_source == "aws:elb":
-        return {
-            'statusCode': status_code,
-            'statusDescription': '200 OK',
-            'isBase64Encoded': False,
-            'headers': {'Content-Type': 'text/html; charset=utf-8'},
-            'body': message
-        }
-    
-    # Se for API Gateway
-    if event_source == "API":
-        if API_INTEGRATION_TYPE == "PROXY":
-            # Retorno Proxy Integration (JSON completo)
-            return {
-                'statusCode': status_code,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({
-                    'message': 'Message processed',
-                    'original_data': message,
-                    'timestamp': str(datetime.datetime.now())
-                })
-            }
+    if origem == "aws:sns":
+        registro = evento["Records"][0]["Sns"]
+        topico = registro["TopicArn"].split(":")[-1]
+        return [(None, registro.get("Message", ""))], f"SNS {topico}"
+
+    if origem == "aws:sqs":
+        fila = evento["Records"][0]["eventSourceARN"].split(":")[-1]
+        itens = [(r.get("messageId"), r.get("body", "")) for r in evento["Records"]]
+        return itens, f"SQS {fila} ({len(itens)} registro(s))"
+
+    if origem in ("aws:kinesis", "aws:dynamodb"):
+        return _itens_de_stream(evento, origem)
+
+    if origem == "aws.events":
+        regra = evento["resources"][0].split("/")[-1]
+        return [(None, f"Evento de {regra}")], f"EventBridge {regra}"
+
+    if origem == "aws:s3":
+        return _itens_de_s3(evento)
+
+    if origem == "aws:elb":
+        alvo = evento["requestContext"]["elb"]["targetGroupArn"].split(":")[-1]
+        return [(None, "Requisicao HTTP do ALB")], f"ALB {alvo}"
+
+    if origem == "aws:codepipeline":
+        return [(None, "Job " + evento["CodePipeline.job"]["id"])], "CodePipeline"
+
+    return _itens_de_api(evento)
+
+
+def _itens_de_stream(evento, origem):
+    """
+    Kinesis Data Streams e DynamoDB Streams tem a mesma forma de lote; o que
+    muda e o campo do registro. O dado do Kinesis vem em base64 -- repassar sem
+    decodificar mandaria a string codificada adiante, que "funciona" e nao
+    prova nada.
+    """
+    campo = "kinesis" if origem == "aws:kinesis" else "dynamodb"
+    itens = []
+    nome = "?"
+
+    for registro in evento.get("Records", []):
+        arn = registro.get("eventSourceARN", "")
+        if arn:
+            nome = arn.split("/")[1] if "/" in arn else arn.split(":")[-1]
+
+        if campo == "kinesis":
+            bloco = registro.get("kinesis", {})
+            identificador = bloco.get("sequenceNumber")
+            bruto = base64.b64decode(bloco.get("data", ""))
+            try:
+                mensagem = _resumir_payload(bruto.decode("utf-8"))
+            except UnicodeDecodeError:
+                mensagem = f"<{len(bruto)} bytes nao-UTF8>"
         else:
-            # Retorno AWS Integration (Non-Proxy - apenas o dado)
-            return message
+            identificador = registro.get("dynamodb", {}).get("SequenceNumber")
+            mensagem = _resumir_payload(json.dumps(registro, ensure_ascii=False))
 
-    # Para outras fontes (SNS, SQS, etc), retorno simples geralmente é ignorado
-    # ou usado apenas para logs
-    return message
+        itens.append((identificador, mensagem))
+
+    rotulo = "Kinesis" if campo == "kinesis" else "DynamoDB Stream"
+    return itens, f"{rotulo} {nome} ({len(itens)} registro(s))"
+
+
+def _itens_de_s3(evento):
+    registro = evento["Records"][0]["s3"]
+    balde = registro["bucket"]["name"]
+    caminho = unquote(registro["object"]["key"]).replace("+", " ")
+    tamanho = registro["object"].get("size", 0)
+
+    if caminho.lower().endswith(".txt"):
+        cliente = boto3.client("s3")
+        corpo = com_xray(balde, cliente.get_object, Bucket=balde, Key=caminho)["Body"].read()
+        mensagem = _truncar(corpo.decode("utf-8", errors="replace"))
+    else:
+        mensagem = f"Arquivo {caminho} nao e .txt"
+
+    return [(None, mensagem)], f"S3 {balde}/{caminho} ({tamanho} bytes)"
+
+
+def _itens_de_api(evento):
+    if MODO_API == "PROXY":
+        corpo = evento.get("body") or "{}"
+        try:
+            dado = json.loads(corpo) if isinstance(corpo, str) else corpo
+            mensagem = str(dado.get("message", dado)) if isinstance(dado, dict) else str(dado)
+        except ValueError as erro:
+            mensagem = f"Corpo do proxy invalido: {erro}"
+    else:
+        mensagem = str(evento.get("message", evento)) if isinstance(evento, dict) else str(evento)
+
+    return [(None, mensagem)], f"API (modo {MODO_API})"
+
+
+# ----------------------------------------------------------------------------
+# Saida: reenviar para todos os vizinhos
+# ----------------------------------------------------------------------------
+
+
+def espalhar(est, mensagem):
+    """Envia a mensagem a cada vizinho. Devolve a lista de erros por destino."""
+    erros = []
+    vizinhos = est["vizinhos"]
+
+    for vizinho in vizinhos.get("AWS_SQS_QUEUE", []):
+        try:
+            cliente = boto3.client("sqs", region_name=_regiao_de(vizinho))
+            com_xray(vizinho["NAME"], cliente.send_message, QueueUrl=_url_da_fila(vizinho), MessageBody=mensagem)
+        except Exception as erro:
+            erros.append(f"SQS {vizinho.get('NAME')}: {erro}")
+
+    for vizinho in vizinhos.get("AWS_SNS_TOPIC", []):
+        try:
+            cliente = boto3.client("sns", region_name=_regiao_de(vizinho))
+            com_xray(
+                vizinho["NAME"],
+                cliente.publish,
+                TopicArn=_arn_do_topico(vizinho),
+                Message=json.dumps({"default": json.dumps(mensagem)}),
+                MessageStructure="json",
+            )
+        except Exception as erro:
+            erros.append(f"SNS {vizinho.get('NAME')}: {erro}")
+
+    agora = datetime.datetime.now()
+
+    for tabela, nome in est["tabelas"]:
+        try:
+            com_xray(
+                nome,
+                tabela.update_item,
+                Key={"ID": "1"},
+                UpdateExpression="SET Cont = if_not_exists(Cont, :zero) + :um",
+                ExpressionAttributeValues={":um": 1, ":zero": 0},
+            )
+            expira = int((agora + datetime.timedelta(days=1)).timestamp())
+            com_xray(
+                nome,
+                tabela.put_item,
+                Item={"ID": f"{NOME_DA_LAMBDA}:{agora}", "Message": mensagem, "TTL": expira},
+            )
+        except Exception as erro:
+            erros.append(f"DynamoDB {nome}: {erro}")
+
+    for vizinho in vizinhos.get("AWS_KINESIS_STREAM", []):
+        try:
+            cliente = boto3.client("kinesis", region_name=_regiao_de(vizinho))
+            com_xray(
+                vizinho["NAME"],
+                cliente.put_record,
+                StreamName=vizinho["NAME"],
+                Data=(mensagem + "\n").encode("utf-8"),
+                # Chave de particao fixa por Lambda mantem a ordem do teste num
+                # shard so. Com varios shards, trocar por algo variavel espalha.
+                PartitionKey=NOME_DA_LAMBDA or "LambdaHub2",
+            )
+        except Exception as erro:
+            erros.append(f"Kinesis {vizinho.get('NAME')}: {erro}")
+
+    for vizinho in vizinhos.get("AWS_KINESIS_FIREHOSE_DELIVERY_STREAM", []):
+        try:
+            cliente = boto3.client("firehose", region_name=_regiao_de(vizinho))
+            # A quebra de linha e o que separa os registros no arquivo que o
+            # Firehose entrega no S3; sem ela o objeto sai com tudo concatenado.
+            com_xray(
+                vizinho["NAME"],
+                cliente.put_record,
+                DeliveryStreamName=vizinho["NAME"],
+                Record={"Data": (mensagem + "\n").encode("utf-8")},
+            )
+        except Exception as erro:
+            erros.append(f"Firehose {vizinho.get('NAME')}: {erro}")
+
+    for vizinho in vizinhos.get("AWS_LAMBDA_FUNCTION", []):
+        try:
+            cliente = boto3.client("lambda", region_name=_regiao_de(vizinho))
+            com_xray(
+                vizinho["NAME"],
+                cliente.invoke,
+                FunctionName=vizinho["NAME"],
+                InvocationType="Event",
+                Payload=json.dumps({"message": mensagem, "source": "aws:lambda"}),
+            )
+        except Exception as erro:
+            erros.append(f"Lambda {vizinho.get('NAME')}: {erro}")
+
+    for vizinho in vizinhos.get("AWS_S3_BUCKET", []):
+        try:
+            cliente = boto3.client("s3", region_name=_regiao_de(vizinho))
+            chave = f"{NOME_DA_LAMBDA}/{NOME_DA_LAMBDA}:{agora}.txt"
+            com_xray(vizinho["NAME"], cliente.put_object, Bucket=vizinho["NAME"], Key=chave, Body=mensagem)
+        except Exception as erro:
+            erros.append(f"S3 {vizinho.get('NAME')}: {erro}")
+
+    for vizinho in vizinhos.get("AWS_EFS_ACCESS_POINT", []):
+        caminho = vizinho.get("PATH")
+        if not caminho:
+            continue
+        try:
+            with open(os.path.join(caminho, f"{NOME_DA_LAMBDA}:{agora}.txt"), "w") as arquivo:
+                arquivo.write(mensagem)
+        except Exception as erro:
+            erros.append(f"EFS {caminho}: {erro}")
+
+    for conexao, banco in est["rds"]:
+        try:
+            with conexao.cursor() as cursor:
+                cursor.execute("INSERT INTO exemplo (texto) VALUES (%s)", (json.dumps(mensagem),))
+            conexao.commit()
+        except Exception as erro:
+            erros.append(f"RDS {banco}: {erro}")
+
+    for vizinho in vizinhos.get("AWS_SSM_PARAMETER", []):
+        # LEITURA, nao escrita: a policy que o Struct8 gera para SSM concede
+        # GetParameter/GetParameters. Um put_parameter aqui falharia por
+        # permissao em todo diagrama que nao tenha uma policy escrita a mao.
+        try:
+            cliente = boto3.client("ssm", region_name=_regiao_de(vizinho))
+            valor = com_xray(
+                vizinho["NAME"], cliente.get_parameter, Name=vizinho["NAME"], WithDecryption=True
+            )["Parameter"]["Value"]
+            print(f"[SSM] {vizinho['NAME']} = {_truncar(valor)}")
+        except Exception as erro:
+            erros.append(f"SSM {vizinho.get('NAME')}: {erro}")
+
+    corpo = json.dumps(mensagem).encode("utf-8")
+    for dns, nome in est["ec2"]:
+        try:
+            conexao = http.client.HTTPConnection(dns, timeout=2)
+            conexao.request("POST", f"/{nome}", body=corpo, headers={"Content-type": "application/json"})
+            print(f"[EC2] {nome} respondeu {conexao.getresponse().status}")
+            conexao.close()
+        except Exception as erro:
+            erros.append(f"EC2 {nome}: {erro}")
+
+    for vizinho in vizinhos.get("AWS_CODEBUILD_PROJECT", []):
+        try:
+            cliente = boto3.client("codebuild", region_name=_regiao_de(vizinho))
+            com_xray(
+                vizinho["NAME"],
+                cliente.start_build,
+                projectName=vizinho["NAME"],
+                environmentVariablesOverride=[{"name": "EVENT", "value": mensagem, "type": "PLAINTEXT"}],
+            )
+        except Exception as erro:
+            erros.append(f"CodeBuild {vizinho.get('NAME')}: {erro}")
+
+    return erros
+
+
+# ----------------------------------------------------------------------------
+# Handler
+# ----------------------------------------------------------------------------
+
+ORIGENS_EM_LOTE = ("aws:sqs", "aws:kinesis", "aws:dynamodb")
+
+
+def lambda_handler(evento, contexto):
+    print("Evento recebido:", json.dumps(evento)[:4000])
+
+    est = estado()
+    if est["falhas"]:
+        print("[inicializacao] falhas:", est["falhas"])
+
+    origem = identificar_origem(evento)
+    try:
+        itens, descricao = extrair_itens(evento, origem)
+    except Exception as erro:
+        print("Falha ao extrair o evento:", traceback.format_exc())
+        return criar_resposta(origem, f"Evento de {origem} nao pode ser lido: {erro}", 400)
+
+    print(f"Origem: {origem} -- {descricao}, {len(itens)} item(ns)")
+
+    agora = datetime.datetime.now()
+    reprovados = []
+    ultima = ""
+
+    for identificador, mensagem in itens:
+        # Guarda de laco: o hub tambem manda para Lambdas, e uma cadeia que
+        # volta nele mesmo se realimentaria para sempre.
+        if NOME_DA_LAMBDA and NOME_DA_LAMBDA in mensagem:
+            print("Laco detectado, item ignorado.")
+            continue
+
+        completa = f"Lambda: {NOME_DA_LAMBDA}. Source: {origem} ({descricao}). Date/Time: {agora}. <- {mensagem}"
+        ultima = completa
+        print("Enviando:", completa)
+
+        erros = espalhar(est, completa)
+        if erros:
+            print(f"Erros no item {identificador}: {erros}")
+            if identificador:
+                reprovados.append(identificador)
+
+    if origem == "aws:codepipeline":
+        return processar_codepipeline(evento, evento["CodePipeline.job"]["id"])
+
+    if origem in ORIGENS_EM_LOTE:
+        # Contrato do function_response_types = ReportBatchItemFailures. A lista
+        # vazia e a resposta de sucesso: sem ela, o mapeamento trata o lote
+        # inteiro como falho e reprocessa tudo. No Kinesis o checkpoint volta
+        # para o MENOR numero de sequencia reportado, entao tudo a partir dali
+        # e reentregue.
+        return {"batchItemFailures": [{"itemIdentifier": i} for i in reprovados]}
+
+    return criar_resposta(origem, ultima or "Nenhum item processado")
+
+
+def processar_codepipeline(evento, job_id):
+    codepipeline = boto3.client("codepipeline")
+    try:
+        credenciais = evento["CodePipeline.job"]["data"]["artifactCredentials"]
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=credenciais["accessKeyId"],
+            aws_secret_access_key=credenciais["secretAccessKey"],
+            aws_session_token=credenciais["sessionToken"],
+        )
+        entradas = evento["CodePipeline.job"]["data"]["inputArtifacts"]
+        saidas = evento["CodePipeline.job"]["data"]["outputArtifacts"]
+
+        if entradas and saidas:
+            origem = entradas[0]["location"]["s3Location"]
+            if origem["objectKey"].endswith(".txt"):
+                conteudo = s3.get_object(Bucket=origem["bucketName"], Key=origem["objectKey"])["Body"].read()
+                destino = saidas[0]["location"]["s3Location"]
+                s3.put_object(
+                    Bucket=destino["bucketName"],
+                    Key=destino["objectKey"],
+                    Body=conteudo.decode("utf-8").upper().encode("utf-8"),
+                )
+
+        codepipeline.put_job_success_result(jobId=job_id)
+        return {"statusCode": 200, "body": json.dumps({"status": "SUCCESS"})}
+    except Exception as erro:
+        codepipeline.put_job_failure_result(
+            jobId=job_id, failureDetails={"type": "JobFailed", "message": str(erro)}
+        )
+        return {"statusCode": 500, "body": json.dumps({"status": "FAILED"})}
+
+
+def criar_resposta(origem, mensagem, codigo=200):
+    if origem == "aws:elb":
+        return {
+            "statusCode": codigo,
+            "statusDescription": f"{codigo} OK",
+            "isBase64Encoded": False,
+            "headers": {"Content-Type": "text/html; charset=utf-8"},
+            "body": mensagem,
+        }
+
+    if origem == "API":
+        if MODO_API == "PROXY":
+            return {
+                "statusCode": codigo,
+                "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+                "body": json.dumps(
+                    {
+                        "message": "Message processed",
+                        "original_data": mensagem,
+                        "timestamp": str(datetime.datetime.now()),
+                    }
+                ),
+            }
+        return mensagem
+
+    return mensagem
