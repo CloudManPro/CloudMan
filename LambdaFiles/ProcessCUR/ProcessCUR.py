@@ -60,6 +60,62 @@ def decimal_default(obj):
     if isinstance(obj, Decimal): return str(obj)
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
+
+DATE_FORMAT = '%Y-%m-%d'
+
+
+def _parse_date(date_str):
+    """Converte uma chave 'YYYY-MM-DD' em `date`. Retorna None quando a chave não
+    é uma data válida -- inclusive o literal "UnknownDate" que versões anteriores
+    gravavam quando faltava `lineItem/UsageStartDate`."""
+    try:
+        return datetime.strptime(date_str, DATE_FORMAT).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _first_day_of_month(month_str):
+    """Converte uma chave 'YYYY-MM' no `date` do dia 1. None se não for um mês
+    válido -- serve também para detectar o mês "Unknown" legado."""
+    try:
+        return datetime.strptime(f"{month_str}-01", DATE_FORMAT).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_decimal(value):
+    """Decimal tolerante: valores já consolidados voltam do JSON como string, e um
+    campo ausente ou corrompido não pode derrubar a consolidação inteira."""
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal('0.0')
+
+
+def _daily_window(consolidated_data, structure_keys):
+    """Devolve `(data_mais_antiga, data_mais_recente)` presentes nas estruturas
+    diárias informadas (formato `{chave: {YYYY-MM-DD: {...}}}`).
+
+    A data mais antiga é o que define se um mês pode ou não ser reconsolidado: se
+    o diário só começa no dia 18 de um mês, a soma dos dias sobreviventes NÃO é o
+    total daquele mês -- ver `rebuild_monthly_costs`."""
+    oldest = None
+    newest = None
+
+    for structure_key in structure_keys:
+        for dates_dict in consolidated_data.get(structure_key, {}).values():
+            for date_str in dates_dict.keys():
+                parsed = _parse_date(date_str)
+                if parsed is None:
+                    continue
+                if oldest is None or parsed < oldest:
+                    oldest = parsed
+                if newest is None or parsed > newest:
+                    newest = parsed
+
+    return oldest, newest
+
+
 def load_consolidated_data(bucket, key):
     try:
         response = s3_client.get_object(Bucket=bucket, Key=key)
@@ -83,6 +139,14 @@ def load_consolidated_data(bucket, key):
         # próprio nó em vez da tag.
         if "resources_by_id" not in data:
             data["resources_by_id"] = {}
+        # NOVO: agregado mensal do índice por resourceId. Sem ele, o custo de
+        # todo recurso SEM cost-allocation tag -- justamente o caso que
+        # `resources_by_id` existe para cobrir -- era apagado na poda dos
+        # DAYS_TO_RETAIN dias e não sobrava nada no histórico.
+        if "monthly_resources_by_id" not in data:
+            data["monthly_resources_by_id"] = {}
+        if "metadata" not in data:
+            data["metadata"] = {}
 
         return data
     except s3_client.exceptions.NoSuchKey:
@@ -100,7 +164,8 @@ def load_consolidated_data(bucket, key):
             },
             "daily_costs": {},
             "monthly_costs": {},
-            "resources_by_id": {}
+            "resources_by_id": {},
+            "monthly_resources_by_id": {}
         }
     except Exception as e:
         print(f"ERROR: Failed to load consolidated data from s3://{bucket}/{key}. Error: {e}")
@@ -286,6 +351,7 @@ def process_single_csv_file(bucket_name, object_key, fallback_date, resource_nam
 
         csv_reader = csv.DictReader(text_stream)
         processed_rows = 0
+        skipped_undated_rows = 0
         currency_found = False
 
         for row in csv_reader:
@@ -297,11 +363,19 @@ def process_single_csv_file(bucket_name, object_key, fallback_date, resource_nam
                     currency_code = currency_code_found
                     currency_found = True
 
+            # BUG CORRIGIDO ("UnknownDate" imortal): quando a coluna faltava E o
+            # fallback vinha vazio, a linha era gravada sob a data literal
+            # "UnknownDate". Nenhuma das duas podas conseguia removê-la (o
+            # strptime falhava e caía num `continue`; na poda mensal
+            # "Unknown" < "2024-08" é False), então a entrada ficava presa no
+            # JSON para sempre e ainda criava um mês "Unknown" no consolidado.
+            # Agora só entram datas válidas -- o resto é contado e descartado.
             raw_usage_date = row.get(USAGE_START_DATE_COLUMN)
-            if raw_usage_date and len(raw_usage_date) >= 10:
-                usage_date = raw_usage_date[:10]
-            else:
-                usage_date = fallback_date or "UnknownDate"
+            usage_date = raw_usage_date[:10] if raw_usage_date and len(raw_usage_date) >= 10 else None
+            if usage_date is not None and _parse_date(usage_date) is None:
+                usage_date = None
+            if usage_date is None:
+                usage_date = fallback_date
 
             product_code = row.get(PRODUCT_COLUMN) or 'UnknownProduct'
             usage_type = row.get(USAGE_TYPE_COLUMN) or 'UnknownUsageType'
@@ -338,6 +412,14 @@ def process_single_csv_file(bucket_name, object_key, fallback_date, resource_nam
             if cost == Decimal('0.0'):
                 continue
 
+            # Linha com custo real mas sem nenhuma data utilizável (nem a da
+            # coluna, nem o fallback do manifesto). Sem data ela não pertence a
+            # dia nem a mês nenhum -- contabiliza e descarta, em vez de poluir a
+            # estrutura com uma chave que nunca sai de lá.
+            if usage_date is None:
+                skipped_undated_rows += 1
+                continue
+
             # Captura a conta ativa correspondente ao uso
             active_account = row.get(USAGE_ACCOUNT_COLUMN) or 'UnknownAccount'
             usage_key = f"{usage_type}@{active_account}"
@@ -354,6 +436,11 @@ def process_single_csv_file(bucket_name, object_key, fallback_date, resource_nam
                 )
 
         print(f"Finished parsing part. Total rows scanned: {processed_rows}.")
+        if skipped_undated_rows:
+            print(
+                f"WARN: {skipped_undated_rows} linha(s) com custo foram descartadas por não terem "
+                f"data utilizável ({USAGE_START_DATE_COLUMN} ausente e sem fallback do manifesto)."
+            )
         return daily_costs_by_tag, daily_costs_by_resource_id, currency_code
 
     except Exception as e:
@@ -401,71 +488,159 @@ def prune_daily_structure(consolidated_data, structure_key, cutoff_date):
     mesma janela de retenção de 60 dias pros dois. Retorna quantas datas
     foram removidas."""
     removed_count = 0
+    malformed_count = 0
     empty_keys = []
+    structure = consolidated_data.setdefault(structure_key, {})
 
-    for key_value in list(consolidated_data[structure_key].keys()):
+    for key_value in list(structure.keys()):
         dates_to_delete = []
-        date_data = consolidated_data[structure_key][key_value]
+        date_data = structure[key_value]
 
         for date_str in date_data.keys():
-            try:
-                data_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                if data_date < cutoff_date:
-                    dates_to_delete.append(date_str)
-            except ValueError:
+            data_date = _parse_date(date_str)
+            if data_date is None:
+                # Chave que não é data -- o "UnknownDate" gravado por versões
+                # anteriores. O `except ValueError: continue` de antes a deixava
+                # presa no arquivo para sempre, crescendo a cada execução.
+                dates_to_delete.append(date_str)
+                malformed_count += 1
                 continue
+            if data_date < cutoff_date:
+                dates_to_delete.append(date_str)
 
         for date_to_delete in dates_to_delete:
-            del consolidated_data[structure_key][key_value][date_to_delete]
+            del structure[key_value][date_to_delete]
             removed_count += 1
 
-        if not consolidated_data[structure_key][key_value]:
+        if not structure[key_value]:
             empty_keys.append(key_value)
 
     for key_to_delete in empty_keys:
-        del consolidated_data[structure_key][key_to_delete]
+        del structure[key_to_delete]
+
+    if malformed_count:
+        print(f"Removed {malformed_count} malformed (non-date) entries from '{structure_key}'.")
 
     return removed_count
 
 
-def rebuild_monthly_costs(consolidated_data, touched_months):
-    """
-    Sincroniza os custos mensais agregados com base nos dados diários.
-    Garante que não haverá duplicidade ao reprocessar os dados do mês corrente.
-    """
-    daily = consolidated_data.get("daily_costs", {})
-    monthly = consolidated_data.setdefault("monthly_costs", {})
+def prune_monthly_structure(consolidated_data, structure_key, cutoff_month_str):
+    """Remove de `consolidated_data[structure_key]` (formato
+    `{chave: {YYYY-MM: {...}}}`) os meses anteriores a `cutoff_month_str`, além de
+    chaves de mês malformadas -- o mês "Unknown" legado nunca era removido porque
+    a comparação de string `"Unknown" < "2024-08"` é False. Retorna quantos meses
+    foram removidos."""
+    removed_count = 0
+    empty_keys = []
+    structure = consolidated_data.setdefault(structure_key, {})
 
-    for tag_value, dates_dict in daily.items():
-        tag_monthly = monthly.setdefault(tag_value, {})
-        for month_str in touched_months:
-            # Filtra os registros diários pertencentes ao mês afetado
+    for key_value in list(structure.keys()):
+        months_to_delete = []
+
+        for month_str in structure[key_value].keys():
+            if _first_day_of_month(month_str) is None or month_str < cutoff_month_str:
+                months_to_delete.append(month_str)
+
+        for month_to_delete in months_to_delete:
+            del structure[key_value][month_to_delete]
+            removed_count += 1
+
+        if not structure[key_value]:
+            empty_keys.append(key_value)
+
+    for key_to_delete in empty_keys:
+        del structure[key_to_delete]
+
+    return removed_count
+
+
+def rebuild_monthly_costs(consolidated_data, daily_key, monthly_key, window_start):
+    """Consolida a estrutura diária `daily_key` na estrutura mensal `monthly_key`.
+
+    Duas correções em relação à versão que reconstruía apenas os meses presentes
+    no manifesto recém-processado (`touched_months`):
+
+    1. Varre TODOS os meses presentes no diário, não só os "tocados" agora. Antes,
+       um mês só virava mensal se a Lambda tivesse rodado com sucesso durante ele
+       -- diário que já estava no arquivo (deploy posterior, execução que falhou,
+       CUR que mudou de prefixo) nunca era consolidado e simplesmente sumia na
+       poda dos DAYS_TO_RETAIN dias.
+
+    2. Só sobrescreve um mês já consolidado quando o mês INTEIRO ainda está no
+       diário (`window_start` <= dia 1 do mês). Antes, qualquer manifesto que
+       tocasse um mês fechado -- um crédito/refund com UsageStartDate antigo, um
+       reprocessamento manual via `object_key`, um manifesto parcial -- reescrevia
+       o total mensal com a soma apenas dos dias sobreviventes da janela,
+       truncando o histórico em definitivo. Era essa a razão real de
+       DAYS_TO_RETAIN ter subido de 30 para 60: com 30 dias a janela corta o mês
+       anterior ao meio, e um único toque o reescrevia com menos da metade do
+       valor. Com a guarda abaixo, 30 dias volta a ser uma configuração válida.
+
+    Um mês parcial que ainda NÃO tem consolidado nenhum é gravado assim mesmo
+    (perder o dado seria pior), porém marcado com `"Partial": true`, para o
+    consumidor saber que aquele total não cobre o mês inteiro.
+
+    O mês corrente é sempre "completo" no sentido usado aqui: `window_start` é
+    anterior ao dia 1, então ele é reconsolidado a cada entrega do CUR e vai
+    acumulando até fechar -- que é o comportamento desejado.
+    """
+    daily = consolidated_data.get(daily_key, {})
+    monthly = consolidated_data.setdefault(monthly_key, {})
+    stats = {"rebuilt": 0, "preserved": 0, "partial": 0}
+
+    for key_value, dates_dict in daily.items():
+        months_present = set()
+        for date_str in dates_dict.keys():
+            if _parse_date(date_str) is not None:
+                months_present.add(date_str[:7])
+
+        for month_str in sorted(months_present):
             month_dates = {d: val for d, val in dates_dict.items() if d.startswith(month_str)}
             if not month_dates:
-                # Se não existem mais dados diários na janela de retenção de 60 dias,
-                # não sobrescrevemos o histórico do mês consolidado do passado
+                continue
+
+            first_day = _first_day_of_month(month_str)
+            month_is_complete = (
+                window_start is not None
+                and first_day is not None
+                and first_day >= window_start
+            )
+
+            # Mês parcial que já tem consolidado: o valor histórico é mais
+            # confiável do que a soma dos dias que sobraram na janela.
+            if not month_is_complete and month_str in monthly.get(key_value, {}):
+                stats["preserved"] += 1
                 continue
 
             total_unblended = Decimal('0.0')
             products = {}
 
-            for d_str, day_data in month_dates.items():
-                cost_val = day_data.get("TotalUnblendedCost", "0.0")
-                total_unblended += Decimal(str(cost_val))
+            for day_data in month_dates.values():
+                total_unblended += _to_decimal(day_data.get("TotalUnblendedCost", "0.0"))
 
                 for prod_code, prod_data in day_data.get("CostsByProduct", {}).items():
                     prod_entry = products.setdefault(prod_code, {})
-                    for usage_type, cost_str in prod_data.items():
-                        prod_entry[usage_type] = prod_entry.get(usage_type, Decimal('0.0')) + Decimal(str(cost_str))
+                    for usage_key, cost_val in prod_data.items():
+                        prod_entry[usage_key] = prod_entry.get(usage_key, Decimal('0.0')) + _to_decimal(cost_val)
 
-            # Atualiza/Insere o mês consolidado com valores normalizados em string
-            tag_monthly[month_str] = {
+            month_entry = {
                 "TotalUnblendedCost": str(total_unblended),
                 "CostsByProduct": {
-                    p: {ut: str(c) for ut, c in ut_dict.items()}
-                    for p, ut_dict in products.items()
+                    p: {uk: str(c) for uk, c in uk_dict.items()}
+                    for p, uk_dict in products.items()
                 }
             }
+            if not month_is_complete:
+                month_entry["Partial"] = True
+                stats["partial"] += 1
+
+            # `setdefault` só aqui: criar a chave antes (como a versão anterior
+            # fazia no topo do laço) enchia o JSON de dicionários vazios para
+            # toda tag que nunca teve mês consolidado.
+            monthly.setdefault(key_value, {})[month_str] = month_entry
+            stats["rebuilt"] += 1
+
+    return stats
 
 def lambda_handler(event, context):
     print(f"Lambda execution started. Received event: {json.dumps(event)}")
@@ -518,6 +693,18 @@ def lambda_handler(event, context):
         except ValueError:
             pass
 
+    # Segundo fallback de data: o billingPeriod do próprio manifesto
+    # ("20260801T000000.000Z"). Sem ele, uma linha sem lineItem/UsageStartDate
+    # num manifesto cujo assemblyId não casa com o regex acima ficava sem data
+    # nenhuma -- e a versão anterior a gravava como "UnknownDate", entrada que
+    # nenhuma das podas conseguia remover.
+    if not processing_date_str:
+        billing_start = (manifest.get("billingPeriod") or {}).get("start") or ""
+        billing_match = re.match(r'(\d{4})(\d{2})(\d{2})', str(billing_start))
+        if billing_match:
+            processing_date_str = f"{billing_match.group(1)}-{billing_match.group(2)}-{billing_match.group(3)}"
+            print(f"INFO: assemblyId sem data utilizável; usando billingPeriod.start ({processing_date_str}) como fallback.")
+
     # 2. Processar e agrupar novos dados diários em lote
     temp_aggregated_costs = {}
     # NOVO: acumulador temporário do índice por resourceId (só linhas sem tag).
@@ -535,11 +722,11 @@ def lambda_handler(event, context):
         if csv_currency:
             final_currency_code = csv_currency
 
+        # `touched_months` hoje serve só para log: a consolidação mensal varre
+        # todos os meses presentes no diário, não apenas os deste manifesto --
+        # ver rebuild_monthly_costs.
         merge_batch_into_temp(temp_aggregated_costs, csv_costs, touched_months)
-        # NOVO: mesmo tratamento pro índice por resourceId -- usa um `set()`
-        # descartável pra `touched_months` porque essa estrutura não tem
-        # agregação mensal própria (só o índice por tag tem).
-        merge_batch_into_temp(temp_aggregated_resource_costs, csv_resource_costs, set())
+        merge_batch_into_temp(temp_aggregated_resource_costs, csv_resource_costs, touched_months)
 
     # Serializar decimais temporários para float/string
     daily_costs_data = json.loads(json.dumps(temp_aggregated_costs, default=decimal_default))
@@ -563,45 +750,48 @@ def lambda_handler(event, context):
 
     # NOVO: mesma mesclagem pro índice novo "resources_by_id".
     resources_key = 'resources_by_id'
+    monthly_key = 'monthly_costs'
+    monthly_resources_key = 'monthly_resources_by_id'
     for resource_id_value, dates_dict in resource_costs_data.items():
         if resource_id_value not in consolidated_data[resources_key]:
             consolidated_data[resources_key][resource_id_value] = {}
         for date_str, day_data in dates_dict.items():
             consolidated_data[resources_key][resource_id_value][date_str] = day_data
 
-    # 5. Sincronizar custos agregados mensais dos meses afetados
-    rebuild_monthly_costs(consolidated_data, touched_months)
-    print(f"Rebuilt monthly consolidated buckets for months: {list(touched_months)}")
+    # 5. Determinar a janela diária realmente presente no arquivo -------------
+    # `window_start` é a data mais antiga que AINDA está no diário (antes da poda
+    # deste ciclo) -- é ela que diz se um mês pode ser reconsolidado sem truncar
+    # o histórico. `reference_date` continua sendo a mais recente, base das podas.
+    window_start, reference_date = _daily_window(consolidated_data, (daily_key, resources_key))
 
-    # 6. Obter data mais recente do dataset para determinar corte das podas
-    all_dates = []
-    for tag_val, dates_dict in consolidated_data[daily_key].items():
-        for d_str in dates_dict.keys():
-            try:
-                all_dates.append(datetime.strptime(d_str, '%Y-%m-%d').date())
-            except ValueError:
-                continue
-
-    if all_dates:
-        reference_date = max(all_dates)
-        print(f"Reference date determined for pruning: {reference_date}")
-    else:
+    if reference_date is None:
         reference_date = datetime.now(timezone.utc).date()
         print(f"Reference date falling back to current date: {reference_date}")
+    else:
+        print(f"Reference date for pruning: {reference_date} (daily window starts at {window_start})")
 
-    # 7. Podar dados diários antigos (Mais velhos que 60 dias) -- mesma janela
-    # aplicada aos dois índices (por tag e, agora, por resourceId).
+    # 6. Consolidar os meses das DUAS estruturas diárias ----------------------
+    # Antes só o índice por tag era consolidado, e só para os meses do manifesto
+    # atual. O índice por resourceId não tinha agregação mensal nenhuma: era
+    # acumulado dia a dia e apagado na poda dos DAYS_TO_RETAIN dias, então o
+    # custo de todo recurso SEM cost-allocation tag -- recurso importado, IPv4
+    # público cujo dono não foi resolvido -- desaparecia por completo.
+    print(f"Months present in this manifest: {sorted(touched_months)}")
+    monthly_stats = rebuild_monthly_costs(consolidated_data, daily_key, monthly_key, window_start)
+    resource_monthly_stats = rebuild_monthly_costs(
+        consolidated_data, resources_key, monthly_resources_key, window_start
+    )
+    print(f"Monthly rebuild by tag: {monthly_stats}")
+    print(f"Monthly rebuild by resourceId: {resource_monthly_stats}")
+
+    # 7. Podar dados diários antigos -- mesma janela nos dois índices.
     print(f"Starting pruning of daily data older than {DAYS_TO_RETAIN} days...")
     cutoff_date = reference_date - timedelta(days=DAYS_TO_RETAIN)
     dates_removed_count = prune_daily_structure(consolidated_data, daily_key, cutoff_date)
     resource_dates_removed_count = prune_daily_structure(consolidated_data, resources_key, cutoff_date)
     print(f"Pruned {dates_removed_count} daily_costs entries and {resource_dates_removed_count} resources_by_id entries.")
 
-    # 8. Podar dados mensais consolidados antigos (Mais velhos que 24 meses)
-    monthly_key = 'monthly_costs'
-    months_removed_count = 0
-
-    # Calcular limite de corte de 24 meses atrás baseado na referência
+    # 8. Podar agregados mensais antigos (mais velhos que MONTHS_TO_RETAIN meses)
     ref_year = reference_date.year
     ref_month = reference_date.month
     cutoff_year = ref_year - (MONTHS_TO_RETAIN // 12)
@@ -612,22 +802,14 @@ def lambda_handler(event, context):
     cutoff_month_str = f"{cutoff_year:04d}-{cutoff_month:02d}"
 
     print(f"Starting pruning of monthly aggregates older than {cutoff_month_str}...")
-
-    if monthly_key in consolidated_data:
-        for tag_value in list(consolidated_data[monthly_key].keys()):
-            months_to_delete = []
-            for m_str in consolidated_data[monthly_key][tag_value].keys():
-                if m_str < cutoff_month_str:
-                    months_to_delete.append(m_str)
-
-            for m_to_delete in months_to_delete:
-                del consolidated_data[monthly_key][tag_value][m_to_delete]
-                months_removed_count += 1
-
-            if not consolidated_data[monthly_key][tag_value]:
-                del consolidated_data[monthly_key][tag_value]
+    months_removed_count = prune_monthly_structure(consolidated_data, monthly_key, cutoff_month_str)
+    resource_months_removed_count = prune_monthly_structure(
+        consolidated_data, monthly_resources_key, cutoff_month_str
+    )
+    print(f"Pruned {months_removed_count} monthly_costs entries and {resource_months_removed_count} monthly_resources_by_id entries.")
 
     # Atualizar Metadados Globais do JSON
+    consolidated_data.setdefault('metadata', {})
     consolidated_data['metadata']['last_processed_cur_date'] = processing_date_str
     consolidated_data['metadata']['last_processed_assembly_id'] = assembly_id
     consolidated_data['metadata']['last_updated_timestamp_utc'] = datetime.now(timezone.utc).isoformat(timespec='seconds') + 'Z'
@@ -650,6 +832,9 @@ def lambda_handler(event, context):
             'resource_ids_updated': len(resource_costs_data),
             'daily_dates_removed': dates_removed_count,
             'resource_dates_removed': resource_dates_removed_count,
-            'monthly_records_removed': months_removed_count
+            'monthly_records_removed': months_removed_count,
+            'resource_monthly_records_removed': resource_months_removed_count,
+            'monthly_rebuild_by_tag': monthly_stats,
+            'monthly_rebuild_by_resource_id': resource_monthly_stats
         })
     }
