@@ -116,6 +116,22 @@ def _daily_window(consolidated_data, structure_keys):
     return oldest, newest
 
 
+def build_description():
+    """O texto do metadado `description`, montado a partir da configuração VIGENTE.
+
+    Reescrito a cada execução (ver lambda_handler), não só na criação do arquivo.
+    Antes ele só era gravado no ramo `NoSuchKey`, então um arquivo criado por uma
+    versão antiga carregava para sempre a descrição daquela versão: o arquivo em
+    produção ainda anunciava "for the last 30 days" com `days_retained` em 60, e
+    não mencionava nenhuma das duas estruturas mensais."""
+    return (
+        f"Daily costs (last {DAYS_TO_RETAIN} days) aggregated by tag '{RESOURCE_TAG_KEY}' in "
+        f"'daily_costs' and by resourceId in 'resources_by_id'; monthly costs (last "
+        f"{MONTHS_TO_RETAIN} months) in 'monthly_costs' and 'monthly_resources_by_id'. "
+        f"A month carrying \"Partial\": true was consolidated without its full daily data."
+    )
+
+
 def load_consolidated_data(bucket, key):
     try:
         response = s3_client.get_object(Bucket=bucket, Key=key)
@@ -153,7 +169,7 @@ def load_consolidated_data(bucket, key):
         print(f"Consolidated file not found at s3://{bucket}/{key}. Initializing new structure.")
         return {
             "metadata": {
-                "description": f"Daily costs (last {DAYS_TO_RETAIN} days) and monthly costs (last {MONTHS_TO_RETAIN} months) aggregated by tag '{RESOURCE_TAG_KEY}'.",
+                "description": build_description(),
                 "tag_key_used": RESOURCE_TAG_KEY,
                 "days_retained": DAYS_TO_RETAIN,
                 "months_retained": MONTHS_TO_RETAIN,
@@ -810,6 +826,16 @@ def lambda_handler(event, context):
 
     # Atualizar Metadados Globais do JSON
     consolidated_data.setdefault('metadata', {})
+    # Reescrito a cada execução de propósito -- ver build_description.
+    consolidated_data['metadata']['description'] = build_description()
+    consolidated_data['metadata']['tag_key_used'] = RESOURCE_TAG_KEY
+    # ATENÇÃO ao nome: nem sempre é a data em que o CUR foi processado. Sai do
+    # `assemblyId` quando ele traz um carimbo `YYYYMMDDTHHMMSSZ`, mas há CUR cujo
+    # assemblyId é só um UUID (o desta conta é) -- nesse caso o valor é o INÍCIO
+    # DO PERÍODO DE FATURAMENTO do manifesto, o dia 1 do mês. Antes, sem o
+    # fallback, o campo ficava simplesmente `None`. O nome ficou de quando só
+    # havia a primeira origem; o front não lê este campo, então mantê-lo é mais
+    # barato que quebrar o contrato do arquivo por causa da etiqueta.
     consolidated_data['metadata']['last_processed_cur_date'] = processing_date_str
     consolidated_data['metadata']['last_processed_assembly_id'] = assembly_id
     consolidated_data['metadata']['last_updated_timestamp_utc'] = datetime.now(timezone.utc).isoformat(timespec='seconds') + 'Z'
