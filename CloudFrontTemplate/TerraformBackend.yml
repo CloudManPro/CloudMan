@@ -198,9 +198,19 @@ Resources:
                     - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/alpha"
                     - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/main"
                     - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/lambda-sync.yml@refs/heads/main"
+              # Flag off: any workflow on the ref -- and in BOTH spellings of the
+              # subject. Once the repository's subject template includes
+              # job_workflow_ref (the app sets it when it prepares a backend),
+              # every token carries `:job_workflow_ref:<workflow>` at the end; an
+              # exact match on the short form would then refuse every run of a
+              # role created with the flag off. The wildcard is on the workflow
+              # only, which is exactly what "flag off" already admits.
               - StringEquals:
                   token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
-                  token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
+                StringLike:
+                  token.actions.githubusercontent.com:sub:
+                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
+                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:*"
       Policies:
         # Explicit Deny beats the Allow in AdministratorAccess. Scoped to the two
         # objects that ARE this role's own trust, plus audit tampering -- everything
