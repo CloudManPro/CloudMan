@@ -70,11 +70,23 @@ Parameters:
     AllowedPattern: '^(ref:refs/(heads|tags)/[A-Za-z0-9._\-\/]+|environment:[A-Za-z0-9 ._\-]+)$'
     ConstraintDescription: >-
       Must be ref:refs/heads/<branch>, ref:refs/tags/<tag> or environment:<name>.
+  RequireEngineWorkflow:
+    Description: >-
+      Also require the run to be executing the Struct8 engine -- the reusable
+      workflows in Struct8/cloudman-core -- and not just any workflow of the
+      repository. Needs the repository's OIDC subject template to include
+      job_workflow_ref (Struct8 sets that up); with GitHub's default template the
+      subject carries no workflow and this role would refuse every run. false keeps
+      the exact-ref match alone.
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
 
 Conditions:
   ShouldCreateS3: !Equals [ !Ref CreateS3Bucket, "true" ]
   ShouldCreateDynamoDB: !Equals [ !Ref CreateDynamoDBTable, "true" ]
   ShouldCreateOIDC: !Equals [ !Ref CreateOIDCProvider, "true" ]
+  ShouldRequireEngineWorkflow: !Equals [ !Ref RequireEngineWorkflow, "true" ]
 
 Resources:
   # 1. OIDC Provider (Optional)
@@ -158,10 +170,37 @@ Resources:
             # AdministratorAccess attached, a pushed branch was enough to reach the
             # whole account. Struct8 only ever deploys from main (both push paths
             # hardcode it), so exact matching removes reach without removing use.
-            Condition:
-              StringEquals:
-                token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
+            # SECOND LAYER, opt-in (RequireEngineWorkflow): the run must also be
+            # executing the Struct8 engine. With the repository's subject template
+            # including job_workflow_ref, `sub` reads
+            #   repo:<org>/<repo>:<subject>:job_workflow_ref:<owner>/<repo>/<path>@<ref>
+            # and only the engine's own workflows, on their five channels, plus the
+            # lambda sync on main, are listed. Why it matters: a token from any step
+            # of a matching job can assume this role, so a workflow the customer
+            # wrote -- or a third-party action inside it -- on the same branch was
+            # enough before. Now the job has to be one whose code is the engine's.
+            #
+            # StringEqualsIgnoreCase, not StringEquals: the job_workflow_ref claim
+            # carries the spelling of the caller's `uses:` (measured 2026-09-04:
+            # `Struct8/cloudman-core`, lower case, from the onboarding template),
+            # and a customer who writes it by hand may spell it otherwise. IAM's
+            # StringEquals is case-sensitive; GitHub owner and repository names are
+            # not.
+            Condition: !If
+              - ShouldRequireEngineWorkflow
+              - StringEquals:
+                  token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
+                StringEqualsIgnoreCase:
+                  token.actions.githubusercontent.com:sub:
+                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/devlocal"
+                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/dev"
+                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/test"
+                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/alpha"
+                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/engine.yml@refs/heads/main"
+                    - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/lambda-sync.yml@refs/heads/main"
+              - StringEquals:
+                  token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
+                  token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
       Policies:
         # Explicit Deny beats the Allow in AdministratorAccess. Scoped to the two
         # objects that ARE this role's own trust, plus audit tampering -- everything
@@ -217,8 +256,11 @@ Outputs:
     Value: !GetAtt GitHubActionsRole.Arn
 
   AllowedSubject:
-    Description: "The only GitHub Actions subject that can use this role"
-    Value: !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
+    Description: "The GitHub Actions subject(s) that can use this role"
+    Value: !If
+      - ShouldRequireEngineWorkflow
+      - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}:job_workflow_ref:Struct8/cloudman-core/.github/workflows/{engine.yml@refs/heads/<devlocal|dev|test|alpha|main> | lambda-sync.yml@refs/heads/main}"
+      - !Sub "repo:${GitHubOrg}/${GitHubRepo}:${GitHubSubject}"
 
   BucketName:
     Condition: ShouldCreateS3
